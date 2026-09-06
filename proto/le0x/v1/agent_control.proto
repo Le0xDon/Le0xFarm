@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package le0x.v1;
+
+option go_package = "github.com/le0xdon/le0xfarm/proto/le0x/v1;le0xv1";
+
+import "google/protobuf/timestamp.proto";
+
+// Versions are independent. IDs are opaque strings, validated at the domain boundary.
+message AgentHello {
+  uint32 protocol_version = 1;
+  uint32 schema_version = 2;
+  string agent_id = 3;
+  string host_id = 4;
+  string hostname = 5;
+}
+
+message ControllerHello {
+  uint32 protocol_version = 1;
+  uint32 schema_version = 2;
+  string controller_id = 3;
+  string farm_id = 4;
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp timestamp = 1;
+  uint64 observed_state_revision = 2;
+}
+
+// Pong echoes the nonce byte-for-byte; it is not an authentication mechanism.
+message Ping {
+  bytes nonce = 1;
+}
+
+message Pong {
+  bytes nonce = 1;
+}
+
+message GetStatus {}
+message GetInventory {}
+
+// The agent state vocabulary is not yet defined in M0.2.
+message Status {
+  string agent_state = 1;
+  string message = 2;
+}
+
+// Physical facts only. This is deliberately a subset of domain Inventory.
+message Inventory {
+  string host_id = 1;
+  string hostname = 2;
+  string os_id = 3;
+  string os_version = 4;
+  string architecture = 5;
+  string cpu_vendor = 6;
+  string cpu_model = 7;
+  uint32 cpu_cores = 8;
+  uint32 cpu_threads = 9;
+  repeated GPU gpus = 10;
+}
+
+message GPU {
+  string device_id = 1;
+  string vendor = 2;
+  string model = 3;
+  string pci_bus_id = 4;
+  string uuid = 5; // Empty when unavailable.
+}
+
+message TypedError {
+  string code = 1; // Canonical internal/farmerr code, not a human message.
+  string human_message = 2;
+  map<string, string> details = 3;
+  string suggested_fix = 4;
+  string logs_ref = 5;
+}
+
+message CommandEnvelope {
+  string command_id = 1; // Opaque correlation ID, echoed in CommandResult.
+  oneof command {
+    Ping ping = 2;
+    GetStatus get_status = 3;
+    GetInventory get_inventory = 4;
+  }
+}
+
+message CommandResult {
+  string command_id = 1;
+  oneof result {
+    Pong pong = 2;
+    Status status = 3;
+    Inventory inventory = 4;
+    TypedError error = 5;
+  }
+}
+
+message AgentMessage {
+  oneof payload {
+    AgentHello hello = 1;
+    Heartbeat heartbeat = 2;
+    CommandResult command_result = 3;
+  }
+}
+
+message ControllerMessage {
+  oneof payload {
+    ControllerHello hello = 1;
+    CommandEnvelope command = 2;
+  }
+}
+
+// Agent initiates the bidirectional stream to its authoritative Controller.
+// M0.2 defines only the contract; transport security and runtime are not implemented.
+service AgentControl {
+  rpc Connect(stream AgentMessage) returns (stream ControllerMessage);
+}

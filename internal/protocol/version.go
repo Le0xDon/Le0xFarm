@@ -4,6 +4,6 @@ package protocol
 type ProtocolVersion uint32
 type SchemaVersion uint32
 
-// Foundation versions; no wire protocol or protobuf messages exist yet.
+// Foundation versions, explicitly carried by the v1 protocol hello messages.
 const CurrentProtocolVersion ProtocolVersion = 1
 const CurrentSchemaVersion SchemaVersion = 1
