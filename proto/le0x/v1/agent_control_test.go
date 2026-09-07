@@ -34,7 +34,7 @@ func TestHelloVersions(t *testing.T) {
 	agent := &le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{
 		ProtocolVersion: 7, SchemaVersion: 19,
 		AgentId: "agent_0123456789abcdef0123456789abcdef",
-		HostId:  "host_0123456789abcdef0123456789abcdef", Hostname: "worker",
+		HostId:  "host_0123456789abcdef0123456789abcdef", Hostname: "worker", EnrollmentToken: "token",
 	}}}
 	controller := &le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{
 		ProtocolVersion: 7, SchemaVersion: 19,
@@ -45,6 +45,9 @@ func TestHelloVersions(t *testing.T) {
 	c := roundTrip(t, controller).(*le0xv1.ControllerMessage).GetHello()
 	if a.GetProtocolVersion() != 7 || a.GetSchemaVersion() != 19 || c.GetProtocolVersion() != 7 || c.GetSchemaVersion() != 19 {
 		t.Fatal("versions lost")
+	}
+	if a.GetEnrollmentToken() != "token" {
+		t.Fatal("enrollment token lost")
 	}
 	for _, message := range []proto.Message{a, c} {
 		for _, name := range []protoreflect.Name{"protocol_version", "schema_version"} {

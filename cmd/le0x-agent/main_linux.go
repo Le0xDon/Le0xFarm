@@ -35,6 +35,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	asJSON := flags.Bool("json", false, "Print local identity and inventory as JSON")
 	controller := flags.String("controller", "", "Controller host:port (enables persistent network mode)")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
+	pair := flags.String("pair", "", "Controller enrollment token (development only)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -44,6 +45,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if flags.NArg() != 0 {
 		fmt.Fprintln(stderr, "Unexpected positional arguments")
 		return 2
+	}
+	if *pair != "" && *controller == "" {
+		return fail(stderr, false, errors.New("--pair requires --controller"))
 	}
 	dir, err := agentidentity.DataDir()
 	if err != nil {
@@ -60,7 +64,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Output: log.New(stdout, "", 0)})
+		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, EnrollmentToken: *pair, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Output: log.New(stdout, "", 0)})
 		if err != nil {
 			return fail(stderr, false, err)
 		}

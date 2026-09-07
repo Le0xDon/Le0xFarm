@@ -13,6 +13,7 @@ message AgentHello {
   string agent_id = 3;
   string host_id = 4;
   string hostname = 5;
+  string enrollment_token = 6;
 }
 
 message ControllerHello {

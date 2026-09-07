@@ -39,3 +39,11 @@ func TestControllerCLIInitializationFlag(t *testing.T) {
 		t.Fatalf("repeat-init result: %d %s", code, errOut.String())
 	}
 }
+
+func TestPairingTTLRequiresPairing(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"--listen", "127.0.0.1:0", "--insecure-dev", "--pairing-ttl", "1m"}, &out, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "--pairing-ttl requires --pairing") {
+		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+}

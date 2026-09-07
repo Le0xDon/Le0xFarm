@@ -30,6 +30,7 @@ type AgentHello struct {
 	AgentId         string                 `protobuf:"bytes,3,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
 	HostId          string                 `protobuf:"bytes,4,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
 	Hostname        string                 `protobuf:"bytes,5,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	EnrollmentToken string                 `protobuf:"bytes,6,opt,name=enrollment_token,json=enrollmentToken,proto3" json:"enrollment_token,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -95,6 +96,13 @@ func (x *AgentHello) GetHostId() string {
 func (x *AgentHello) GetHostname() string {
 	if x != nil {
 		return x.Hostname
+	}
+	return ""
+}
+
+func (x *AgentHello) GetEnrollmentToken() string {
+	if x != nil {
+		return x.EnrollmentToken
 	}
 	return ""
 }
@@ -1122,14 +1130,15 @@ var File_proto_le0x_v1_agent_control_proto protoreflect.FileDescriptor
 
 const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\n" +
-	"!proto/le0x/v1/agent_control.proto\x12\ale0x.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xae\x01\n" +
+	"!proto/le0x/v1/agent_control.proto\x12\ale0x.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd9\x01\n" +
 	"\n" +
 	"AgentHello\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12%\n" +
 	"\x0eschema_version\x18\x02 \x01(\rR\rschemaVersion\x12\x19\n" +
 	"\bagent_id\x18\x03 \x01(\tR\aagentId\x12\x17\n" +
 	"\ahost_id\x18\x04 \x01(\tR\x06hostId\x12\x1a\n" +
-	"\bhostname\x18\x05 \x01(\tR\bhostname\"\xa1\x01\n" +
+	"\bhostname\x18\x05 \x01(\tR\bhostname\x12)\n" +
+	"\x10enrollment_token\x18\x06 \x01(\tR\x0fenrollmentToken\"\xa1\x01\n" +
 	"\x0fControllerHello\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12%\n" +
 	"\x0eschema_version\x18\x02 \x01(\rR\rschemaVersion\x12#\n" +

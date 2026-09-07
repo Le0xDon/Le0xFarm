@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
@@ -24,11 +25,156 @@ func TestControllerRequiresExplicitDevelopmentMode(t *testing.T) {
 	}
 }
 
+func TestControllerRequiresTrustStore(t *testing.T) {
+	controllerID, _ := identity.NewControllerID()
+	farmID, _ := identity.NewFarmID()
+	_, err := New(Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID})
+	code, ok := farmerr.CodeOf(err)
+	if !ok || code != farmerr.CONFIG_CONFLICT {
+		t.Fatalf("error=%v code=%v", err, code)
+	}
+}
+
+func TestPairingRequiredAndPairedAgentAcceptedWithoutWindow(t *testing.T) {
+	controllerID, _ := identity.NewControllerID()
+	farmID, _ := identity.NewFarmID()
+	trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID, _ := identity.NewAgentID()
+	hostID, _ := identity.NewHostID()
+	connect := func() error {
+		server, err := New(Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust})
+		if err != nil {
+			return err
+		}
+		listener := bufconn.Listen(1024 * 1024)
+		gs := grpc.NewServer()
+		le0xv1.RegisterAgentControlServer(gs, server)
+		go gs.Serve(listener)
+		defer gs.Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		conn, err := grpc.DialContext(ctx, "buf", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		stream, err := le0xv1.NewAgentControlClient(conn).Connect(ctx)
+		if err != nil {
+			return err
+		}
+		if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: agentID.String(), HostId: hostID.String()}}}); err != nil {
+			return err
+		}
+		_, err = stream.Recv()
+		return err
+	}
+	if err := connect(); err == nil || !strings.Contains(err.Error(), string(farmerr.PAIRING_REQUIRED)) {
+		t.Fatalf("unpaired error=%v", err)
+	}
+	if err := trust.Pair(agentID, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if err := connect(); err != nil {
+		t.Fatalf("paired agent rejected: %v", err)
+	}
+}
+
+func TestControllerPairingTokenLifecycle(t *testing.T) {
+	now := time.Unix(100, 0)
+	newFixture := func(ttl time.Duration) (*PairingWindow, string, *controllertrust.Store, identity.ControllerID, identity.FarmID) {
+		controllerID, _ := identity.NewControllerID()
+		farmID, _ := identity.NewFarmID()
+		trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		window, token, _, err := NewPairingWindow(ttl, func() time.Time { return now })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return window, token, trust, controllerID, farmID
+	}
+	attempt := func(window *PairingWindow, trust *controllertrust.Store, controllerID identity.ControllerID, farmID identity.FarmID, agentID identity.AgentID, hostID identity.HostID, token string) error {
+		server, err := New(Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, Pairing: window})
+		if err != nil {
+			return err
+		}
+		listener := bufconn.Listen(1024 * 1024)
+		gs := grpc.NewServer()
+		le0xv1.RegisterAgentControlServer(gs, server)
+		go gs.Serve(listener)
+		defer gs.Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		conn, err := grpc.DialContext(ctx, "buf", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		stream, err := le0xv1.NewAgentControlClient(conn).Connect(ctx)
+		if err != nil {
+			return err
+		}
+		if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: agentID.String(), HostId: hostID.String(), EnrollmentToken: token}}}); err != nil {
+			return err
+		}
+		_, err = stream.Recv()
+		return err
+	}
+	t.Run("invalid", func(t *testing.T) {
+		w, _, trust, c, f := newFixture(time.Minute)
+		a, _ := identity.NewAgentID()
+		h, _ := identity.NewHostID()
+		err := attempt(w, trust, c, f, a, h, "wrong")
+		if err == nil || !strings.Contains(err.Error(), string(farmerr.PAIRING_TOKEN_INVALID)) {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	t.Run("expired", func(t *testing.T) {
+		w, token, trust, c, f := newFixture(time.Second)
+		now = now.Add(2 * time.Second)
+		a, _ := identity.NewAgentID()
+		h, _ := identity.NewHostID()
+		err := attempt(w, trust, c, f, a, h, token)
+		if err == nil || !strings.Contains(err.Error(), string(farmerr.PAIRING_TOKEN_EXPIRED)) {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	t.Run("consumed", func(t *testing.T) {
+		now = time.Unix(100, 0)
+		w, token, trust, c, f := newFixture(time.Minute)
+		a1, _ := identity.NewAgentID()
+		h1, _ := identity.NewHostID()
+		if err := attempt(w, trust, c, f, a1, h1, token); err != nil {
+			t.Fatal(err)
+		}
+		a2, _ := identity.NewAgentID()
+		h2, _ := identity.NewHostID()
+		err := attempt(w, trust, c, f, a2, h2, token)
+		if err == nil || !strings.Contains(err.Error(), string(farmerr.PAIRING_TOKEN_INVALID)) {
+			t.Fatalf("error=%v", err)
+		}
+	})
+}
+
 func newTestServer(t *testing.T, config Config) *Server {
 	t.Helper()
 	config.InsecureDev = true
 	config.ControllerID, _ = identity.NewControllerID()
 	config.FarmID, _ = identity.NewFarmID()
+	trust, err := controllertrust.Open(t.TempDir(), config.ControllerID, config.FarmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID, _ := identity.ParseAgentID("agent_0123456789abcdef0123456789abcdef")
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	if err := trust.Pair(agentID, hostID); err != nil {
+		t.Fatal(err)
+	}
+	config.Trust = trust
 	server, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +216,16 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 	var output bytes.Buffer
 	controllerID, _ := identity.NewControllerID()
 	farmID, _ := identity.NewFarmID()
-	server, err := New(Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Output: testLogger(&output), Inventory: inventory.Local()})
+	trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentIDValue, _ := identity.ParseAgentID("agent_0123456789abcdef0123456789abcdef")
+	hostIDValue, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	if err := trust.Pair(agentIDValue, hostIDValue); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, Output: testLogger(&output), Inventory: inventory.Local()})
 	if err != nil {
 		t.Fatal(err)
 	}

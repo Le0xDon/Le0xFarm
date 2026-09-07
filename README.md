@@ -256,3 +256,7 @@ go vet ./...
 ```
 
 Лицензия: Apache-2.0, см. LICENSE.
+
+## M1.4 pairing foundation
+
+Development pairing uses a one-time 256-bit enrollment token held only in Controller memory. Start an initialized Controller with `--pairing` (optionally `--pairing-ttl 15m`), then connect a new Agent with `--controller HOST:PORT --insecure-dev --pair TOKEN`. The token travels over plaintext development transport and is not production security. After pairing, Controller trust is stored in `paired_agents.json` and Agent trust in `controller.json`; reconnects do not require the token. Production pairing will use mTLS/bootstrap security in a later stage.

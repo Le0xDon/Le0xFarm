@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
@@ -32,6 +33,8 @@ type Config struct {
 	Inventory           inventory.Source
 	Output              *log.Logger
 	ShutdownGracePeriod time.Duration
+	Trust               *controllertrust.Store
+	Pairing             *PairingWindow
 }
 
 type Server struct {
@@ -70,6 +73,9 @@ func New(config Config) (*Server, error) {
 	}
 	if err := config.FarmID.Validate(); err != nil {
 		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "FarmID is required", Details: map[string]string{"reason": err.Error()}}
+	}
+	if config.Trust == nil {
+		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "Controller trust store is required"}
 	}
 	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config}, nil
 }
@@ -138,6 +144,24 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 	if err != nil {
 		s.log("Rejected agent: invalid HostID")
 		return statusError(farmerr.CONFIG_CONFLICT, "invalid HostID")
+	}
+	if record, paired := s.config.Trust.Find(agentID); paired {
+		if record.HostID != hostID {
+			return statusError(farmerr.CONFIG_CONFLICT, "AgentID is paired to another HostID")
+		}
+	} else {
+		if hello.EnrollmentToken == "" {
+			return statusError(farmerr.PAIRING_REQUIRED, "Agent is not paired; enrollment token required")
+		}
+		if s.config.Pairing == nil {
+			return statusError(farmerr.PAIRING_REQUIRED, "Controller pairing window is not enabled")
+		}
+		if err := s.config.Pairing.Use(hello.EnrollmentToken, func() error { return s.config.Trust.Pair(agentID, hostID) }); err != nil {
+			if code, ok := farmerr.CodeOf(err); ok {
+				return statusError(code, err.Error())
+			}
+			return err
+		}
 	}
 	s.mu.Lock()
 	s.connections++

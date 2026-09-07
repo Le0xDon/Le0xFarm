@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/agenttrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
@@ -36,6 +38,8 @@ type Config struct {
 	ReconnectMax      time.Duration
 	Dialer            func(context.Context, string) (net.Conn, error)
 	Output            *log.Logger
+	EnrollmentToken   string
+	TrustDir          string
 }
 
 type sessionError struct {
@@ -62,6 +66,16 @@ func Run(ctx context.Context, config Config) error {
 	}
 	if config.Output == nil {
 		config.Output = log.Default()
+	}
+	if config.TrustDir == "" {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "Agent network mode requires a Controller trust directory"}
+	}
+	_, trustErr := agenttrust.Load(config.TrustDir)
+	if trustErr != nil && !errors.Is(trustErr, os.ErrNotExist) {
+		return trustErr
+	}
+	if errors.Is(trustErr, os.ErrNotExist) && config.EnrollmentToken == "" {
+		return farmerr.Error{Code: farmerr.PAIRING_REQUIRED, HumanMessage: "Agent is not paired with a Controller", SuggestedFix: "Use --pair with a Controller enrollment token."}
 	}
 	backoff := config.ReconnectInitial
 	for {
@@ -115,7 +129,7 @@ func connectOnce(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: config.AgentID.String(), HostId: config.HostID.String(), Hostname: config.Hostname}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: config.AgentID.String(), HostId: config.HostID.String(), Hostname: config.Hostname, EnrollmentToken: config.EnrollmentToken}}}); err != nil {
 		return err
 	}
 	message, err := stream.Recv()
@@ -133,10 +147,23 @@ func connectOnce(ctx context.Context, config Config) error {
 		return farmerr.Error{Code: farmerr.SCHEMA_VERSION_MISMATCH, HumanMessage: fmt.Sprintf("controller schema version %d is unsupported", hello.SchemaVersion)}
 	}
 	if _, err := identity.ParseControllerID(hello.ControllerId); err != nil {
-		return fmt.Errorf("invalid ControllerID: %w", err)
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ControllerHello contains invalid ControllerID"}
 	}
-	if _, err := identity.ParseFarmID(hello.FarmId); err != nil {
-		return fmt.Errorf("invalid FarmID: %w", err)
+	farmID, err := identity.ParseFarmID(hello.FarmId)
+	if err != nil {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ControllerHello contains invalid FarmID"}
+	}
+	controllerID, _ := identity.ParseControllerID(hello.ControllerId)
+	if binding, err := agenttrust.Load(config.TrustDir); err == nil {
+		if binding.ControllerID != controllerID || binding.FarmID != farmID {
+			return farmerr.Error{Code: farmerr.CONTROLLER_IDENTITY_MISMATCH, HumanMessage: "Controller identity differs from trusted binding"}
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		if err := agenttrust.Save(config.TrustDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
+			return err
+		}
+	} else {
+		return err
 	}
 	config.Output.Printf("Connected to Controller %s (Farm %s)", hello.ControllerId, hello.FarmId)
 	heartbeats := make(chan error, 1)
@@ -203,6 +230,9 @@ func nonTransient(err error) bool {
 		return false
 	}
 	if code, ok := farmerr.CodeOf(err); ok && (code == farmerr.PROTOCOL_VERSION_MISMATCH || code == farmerr.SCHEMA_VERSION_MISMATCH) {
+		return true
+	}
+	if code, ok := farmerr.CodeOf(err); ok && (code == farmerr.PAIRING_REQUIRED || code == farmerr.PAIRING_TOKEN_INVALID || code == farmerr.PAIRING_TOKEN_EXPIRED || code == farmerr.CONTROLLER_IDENTITY_MISMATCH || code == farmerr.CONFIG_CONFLICT) {
 		return true
 	}
 	if status.Code(err) == codes.InvalidArgument {
