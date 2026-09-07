@@ -1,0 +1,25 @@
+{
+  "version": "6.26.0",
+  "kind": "miner",
+  "algo": "rx/0",
+  "uptime": 89,
+  "hashrate": {
+    "total": [1035.86, 1034.95, null],
+    "highest": 1041.64
+  },
+  "hugepages": [0, 1170],
+  "results": {
+    "shares_good": 0,
+    "shares_total": 0
+  },
+  "connection": {
+    "pool": "randomx.xmrig.com:443",
+    "uptime": 89,
+    "ping": 0,
+    "tls": "TLSv1.3",
+    "accepted": 0,
+    "rejected": 0
+  },
+  "donate_level": 1,
+  "unknown_future_field": {"ignored": true}
+}

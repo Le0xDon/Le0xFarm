@@ -50,6 +50,26 @@ message ExecutionPlan {
   map<string, string> environment = 4;
   string working_directory = 5;
   string restart_policy = 6;
+  MinerSpec miner = 7;
+}
+message MinerSpec {
+  string adapter_id = 1;
+  uint32 spec_version = 2;
+  string package_id = 3;
+  string package_version = 4;
+  string mode = 5;
+  string coin = 6;
+  string algorithm = 7;
+  string pool_url = 8;
+  string wallet_address = 9;
+  string worker = 10;
+  optional uint32 cpu_threads = 11;
+  repeated string gpu_device_ids = 12;
+  optional bool huge_pages = 13;
+  optional bool msr = 14;
+  map<string, string> options = 15;
+  string wallet_id = 16;
+  string pool_id = 17;
 }
 message StartExecution { ExecutionPlan plan = 1; }
 message StopExecution { string execution_id = 1; }
@@ -64,6 +84,34 @@ message Execution {
   bool has_exit_code = 6;
   uint32 restart_count = 7;
   string last_error = 8;
+  MinerTelemetry miner_telemetry = 9;
+  repeated string warnings = 10;
+}
+message DeviceHashrate { string device_id = 1; double hashrate_hps = 2; }
+message MinerTelemetry {
+  string adapter_id = 1;
+  string miner_version = 2;
+  string algorithm = 3;
+  optional double hashrate_short_hps = 4;
+  optional double hashrate_medium_hps = 5;
+  optional double hashrate_long_hps = 6;
+  optional double highest_hashrate_hps = 7;
+  repeated DeviceHashrate per_device = 8;
+  optional uint64 accepted_shares = 9;
+  optional uint64 rejected_shares = 10;
+  optional uint64 stale_shares = 11;
+  optional uint64 total_results = 12;
+  optional bool pool_connected = 13;
+  optional uint32 pool_latency_ms = 14;
+  uint64 uptime_seconds = 15;
+  optional bool huge_pages_available = 16;
+  optional double huge_pages_percent = 17;
+  optional bool msr_available = 18;
+  google.protobuf.Timestamp collected_at = 19;
+  uint64 age_milliseconds = 20;
+  string health = 21;
+  string error_code = 22;
+  string message = 23;
 }
 message ExecutionResult { Execution execution = 1; string message = 2; }
 message Executions { repeated Execution executions = 1; }

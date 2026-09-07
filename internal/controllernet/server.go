@@ -345,6 +345,23 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 
 func (s *Server) logExecution(kind string, execution *le0xv1.Execution, message string) {
 	s.log("%s: %s state=%s pid=%d restart_count=%d message=%q last_error=%q", strings.ToUpper(kind), execution.ExecutionId, execution.State, execution.Pid, execution.RestartCount, message, execution.LastError)
+	for _, warning := range execution.Warnings {
+		s.log("EXECUTION WARNING: %s", warning)
+	}
+	if telemetry := execution.GetMinerTelemetry(); telemetry != nil {
+		hashrate := "unavailable"
+		if telemetry.HashrateShortHps != nil {
+			hashrate = fmt.Sprintf("%.3f H/s", telemetry.GetHashrateShortHps())
+		}
+		hugePages, msr := "unreported", "unreported"
+		if telemetry.HugePagesPercent != nil {
+			hugePages = fmt.Sprintf("%.1f%%", telemetry.GetHugePagesPercent())
+		}
+		if telemetry.MsrAvailable != nil {
+			msr = fmt.Sprintf("%t", telemetry.GetMsrAvailable())
+		}
+		s.log("MINER: adapter=%s version=%s algorithm=%s health=%s hashrate=%s age=%dms huge_pages=%s msr_available=%s error=%s", telemetry.AdapterId, telemetry.MinerVersion, telemetry.Algorithm, telemetry.Health, hashrate, telemetry.AgeMilliseconds, hugePages, msr, telemetry.ErrorCode)
+	}
 }
 
 func pingResultValid(result *le0xv1.CommandResult, expected []byte) bool {

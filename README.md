@@ -8,11 +8,70 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Текущий этап — **M2 Agent Runtime Supervisor**. Существующий M1 transport использует
+Текущий этап — **M3 Generic Miner Runtime + XMRig adapter**. Существующий M1 transport использует
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
-может выполнять resolved process plans. Интеграция майнеров, Le0xNoda/Le0xBrain,
-DesiredState persistence и установка systemd не реализованы.
+может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
+проверяемое локальное хранилище packages и первый adapter XMRig. Le0xNoda/Le0xBrain,
+DesiredState persistence, Controller-to-Agent package distribution и systemd не реализованы.
+
+## M3 — Generic Miner Runtime и XMRig 6.26.0
+
+`internal/minerruntime` содержит registry и общий MinerAdapter contract. Adapter объявляет
+capabilities, проверяет generic MinerSpec, готовит resolved ExecutionPlan, предоставляет
+источник нормализованной MinerTelemetry и очищает свои runtime resources. Supervisor,
+gRPC transport и Controller command path не знают о формате XMRig config или HTTP API.
+Тестовый второй adapter без HTTP API доказывает эту границу. Для добавления SRBMiner,
+Rigel или другого miner нужны adapter package, manifest/catalog entry, регистрация и
+adapter-specific tests; Supervisor, protocol lifecycle и agentnet менять не требуется.
+
+`internal/packages` устанавливает уже локально доставленные tar.gz artifacts. Store сам
+проверяет SHA-256 до extraction, отклоняет absolute/traversal paths, links и special files,
+публикует install атомарно и проверяет hashes при каждом lookup. Agent не скачивает
+packages из Internet. В M3 Controller distribution ещё отсутствует; acceptance archive
+доставляется вручную после проверки на development host.
+
+Первый production adapter использует только официальный XMRig 6.26.0 static amd64 asset
+с SHA-256 `fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5`.
+Manifest фиксирует upstream repository/release URL и штатный XMRig donate level 1%.
+Opaque PackageID `package_5f5d8ae2b63ce1001aa0a3b8a2a9b29a` идентифицирует
+семейство XMRig и остаётся тем же для будущих версий; `6.26.0` является отдельной
+version dimension. Store layout — `packages/<PackageID>/<Version>/`.
+Adapter создаёт для каждого ExecutionID отдельный `runtime/<ExecutionID>/xmrig-config.json`
+с правами 0600 и запускает verified executable напрямую через Supervisor. XMRig API
+выделяет отдельный порт и bind только `127.0.0.1`; localhost HTTP client отключает proxy,
+ограничивает response одним MiB и использует timeout. Port reservation имеет небольшой
+bind-close-start race, потому что XMRig сам открывает listener; collision приводит к
+обычной startup/runtime ошибке, не к использованию внешнего bind address.
+
+Telemetry polling по умолчанию выполняется раз в 3 секунды, startup grace равен 45
+секундам, stale threshold — 10 секунд. XMRig `/2/summary` нормализуется в общие поля
+version, algorithm, short/medium/long/highest hashrate, shares/results, pool connection,
+latency, uptime и optimization status. Process RUNNING сам по себе не означает MINING.
+MINING требует mining mode, healthy API, connected pool и hashrate > 0. STRESS и
+BENCHMARK никогда не сообщают MINING; без реальной mining execution общий Agent status
+остаётся IDLE. XMRig STRESS не является полностью offline workload: штатная реализация
+XMRig может подключаться к внешнему upstream stress service `randomx.xmrig.com:443`.
+Это не пользовательский payout pool mining; payout wallet в STRESS не передаётся.
+
+Huge pages только запрашиваются в config и наблюдаются; M3 не меняет sysctl/GRUB.
+MSR capability проверяется read-only, а XMRig rdmsr/wrmsr отключены: sudo, modprobe и
+kernel writes отсутствуют. Automatic certificate renewal, package signing и restoration
+executions после полного Agent restart остаются следующими этапами.
+
+Development/test Controller action проходит через существующий authenticated mTLS stream
+и требует точный target Agent:
+
+```sh
+le0x-controller --listen 0.0.0.0:50051 \
+  --dev-runtime-action start-miner \
+  --target-agent agent_0123456789abcdef0123456789abcdef \
+  --execution-id execution_0123456789abcdef0123456789abcdef \
+  --miner-adapter xmrig \
+  --package-id package_5f5d8ae2b63ce1001aa0a3b8a2a9b29a \
+  --package-version 6.26.0 --miner-mode STRESS \
+  --algorithm rx/0 --cpu-threads 2 --restart-policy ON_FAILURE
+```
 
 ## M2 — Agent Runtime Supervisor
 
@@ -99,6 +158,9 @@ Controller поддерживает тот же флаг `--insecure-dev` для
 - `internal/agentidentity/` — выбор data directory и атомарное хранение identity.
 - `internal/agentnet/` — Agent gRPC client, handshake и reconnect backoff.
 - `internal/runtime/supervisor/` — Linux child-process lifecycle and watchdog.
+- `internal/minerruntime/` — generic miner adapter registry, telemetry polling and status normalization.
+- `internal/miners/xmrig/` — XMRig-specific config, preflight and `/2/summary` adapter.
+- `internal/packages/` — miner-agnostic verified local artifact store.
 - `internal/controllernet/` — Controller gRPC stream handling and command correlation.
 - `internal/wiremap/` — преобразование domain inventory в protobuf wire model.
 - `internal/inventory/` — Linux discovery с подменяемыми источниками для тестов.

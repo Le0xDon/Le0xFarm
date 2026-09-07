@@ -144,6 +144,24 @@ func TestHeartbeat(t *testing.T) {
 	}}})
 }
 
+func TestGenericMinerContractRoundTrip(t *testing.T) {
+	threads := uint32(2)
+	hashrate := 123.5
+	connected := true
+	message := &le0xv1.ExecutionPlan{ExecutionId: "execution_0123456789abcdef0123456789abcdef", RestartPolicy: "ON_FAILURE", Miner: &le0xv1.MinerSpec{
+		AdapterId: "test-no-http", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "1.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "STRESS", Algorithm: "test-algorithm", CpuThreads: &threads,
+	}}
+	decoded := roundTrip(t, message).(*le0xv1.ExecutionPlan)
+	if decoded.GetMiner().GetAdapterId() != "test-no-http" || decoded.GetMiner().GetCpuThreads() != 2 || decoded.GetMiner().GetWalletId() == "" || decoded.GetMiner().GetPoolId() == "" {
+		t.Fatalf("miner spec lost: %+v", decoded.GetMiner())
+	}
+	execution := &le0xv1.Execution{ExecutionId: message.ExecutionId, State: "RUNNING", Warnings: []string{"adapter-specific source has no HTTP API"}, MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test-no-http", MinerVersion: "1.0", HashrateShortHps: &hashrate, PoolConnected: &connected, Health: "HEALTHY"}}
+	observed := roundTrip(t, execution).(*le0xv1.Execution)
+	if observed.GetMinerTelemetry().GetHashrateShortHps() != hashrate || !observed.GetMinerTelemetry().GetPoolConnected() || len(observed.GetWarnings()) != 1 {
+		t.Fatalf("generic telemetry lost: %+v", observed.GetMinerTelemetry())
+	}
+}
+
 func TestConnectContract(t *testing.T) {
 	service := le0xv1.File_proto_le0x_v1_agent_control_proto.Services().ByName("AgentControl")
 	if service == nil {

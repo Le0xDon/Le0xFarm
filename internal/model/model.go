@@ -150,14 +150,15 @@ type ObservedState struct {
 }
 
 type ExecutionObservation struct {
-	ExecutionID  identity.ExecutionID
-	Status       ExecutionStatus
-	Error        *farmerr.Error
-	PID          int
-	StartedAt    time.Time
-	ExitCode     *int
-	RestartCount uint32
-	LastError    string
+	ExecutionID    identity.ExecutionID
+	Status         ExecutionStatus
+	Error          *farmerr.Error
+	PID            int
+	StartedAt      time.Time
+	ExitCode       *int
+	RestartCount   uint32
+	LastError      string
+	MinerTelemetry *MinerTelemetry
 }
 
 type ExecutionPlan struct {
@@ -172,6 +173,78 @@ type ExecutionPlan struct {
 	Environment      map[string]string
 	WorkingDirectory string
 	RestartPolicy    RestartPolicy
+	Miner            *MinerSpec
+}
+
+type MinerMode string
+
+const (
+	MinerModeMining    MinerMode = "MINING"
+	MinerModeStress    MinerMode = "STRESS"
+	MinerModeBenchmark MinerMode = "BENCHMARK"
+)
+
+// MinerSpec is adapter-neutral. Options is a versioned extension namespace;
+// adapters validate every key they consume.
+type MinerSpec struct {
+	AdapterID      string
+	SpecVersion    uint32
+	PackageID      identity.PackageID
+	PackageVersion string
+	WalletID       *identity.WalletID
+	PoolID         *identity.PoolID
+	Mode           MinerMode
+	Coin           string
+	Algorithm      string
+	PoolURL        string
+	WalletAddress  string
+	Worker         string
+	CPUThreads     *uint32
+	GPUDeviceIDs   []identity.DeviceID
+	HugePages      *bool
+	MSR            *bool
+	Options        map[string]string
+}
+
+type MinerHealth string
+
+const (
+	MinerHealthStarting MinerHealth = "STARTING"
+	MinerHealthHealthy  MinerHealth = "HEALTHY"
+	MinerHealthMining   MinerHealth = "MINING"
+	MinerHealthDegraded MinerHealth = "DEGRADED"
+	MinerHealthError    MinerHealth = "ERROR"
+)
+
+type DeviceHashrate struct {
+	DeviceID    identity.DeviceID
+	HashrateHPS float64
+}
+
+type MinerTelemetry struct {
+	AdapterID          string
+	MinerVersion       string
+	Algorithm          string
+	HashrateShortHPS   *float64
+	HashrateMediumHPS  *float64
+	HashrateLongHPS    *float64
+	HighestHashrateHPS *float64
+	PerDevice          []DeviceHashrate
+	AcceptedShares     *uint64
+	RejectedShares     *uint64
+	StaleShares        *uint64
+	TotalResults       *uint64
+	PoolConnected      *bool
+	PoolLatencyMS      *uint32
+	UptimeSeconds      uint64
+	HugePagesAvailable *bool
+	HugePagesPercent   *float64
+	MSRAvailable       *bool
+	CollectedAt        time.Time
+	Age                time.Duration
+	Health             MinerHealth
+	ErrorCode          farmerr.Code
+	Message            string
 }
 
 type RestartPolicy string

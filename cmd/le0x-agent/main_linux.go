@@ -20,7 +20,10 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/agentnet"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/minerruntime"
+	"github.com/le0xdon/le0xfarm/internal/miners/xmrig"
 	"github.com/le0xdon/le0xfarm/internal/model"
+	"github.com/le0xdon/le0xfarm/internal/packages"
 	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 )
 
@@ -97,12 +100,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		runtimeSupervisor := supervisor.New(supervisor.Config{})
+		registry := minerruntime.NewRegistry()
+		if err := registry.Register(&xmrig.Adapter{}); err != nil {
+			return fail(stderr, false, err)
+		}
+		packageStore := packages.New(dir)
+		minerRuntime := minerruntime.New(runtimeSupervisor, registry, dir, packageStore, facts, minerruntime.Config{})
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
-			_ = runtimeSupervisor.Shutdown(shutdownCtx)
+			_ = minerRuntime.Shutdown(shutdownCtx)
 		}()
-		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Supervisor: runtimeSupervisor, Output: log.New(stdout, "", 0)})
+		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Supervisor: runtimeSupervisor, MinerRuntime: minerRuntime, Output: log.New(stdout, "", 0)})
 		if err != nil {
 			return fail(stderr, false, err)
 		}

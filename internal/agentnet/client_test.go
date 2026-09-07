@@ -21,13 +21,51 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/minerruntime"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
 	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
+
+func TestParseGenericMinerPlanValidatesTypedReferences(t *testing.T) {
+	id := "execution_0123456789abcdef0123456789abcdef"
+	base := &le0xv1.ExecutionPlan{ExecutionId: id, Miner: &le0xv1.MinerSpec{AdapterId: "xmrig", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "6.26.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "MINING"}}
+	plan, err := parsePlan(base)
+	if err != nil || plan.Miner == nil || plan.Miner.WalletID == nil || plan.Miner.PoolID == nil {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	badWallet := proto.Clone(base).(*le0xv1.ExecutionPlan)
+	badWallet.Miner.WalletId = "agent_0123456789abcdef0123456789abcdef"
+	if _, err := parsePlan(badWallet); err == nil {
+		t.Fatal("wrong WalletID prefix accepted")
+	}
+	badPool := proto.Clone(base).(*le0xv1.ExecutionPlan)
+	badPool.Miner.PoolId = "invalid"
+	if _, err := parsePlan(badPool); err == nil {
+		t.Fatal("invalid PoolID accepted")
+	}
+}
+
+func TestControllerFacingTelemetryIsAdapterNeutral(t *testing.T) {
+	executionID, _ := identity.NewExecutionID()
+	hashrate := 77.25
+	wire := wireObservation(minerruntime.Observation{Process: supervisor.Snapshot{ExecutionID: executionID, State: model.ExecutionRunning, PID: 42}, Telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", MinerVersion: "1.0", HashrateShortHPS: &hashrate, Health: model.MinerHealthHealthy}})
+	encoded, err := proto.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded le0xv1.Execution
+	if err := proto.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.GetMinerTelemetry().GetAdapterId() != "test-no-http" || decoded.GetMinerTelemetry().GetHashrateShortHps() != hashrate {
+		t.Fatalf("generic adapter telemetry did not reach Controller-facing wire model: %+v", decoded.GetMinerTelemetry())
+	}
+}
 
 type helloServer struct {
 	le0xv1.UnimplementedAgentControlServer

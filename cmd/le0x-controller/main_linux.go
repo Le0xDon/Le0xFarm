@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -42,12 +43,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	initPKI := flags.Bool("init-pki", false, "Initialize PKI for an existing Controller identity")
 	pairing := flags.Bool("pairing", false, "Enable temporary development enrollment pairing")
 	pairingTTL := flags.Duration("pairing-ttl", 15*time.Minute, "Enrollment token lifetime")
-	runtimeAction := flags.String("dev-runtime-action", "", "Development/test runtime action: start, stop, restart, or get")
+	runtimeAction := flags.String("dev-runtime-action", "", "Development/test runtime action: start, start-miner, stop, restart, or get")
 	runtimeTarget := flags.String("target-agent", "", "AgentID targeted by a development/test runtime action")
 	executionID := flags.String("execution-id", "", "ExecutionID for a development/test runtime action")
 	executable := flags.String("executable", "", "Absolute executable path for a development/test start")
 	workingDirectory := flags.String("working-directory", "", "Working directory for a development/test start")
 	restartPolicy := flags.String("restart-policy", "NEVER", "Restart policy for a development/test start: NEVER or ON_FAILURE")
+	minerAdapter := flags.String("miner-adapter", "", "Miner adapter ID for start-miner")
+	packageID := flags.String("package-id", "", "Installed PackageID for start-miner")
+	packageVersion := flags.String("package-version", "", "Installed package version for start-miner")
+	minerMode := flags.String("miner-mode", "", "Miner mode for start-miner")
+	algorithm := flags.String("algorithm", "", "Optional miner algorithm")
+	cpuThreads := flags.Uint("cpu-threads", 0, "CPU threads for start-miner")
 	var executionArgs stringList
 	flags.Var(&executionArgs, "execution-arg", "Argument for a development/test start; repeat for multiple argv entries")
 	if err := flags.Parse(args); err != nil {
@@ -74,7 +81,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--init and --init-pki cannot be combined")
 		return 2
 	}
-	runtimeCommand, err := buildRuntimeCommand(*runtimeAction, *executionID, *executable, []string(executionArgs), *workingDirectory, *restartPolicy)
+	var runtimeCommand *le0xv1.CommandEnvelope
+	var err error
+	if *runtimeAction == "start-miner" {
+		if uint64(*cpuThreads) > math.MaxUint32 {
+			fmt.Fprintln(stderr, "--cpu-threads exceeds uint32")
+			return 2
+		}
+		runtimeCommand, err = buildMinerRuntimeCommand(*executionID, *minerAdapter, *packageID, *packageVersion, *minerMode, *algorithm, uint32(*cpuThreads), *restartPolicy)
+	} else {
+		if *minerAdapter != "" || *packageID != "" || *packageVersion != "" || *minerMode != "" || *algorithm != "" || *cpuThreads != 0 {
+			fmt.Fprintln(stderr, "miner options require --dev-runtime-action start-miner")
+			return 2
+		}
+		runtimeCommand, err = buildRuntimeCommand(*runtimeAction, *executionID, *executable, []string(executionArgs), *workingDirectory, *restartPolicy)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -195,8 +216,22 @@ func buildRuntimeCommand(action, executionID, executable string, args []string, 
 	case "get":
 		return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}, nil
 	default:
-		return nil, errors.New("--dev-runtime-action must be start, stop, restart, or get")
+		return nil, errors.New("--dev-runtime-action must be start, start-miner, stop, restart, or get")
 	}
+}
+
+func buildMinerRuntimeCommand(executionID, adapterID, packageID, packageVersion, mode, algorithm string, cpuThreads uint32, restartPolicy string) (*le0xv1.CommandEnvelope, error) {
+	if executionID == "" || adapterID == "" || packageID == "" || packageVersion == "" || mode == "" {
+		return nil, errors.New("start-miner requires execution, adapter, package, version, and mode")
+	}
+	if restartPolicy != "NEVER" && restartPolicy != "ON_FAILURE" {
+		return nil, errors.New("--restart-policy must be NEVER or ON_FAILURE")
+	}
+	miner := &le0xv1.MinerSpec{AdapterId: adapterID, SpecVersion: 1, PackageId: packageID, PackageVersion: packageVersion, Mode: mode, Algorithm: algorithm}
+	if cpuThreads > 0 {
+		miner.CpuThreads = &cpuThreads
+	}
+	return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: executionID, RestartPolicy: restartPolicy, Miner: miner}}}}, nil
 }
 
 func printError(out io.Writer, err error) {

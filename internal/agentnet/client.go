@@ -25,6 +25,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/minerruntime"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
 	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
@@ -55,6 +56,7 @@ type Config struct {
 	TLSFingerprint    string
 	tlsConfig         *tls.Config
 	Supervisor        *supervisor.Supervisor
+	MinerRuntime      *minerruntime.Manager
 }
 
 type sessionError struct {
@@ -418,13 +420,22 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 		facts, _ := config.Inventory.Discover(config.HostID)
 		result.Result = &le0xv1.CommandResult_Inventory{Inventory: wiremap.Inventory(facts)}
 	case command.GetStartExecution() != nil:
-		if config.Supervisor == nil {
+		if config.Supervisor == nil && config.MinerRuntime == nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
 			break
 		}
 		plan, err := parsePlan(command.GetStartExecution().GetPlan())
 		if err != nil {
 			result.Result = errorResult(err)
+			break
+		}
+		if config.MinerRuntime != nil {
+			observation, msg, err := config.MinerRuntime.Start(stream.Context(), plan)
+			if err != nil {
+				result.Result = errorResult(err)
+			} else {
+				result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireObservation(observation), Message: msg}}
+			}
 			break
 		}
 		snap, msg, err := config.Supervisor.Start(plan)
@@ -434,13 +445,22 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
 		}
 	case command.GetStopExecution() != nil:
-		if config.Supervisor == nil {
+		if config.Supervisor == nil && config.MinerRuntime == nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
 			break
 		}
 		id, err := identity.ParseExecutionID(command.GetStopExecution().ExecutionId)
 		if err != nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "invalid ExecutionID")
+			break
+		}
+		if config.MinerRuntime != nil {
+			observation, msg, err := config.MinerRuntime.Stop(id)
+			if err != nil {
+				result.Result = errorResult(err)
+			} else {
+				result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireObservation(observation), Message: msg}}
+			}
 			break
 		}
 		snap, msg, err := config.Supervisor.Stop(id)
@@ -450,13 +470,22 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
 		}
 	case command.GetRestartExecution() != nil:
-		if config.Supervisor == nil {
+		if config.Supervisor == nil && config.MinerRuntime == nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
 			break
 		}
 		id, err := identity.ParseExecutionID(command.GetRestartExecution().ExecutionId)
 		if err != nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "invalid ExecutionID")
+			break
+		}
+		if config.MinerRuntime != nil {
+			observation, msg, err := config.MinerRuntime.Restart(id)
+			if err != nil {
+				result.Result = errorResult(err)
+			} else {
+				result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireObservation(observation), Message: msg}}
+			}
 			break
 		}
 		snap, msg, err := config.Supervisor.Restart(id)
@@ -466,14 +495,19 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
 		}
 	case command.GetGetExecutions() != nil:
-		if config.Supervisor == nil {
+		if config.Supervisor == nil && config.MinerRuntime == nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
 			break
 		}
-		items := config.Supervisor.List()
-		wire := make([]*le0xv1.Execution, 0, len(items))
-		for _, item := range items {
-			wire = append(wire, wireExecution(item))
+		wire := make([]*le0xv1.Execution, 0)
+		if config.MinerRuntime != nil {
+			for _, item := range config.MinerRuntime.List() {
+				wire = append(wire, wireObservation(item))
+			}
+		} else {
+			for _, item := range config.Supervisor.List() {
+				wire = append(wire, wireExecution(item))
+			}
 		}
 		result.Result = &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{Executions: wire}}
 	default:
@@ -492,7 +526,39 @@ func parsePlan(in *le0xv1.ExecutionPlan) (model.ExecutionPlan, error) {
 	if err != nil {
 		return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid ExecutionID"}
 	}
-	return model.ExecutionPlan{ExecutionID: id, Executable: in.Executable, Args: append([]string(nil), in.Args...), Environment: maps.Clone(in.Environment), WorkingDirectory: in.WorkingDirectory, RestartPolicy: model.RestartPolicy(in.RestartPolicy)}, nil
+	plan := model.ExecutionPlan{ExecutionID: id, Executable: in.Executable, Args: append([]string(nil), in.Args...), Environment: maps.Clone(in.Environment), WorkingDirectory: in.WorkingDirectory, RestartPolicy: model.RestartPolicy(in.RestartPolicy)}
+	if wire := in.GetMiner(); wire != nil {
+		packageID, err := identity.ParsePackageID(wire.PackageId)
+		if err != nil {
+			return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid miner PackageID"}
+		}
+		devices := make([]identity.DeviceID, 0, len(wire.GpuDeviceIds))
+		for _, value := range wire.GpuDeviceIds {
+			device, err := identity.ParseDeviceID(value)
+			if err != nil {
+				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid miner DeviceID"}
+			}
+			devices = append(devices, device)
+		}
+		var walletID *identity.WalletID
+		if wire.WalletId != "" {
+			parsed, err := identity.ParseWalletID(wire.WalletId)
+			if err != nil {
+				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid miner WalletID"}
+			}
+			walletID = &parsed
+		}
+		var poolID *identity.PoolID
+		if wire.PoolId != "" {
+			parsed, err := identity.ParsePoolID(wire.PoolId)
+			if err != nil {
+				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid miner PoolID"}
+			}
+			poolID = &parsed
+		}
+		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, WalletID: walletID, PoolID: poolID, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, PoolURL: wire.PoolUrl, WalletAddress: wire.WalletAddress, Worker: wire.Worker, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
+	}
+	return plan, nil
 }
 func wireExecution(s supervisor.Snapshot) *le0xv1.Execution {
 	out := &le0xv1.Execution{ExecutionId: s.ExecutionID.String(), State: string(s.State), Pid: int64(s.PID), RestartCount: s.RestartCount, LastError: s.LastError}
@@ -502,6 +568,22 @@ func wireExecution(s supervisor.Snapshot) *le0xv1.Execution {
 	if s.ExitCode != nil {
 		out.HasExitCode = true
 		out.ExitCode = int32(*s.ExitCode)
+	}
+	return out
+}
+
+func wireObservation(observation minerruntime.Observation) *le0xv1.Execution {
+	out := wireExecution(observation.Process)
+	out.Warnings = append([]string(nil), observation.Warnings...)
+	if telemetry := observation.Telemetry; telemetry != nil {
+		wire := &le0xv1.MinerTelemetry{AdapterId: telemetry.AdapterID, MinerVersion: telemetry.MinerVersion, Algorithm: telemetry.Algorithm, HashrateShortHps: telemetry.HashrateShortHPS, HashrateMediumHps: telemetry.HashrateMediumHPS, HashrateLongHps: telemetry.HashrateLongHPS, HighestHashrateHps: telemetry.HighestHashrateHPS, AcceptedShares: telemetry.AcceptedShares, RejectedShares: telemetry.RejectedShares, StaleShares: telemetry.StaleShares, TotalResults: telemetry.TotalResults, PoolConnected: telemetry.PoolConnected, PoolLatencyMs: telemetry.PoolLatencyMS, UptimeSeconds: telemetry.UptimeSeconds, HugePagesAvailable: telemetry.HugePagesAvailable, HugePagesPercent: telemetry.HugePagesPercent, MsrAvailable: telemetry.MSRAvailable, AgeMilliseconds: uint64(max(telemetry.Age.Milliseconds(), 0)), Health: string(telemetry.Health), ErrorCode: string(telemetry.ErrorCode), Message: telemetry.Message}
+		if !telemetry.CollectedAt.IsZero() {
+			wire.CollectedAt = timestamppb.New(telemetry.CollectedAt)
+		}
+		for _, device := range telemetry.PerDevice {
+			wire.PerDevice = append(wire.PerDevice, &le0xv1.DeviceHashrate{DeviceId: device.DeviceID.String(), HashrateHps: device.HashrateHPS})
+		}
+		out.MinerTelemetry = wire
 	}
 	return out
 }

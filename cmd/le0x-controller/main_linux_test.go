@@ -73,3 +73,18 @@ func TestBuildRuntimeCommand(t *testing.T) {
 		t.Fatal("execution option without development action accepted")
 	}
 }
+
+func TestBuildGenericMinerRuntimeCommand(t *testing.T) {
+	id := "execution_0123456789abcdef0123456789abcdef"
+	command, err := buildMinerRuntimeCommand(id, "test-no-http", "package_0123456789abcdef0123456789abcdef", "1.0", "STRESS", "test-algorithm", 2, "ON_FAILURE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := command.GetStartExecution().GetPlan()
+	if plan.GetExecutable() != "" || plan.GetMiner().GetAdapterId() != "test-no-http" || plan.GetMiner().GetPackageId() == "" || plan.GetMiner().GetCpuThreads() != 2 || plan.GetMiner().GetMode() != "STRESS" {
+		t.Fatalf("miner command=%v", command)
+	}
+	if _, err := buildMinerRuntimeCommand(id, "", "package_0123456789abcdef0123456789abcdef", "6.26.0", "STRESS", "", 2, "NEVER"); err == nil {
+		t.Fatal("missing adapter accepted")
+	}
+}
