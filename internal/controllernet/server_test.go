@@ -24,6 +24,18 @@ func TestControllerRequiresExplicitDevelopmentMode(t *testing.T) {
 	}
 }
 
+func newTestServer(t *testing.T, config Config) *Server {
+	t.Helper()
+	config.InsecureDev = true
+	config.ControllerID, _ = identity.NewControllerID()
+	config.FarmID, _ = identity.NewFarmID()
+	server, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
 func TestPingNonceVerification(t *testing.T) {
 	result := &le0xv1.CommandResult{Result: &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: []byte{1, 2, 3}}}}
 	if !pingResultValid(result, []byte{1, 2, 3}) {
@@ -56,7 +68,9 @@ func TestInventoryWireTrustBoundary(t *testing.T) {
 
 func TestControllerHandshakeAndCommands(t *testing.T) {
 	var output bytes.Buffer
-	server, err := New(Config{InsecureDev: true, Output: testLogger(&output), Inventory: inventory.Local()})
+	controllerID, _ := identity.NewControllerID()
+	farmID, _ := identity.NewFarmID()
+	server, err := New(Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Output: testLogger(&output), Inventory: inventory.Local()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +99,7 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := message.GetHello(); got == nil || got.ControllerId == "" || got.FarmId == "" {
+	if got := message.GetHello(); got == nil || got.ControllerId != controllerID.String() || got.FarmId != farmID.String() {
 		t.Fatalf("invalid controller hello: %v", message)
 	}
 	for i, expected := range []string{"Ping", "GetStatus", "GetInventory"} {
@@ -123,10 +137,7 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 }
 
 func TestControllerConnectionCounterLifecycle(t *testing.T) {
-	server, err := New(Config{InsecureDev: true})
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := newTestServer(t, Config{})
 	listener := bufconn.Listen(1024 * 1024)
 	gs := grpc.NewServer()
 	le0xv1.RegisterAgentControlServer(gs, server)
@@ -177,10 +188,7 @@ func startTestServe(t *testing.T, server *Server, listener *bufconn.Listener, ct
 }
 
 func TestServeShutdownForcesLongLivedStreamToStop(t *testing.T) {
-	server, err := New(Config{InsecureDev: true, ShutdownGracePeriod: 20 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := newTestServer(t, Config{ShutdownGracePeriod: 20 * time.Millisecond})
 	listener := bufconn.Listen(1024 * 1024)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startTestServe(t, server, listener, ctx)
@@ -227,10 +235,7 @@ func TestServeShutdownForcesLongLivedStreamToStop(t *testing.T) {
 }
 
 func TestServeShutdownWithoutStreamsIsImmediate(t *testing.T) {
-	server, err := New(Config{InsecureDev: true, ShutdownGracePeriod: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := newTestServer(t, Config{ShutdownGracePeriod: time.Second})
 	listener := bufconn.Listen(1024 * 1024)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startTestServe(t, server, listener, ctx)
@@ -261,10 +266,7 @@ func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			server, err := New(Config{InsecureDev: true})
-			if err != nil {
-				t.Fatal(err)
-			}
+			server := newTestServer(t, Config{})
 			listener := bufconn.Listen(1024 * 1024)
 			gs := grpc.NewServer()
 			le0xv1.RegisterAgentControlServer(gs, server)

@@ -14,6 +14,21 @@ Le0xFarm — проект системы управления оборудова
 plaintext gRPC. Production mTLS, pairing, miner runtime, watchdog, Le0xNoda/Le0xBrain
 runtime и установка systemd не реализованы.
 
+## M1.3 — persistent Controller identity
+
+ControllerID and FarmID are now persisted independently from the Controller runtime in
+`internal/controlleridentity`. First initialization requires the explicit `--init` flag;
+normal restart only loads an existing identity. The file contains only `schema_version`, `controller_id`
+and `farm_id`; storage schema version is 1. The default Linux directory is
+`$XDG_DATA_HOME/le0xfarm/controller` or `$HOME/.local/share/le0xfarm/controller`.
+`LE0X_CONTROLLER_DATA_DIR` overrides it with an exact development/test directory.
+The directory is 0700 and `identity.json` is 0600. Creation is atomic and existing or
+corrupted files are never silently replaced. A missing or future schema version is a
+typed `CONFIG_CONFLICT`. Controller identity is independent of hostname, network
+addresses and listen address; deleting storage makes normal startup fail. A new identity
+is created only by an explicit `--init` after the loss is intentional.
+Controller runtime receives both IDs explicitly and uses them in ControllerHello.
+
 ## M1.2 — first Agent ↔ Controller connection
 
 `le0x-controller` и network mode `le0x-agent --controller HOST:PORT --insecure-dev` теперь
@@ -22,7 +37,7 @@ runtime и установка systemd не реализованы.
 умолчанию. Без него Controller отказывается запускать plaintext, а Agent не подключается;
 production architecture остаётся persistent gRPC + mTLS и будет реализована отдельно.
 
-Controller создаёт временные ControllerID/FarmID на каждый процесс и ничего не сохраняет.
+Controller загружает persistent ControllerID/FarmID; первый запуск выполняется с `--init`.
 После handshake он отправляет Ping, GetStatus и GetInventory, сопоставляет ответы по
 непрозрачным уникальным command_id и показывает результат. Agent отвечает `Pong`, `IDLE`
 и текущим inventory, затем отправляет heartbeat с revision 0.
@@ -35,7 +50,7 @@ Controller создаёт временные ControllerID/FarmID на кажды
 Loopback development example:
 
 ```sh
-go run ./cmd/le0x-controller --listen 127.0.0.1:50051 --insecure-dev
+go run ./cmd/le0x-controller --listen 127.0.0.1:50051 --insecure-dev --init  # first start only
 LE0X_DATA_DIR="$PWD/.le0x-data" go run ./cmd/le0x-agent --controller 127.0.0.1:50051 --insecure-dev
 ```
 

@@ -23,6 +23,8 @@ import (
 )
 
 type Config struct {
+	ControllerID        identity.ControllerID
+	FarmID              identity.FarmID
 	ListenAddress       string
 	InsecureDev         bool
 	ProtocolVersion     uint32
@@ -63,15 +65,13 @@ func New(config Config) (*Server, error) {
 	if config.ShutdownGracePeriod <= 0 {
 		config.ShutdownGracePeriod = 3 * time.Second
 	}
-	controllerID, err := identity.NewControllerID()
-	if err != nil {
-		return nil, err
+	if err := config.ControllerID.Validate(); err != nil {
+		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ControllerID is required", Details: map[string]string{"reason": err.Error()}}
 	}
-	farmID, err := identity.NewFarmID()
-	if err != nil {
-		return nil, err
+	if err := config.FarmID.Validate(); err != nil {
+		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "FarmID is required", Details: map[string]string{"reason": err.Error()}}
 	}
-	return &Server{controllerID: controllerID, farmID: farmID, config: config}, nil
+	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config}, nil
 }
 
 func (s *Server) IDs() (identity.ControllerID, identity.FarmID) { return s.controllerID, s.farmID }

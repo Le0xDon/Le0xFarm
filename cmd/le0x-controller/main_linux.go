@@ -13,7 +13,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
 	"github.com/le0xdon/le0xfarm/internal/controllernet"
+	"github.com/le0xdon/le0xfarm/internal/farmerr"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -23,6 +25,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	listen := flags.String("listen", "127.0.0.1:50051", "TCP listen address")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
+	initIdentity := flags.Bool("init", false, "Initialize a new Controller/Farm identity")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -37,13 +40,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "Secure transport will be implemented in a future stage; refusing plaintext. Pass --insecure-dev for development/test only.")
 		return 1
 	}
+	dataDir, err := controlleridentity.DataDir()
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	var controllerIdentity controlleridentity.Identity
+	if *initIdentity {
+		controllerIdentity, err = controlleridentity.Initialize(dataDir)
+	} else {
+		controllerIdentity, err = controlleridentity.Load(dataDir)
+	}
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	defer listener.Close()
-	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: true, Output: log.New(stdout, "", 0)})
+	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: true, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Output: log.New(stdout, "", 0)})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -57,4 +75,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func printError(out io.Writer, err error) {
+	fmt.Fprintln(out, err)
+	var typed farmerr.Error
+	if errors.As(err, &typed) && typed.SuggestedFix != "" {
+		fmt.Fprintln(out, typed.SuggestedFix)
+	}
 }

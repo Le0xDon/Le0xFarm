@@ -32,7 +32,9 @@ func TestAgentNetworkRequiresExplicitDevelopmentMode(t *testing.T) {
 }
 
 func TestAgentConnectsAndSendsHeartbeat(t *testing.T) {
-	server, err := controllernet.New(controllernet.Config{InsecureDev: true})
+	controllerID, _ := identity.NewControllerID()
+	farmID, _ := identity.NewFarmID()
+	server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID})
 	if err != nil {
 		t.Fatal(err)
 	}

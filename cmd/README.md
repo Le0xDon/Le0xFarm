@@ -1,1 +1,1 @@
-M1.2: le0x-agent выполняет local bootstrap или подключается к development-only Controller через `--controller HOST:PORT --insecure-dev`. `le0x-controller` предоставляет минимальный plaintext gRPC skeleton только с явным `--insecure-dev`. Production mTLS и runtime компонентов не реализованы.
+M1.3: `le0x-controller` загружает persistent ControllerID/FarmID из `LE0X_CONTROLLER_DATA_DIR` или XDG user data path и передаёт их в runtime. Network transport остаётся development-only plaintext через явный `--insecure-dev`; production mTLS и runtime компонентов не реализованы.
