@@ -19,7 +19,17 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/controllerpki"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/identity"
+	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 )
+
+type stringList []string
+
+func (values *stringList) String() string { return fmt.Sprint([]string(*values)) }
+func (values *stringList) Set(value string) error {
+	*values = append(*values, value)
+	return nil
+}
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
@@ -32,6 +42,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	initPKI := flags.Bool("init-pki", false, "Initialize PKI for an existing Controller identity")
 	pairing := flags.Bool("pairing", false, "Enable temporary development enrollment pairing")
 	pairingTTL := flags.Duration("pairing-ttl", 15*time.Minute, "Enrollment token lifetime")
+	runtimeAction := flags.String("dev-runtime-action", "", "Development/test runtime action: start, stop, restart, or get")
+	runtimeTarget := flags.String("target-agent", "", "AgentID targeted by a development/test runtime action")
+	executionID := flags.String("execution-id", "", "ExecutionID for a development/test runtime action")
+	executable := flags.String("executable", "", "Absolute executable path for a development/test start")
+	workingDirectory := flags.String("working-directory", "", "Working directory for a development/test start")
+	restartPolicy := flags.String("restart-policy", "NEVER", "Restart policy for a development/test start: NEVER or ON_FAILURE")
+	var executionArgs stringList
+	flags.Var(&executionArgs, "execution-arg", "Argument for a development/test start; repeat for multiple argv entries")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -54,6 +72,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if *initIdentity && *initPKI {
 		fmt.Fprintln(stderr, "--init and --init-pki cannot be combined")
+		return 2
+	}
+	runtimeCommand, err := buildRuntimeCommand(*runtimeAction, *executionID, *executable, []string(executionArgs), *workingDirectory, *restartPolicy)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	var targetAgent identity.AgentID
+	if runtimeCommand != nil {
+		targetAgent, err = identity.ParseAgentID(*runtimeTarget)
+		if err != nil {
+			fmt.Fprintln(stderr, "runtime action requires a valid --target-agent")
+			return 2
+		}
+	} else if *runtimeTarget != "" {
+		fmt.Fprintln(stderr, "--target-agent requires --dev-runtime-action")
 		return 2
 	}
 	dataDir, err := controlleridentity.DataDir()
@@ -102,7 +136,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer listener.Close()
-	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: *insecureDev, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Trust: trust, Pairing: pairingWindow, PKI: pki, Output: log.New(stdout, "", 0)})
+	var runtimeCommands []*le0xv1.CommandEnvelope
+	if runtimeCommand != nil {
+		runtimeCommands = append(runtimeCommands, runtimeCommand)
+	}
+	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: *insecureDev, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Trust: trust, Pairing: pairingWindow, PKI: pki, RuntimeCommands: runtimeCommands, RuntimeTarget: targetAgent, Output: log.New(stdout, "", 0)})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
@@ -127,6 +165,38 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func buildRuntimeCommand(action, executionID, executable string, args []string, workingDirectory, restartPolicy string) (*le0xv1.CommandEnvelope, error) {
+	switch action {
+	case "":
+		if executionID != "" || executable != "" || len(args) != 0 || workingDirectory != "" || restartPolicy != "NEVER" {
+			return nil, errors.New("execution options require --dev-runtime-action")
+		}
+		return nil, nil
+	case "start":
+		if executionID == "" || executable == "" {
+			return nil, errors.New("start requires --execution-id and --executable")
+		}
+		if restartPolicy != "NEVER" && restartPolicy != "ON_FAILURE" {
+			return nil, errors.New("--restart-policy must be NEVER or ON_FAILURE")
+		}
+		return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: executionID, Executable: executable, Args: args, WorkingDirectory: workingDirectory, RestartPolicy: restartPolicy}}}}, nil
+	case "stop":
+		if executionID == "" {
+			return nil, errors.New("stop requires --execution-id")
+		}
+		return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StopExecution{StopExecution: &le0xv1.StopExecution{ExecutionId: executionID}}}, nil
+	case "restart":
+		if executionID == "" {
+			return nil, errors.New("restart requires --execution-id")
+		}
+		return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_RestartExecution{RestartExecution: &le0xv1.RestartExecution{ExecutionId: executionID}}}, nil
+	case "get":
+		return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}, nil
+	default:
+		return nil, errors.New("--dev-runtime-action must be start, stop, restart, or get")
+	}
 }
 
 func printError(out io.Writer, err error) {

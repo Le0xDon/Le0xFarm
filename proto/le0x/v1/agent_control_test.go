@@ -67,6 +67,10 @@ func TestCommandOneofs(t *testing.T) {
 		{CommandId: "ping-1", Command: &le0xv1.CommandEnvelope_Ping{Ping: &le0xv1.Ping{Nonce: nonce}}},
 		{CommandId: "status-1", Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}},
 		{CommandId: "inventory-1", Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}},
+		{CommandId: "start-1", Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: "execution_0123456789abcdef0123456789abcdef", Executable: "/bin/sleep", Args: []string{"300"}, Environment: map[string]string{"MODE": "test"}, WorkingDirectory: "/tmp", RestartPolicy: "ON_FAILURE"}}}},
+		{CommandId: "stop-1", Command: &le0xv1.CommandEnvelope_StopExecution{StopExecution: &le0xv1.StopExecution{ExecutionId: "execution_0123456789abcdef0123456789abcdef"}}},
+		{CommandId: "restart-1", Command: &le0xv1.CommandEnvelope_RestartExecution{RestartExecution: &le0xv1.RestartExecution{ExecutionId: "execution_0123456789abcdef0123456789abcdef"}}},
+		{CommandId: "executions-1", Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}},
 	}
 	for _, command := range commands {
 		t.Run(command.CommandId, func(t *testing.T) {
@@ -107,6 +111,8 @@ func TestResultOneofs(t *testing.T) {
 			Details:      map[string]string{"package": "example", "reason": "not installed"},
 			SuggestedFix: "Install the dependency", LogsRef: "logs/example",
 		}}},
+		{CommandId: "execution-1", Result: &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: &le0xv1.Execution{ExecutionId: "execution_0123456789abcdef0123456789abcdef", State: "RUNNING", Pid: 123, StartedAt: timestamppb.Now(), RestartCount: 2}, Message: "started"}}},
+		{CommandId: "executions-1", Result: &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{Executions: []*le0xv1.Execution{{ExecutionId: "execution_0123456789abcdef0123456789abcdef", State: "STOPPED", ExitCode: 0, HasExitCode: true}}}}},
 	}
 	for _, result := range results {
 		t.Run(result.CommandId, func(t *testing.T) {

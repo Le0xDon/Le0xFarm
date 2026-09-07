@@ -8,11 +8,45 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Сейчас реализован **M1.2 — first Agent ↔ Controller connection** поверх M0.1 foundation
-и M0.2 protocol contracts. Agent сохраняет локальные IDs, собирает Linux inventory,
-может работать локально или подключаться к минимальному Controller через development-only
-plaintext gRPC. Production mTLS, pairing, miner runtime, watchdog, Le0xNoda/Le0xBrain
-runtime и установка systemd не реализованы.
+Текущий этап — **M2 Agent Runtime Supervisor**. Существующий M1 transport использует
+persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
+явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
+может выполнять resolved process plans. Интеграция майнеров, Le0xNoda/Le0xBrain,
+DesiredState persistence и установка systemd не реализованы.
+
+## M2 — Agent Runtime Supervisor
+
+`internal/runtime/supervisor` управляет несколькими процессами по `ExecutionID`.
+START, STOP, RESTART и GET_EXECUTIONS идут по существующему authenticated
+AgentControl stream. Supervisor создаётся один раз на lifetime Agent, поэтому разрыв
+Controller connection не останавливает workload, а reconnect сообщает тот же PID и
+ExecutionID. Нормальный restart всего Agent пока не восстанавливает executions.
+
+ExecutionPlan передаёт абсолютный clean executable path, отдельный argv, environment,
+working directory и restart policy. Процесс запускается напрямую через `os/exec`, без
+shell и interpolation, в отдельной Linux process group с `Pdeathsig`. STOP посылает
+SIGTERM группе, ждёт 5 секунд и при необходимости посылает SIGKILL. Shutdown Agent
+останавливает supervised children тем же механизмом. stdout и stderr хранятся раздельно
+в bounded in-memory tails по 64 KiB; значения environment не логируются.
+
+При `ON_FAILURE` неожиданный exit перезапускается с backoff 1, 2, 4, 8, 16 секунд до
+максимума 30 секунд. Пять crashes за 10 минут переводят execution в FAILED с
+`PROCESS_CRASHED`. Explicit STOP отменяет pending restart. `NEVER` оставляет неожиданно
+завершившийся execution в CRASHED.
+
+Для acceptance доступен явный development/test CLI Controller, который использует тот
+же mTLS stream и не создаёт дополнительного listener:
+
+```sh
+le0x-controller --listen 0.0.0.0:50051 \
+  --dev-runtime-action start \
+  --target-agent agent_0123456789abcdef0123456789abcdef \
+  --execution-id execution_0123456789abcdef0123456789abcdef \
+  --executable /bin/sleep --execution-arg 300
+```
+
+Действия: `start`, `stop`, `restart`, `get`. Этот механизм нужен до появления
+persistent DesiredState/Controller API и не обходит authentication.
 
 ## M1.3 — persistent Controller identity
 
@@ -64,6 +98,7 @@ Controller поддерживает тот же флаг `--insecure-dev` для
 - `cmd/le0x-controller/` — development-only Controller CLI skeleton.
 - `internal/agentidentity/` — выбор data directory и атомарное хранение identity.
 - `internal/agentnet/` — Agent gRPC client, handshake и reconnect backoff.
+- `internal/runtime/supervisor/` — Linux child-process lifecycle and watchdog.
 - `internal/controllernet/` — Controller gRPC stream handling and command correlation.
 - `internal/wiremap/` — преобразование domain inventory в protobuf wire model.
 - `internal/inventory/` — Linux discovery с подменяемыми источниками для тестов.
@@ -121,8 +156,8 @@ Name и Coin. ServiceProfile использует ServiceID, Name, Kind, Coin и
 
 DesiredState содержит версию схемы, HostID, Revision, список DesiredMining
 (ProfileID и DeviceIDs) и список ServiceID. Определений профилей и DeviceConfig в нём нет.
-ExecutionPlan содержит только версию схемы, ExecutionID, HostID, ProfileID,
-DeviceIDs и optional CPUThreads (*uint32). План пока не исполняется.
+ExecutionPlan сохраняет domain references и optional CPUThreads, а M2 добавляет
+resolved executable, argv, environment, working directory и restart policy.
 ObservedState и ExecutionObservation сохраняют наблюдения по ExecutionID.
 
 ProtocolVersion — версия взаимодействия компонентов; SchemaVersion — версия структуры
@@ -144,8 +179,9 @@ command_id — непрозрачная строка корреляции, во�
 Heartbeat использует google.protobuf.Timestamp и uint64 observed_state_revision.
 Ping/Pong содержат bytes nonce: Pong должен вернуть те же байты; это не аутентификация.
 
-Команды ограничены Ping, GetStatus и GetInventory. Результаты — Pong, Status,
-минимальный Inventory или TypedError. Оболочки используют oneof. Proto3 допускает
+Команды включают Ping, GetStatus, GetInventory и M2 lifecycle operations для execution.
+Результаты включают Pong, Status, минимальный Inventory, execution observations или
+TypedError. Оболочки используют oneof. Proto3 допускает
 незаполненный oneof и нулевые значения; обязательность полей, порядок hello и согласование
 версий пока не реализованы. Номера полей нельзя переназначать; удалённые номера и имена
 следует резервировать при будущих изменениях.

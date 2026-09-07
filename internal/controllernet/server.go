@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type Config struct {
@@ -40,6 +42,10 @@ type Config struct {
 	Trust               *controllertrust.Store
 	Pairing             *PairingWindow
 	PKI                 *controllerpki.PKI
+	// RuntimeCommands are development/test commands sent through the authenticated
+	// AgentControl stream. Production desired-state control is a later milestone.
+	RuntimeCommands []*le0xv1.CommandEnvelope
+	RuntimeTarget   identity.AgentID
 }
 
 type Server struct {
@@ -81,6 +87,11 @@ func New(config Config) (*Server, error) {
 	}
 	if config.Trust == nil {
 		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "Controller trust store is required"}
+	}
+	if len(config.RuntimeCommands) > 0 {
+		if err := config.RuntimeTarget.Validate(); err != nil {
+			return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "runtime commands require a target AgentID"}
+		}
 	}
 	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config}, nil
 }
@@ -247,6 +258,17 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 		return err
 	}
 	commands := []*le0xv1.CommandEnvelope{{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_Ping{Ping: &le0xv1.Ping{Nonce: nonce()}}}, {CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}, {CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}}}
+	for _, configured := range s.config.RuntimeCommands {
+		if agentID != s.config.RuntimeTarget {
+			break
+		}
+		if configured == nil {
+			continue
+		}
+		command := proto.Clone(configured).(*le0xv1.CommandEnvelope)
+		command.CommandId = commandID()
+		commands = append(commands, command)
+	}
 	pending := make(map[string]pendingCommand, len(commands))
 	for _, command := range commands {
 		kind := commandKind(command)
@@ -302,8 +324,27 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			} else {
 				s.logInventory(result.GetInventory())
 			}
+		case "START_EXECUTION", "STOP_EXECUTION", "RESTART_EXECUTION":
+			if result.GetExecution() == nil || result.GetExecution().Execution == nil {
+				s.log("%s: invalid result", strings.ToUpper(pendingResult.kind))
+			} else {
+				s.logExecution(pendingResult.kind, result.GetExecution().Execution, result.GetExecution().Message)
+			}
+		case "GET_EXECUTIONS":
+			if result.GetExecutions() == nil {
+				s.log("GET_EXECUTIONS: invalid result")
+			} else {
+				s.log("EXECUTIONS: %d", len(result.GetExecutions().Executions))
+				for _, execution := range result.GetExecutions().Executions {
+					s.logExecution("Execution", execution, "")
+				}
+			}
 		}
 	}
+}
+
+func (s *Server) logExecution(kind string, execution *le0xv1.Execution, message string) {
+	s.log("%s: %s state=%s pid=%d restart_count=%d message=%q last_error=%q", strings.ToUpper(kind), execution.ExecutionId, execution.State, execution.Pid, execution.RestartCount, message, execution.LastError)
 }
 
 func pingResultValid(result *le0xv1.CommandResult, expected []byte) bool {
@@ -346,6 +387,14 @@ func commandKind(command *le0xv1.CommandEnvelope) string {
 		return "GetStatus"
 	case command.GetGetInventory() != nil:
 		return "GetInventory"
+	case command.GetStartExecution() != nil:
+		return "START_EXECUTION"
+	case command.GetStopExecution() != nil:
+		return "STOP_EXECUTION"
+	case command.GetRestartExecution() != nil:
+		return "RESTART_EXECUTION"
+	case command.GetGetExecutions() != nil:
+		return "GET_EXECUTIONS"
 	default:
 		return "Unknown"
 	}

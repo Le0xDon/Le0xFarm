@@ -52,3 +52,24 @@ func TestPairingTTLRequiresPairing(t *testing.T) {
 		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
 	}
 }
+
+func TestBuildRuntimeCommand(t *testing.T) {
+	id := "execution_0123456789abcdef0123456789abcdef"
+	start, err := buildRuntimeCommand("start", id, "/bin/sleep", []string{"300"}, "", "ON_FAILURE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := start.GetStartExecution().GetPlan()
+	if plan.ExecutionId != id || plan.Executable != "/bin/sleep" || len(plan.Args) != 1 || plan.Args[0] != "300" || plan.RestartPolicy != "ON_FAILURE" {
+		t.Fatalf("start command=%v", start)
+	}
+	if command, err := buildRuntimeCommand("get", "", "", nil, "", "NEVER"); err != nil || command.GetGetExecutions() == nil {
+		t.Fatalf("get command=%v error=%v", command, err)
+	}
+	if _, err := buildRuntimeCommand("start", "", "/bin/sleep", nil, "", "NEVER"); err == nil {
+		t.Fatal("start without ExecutionID accepted")
+	}
+	if _, err := buildRuntimeCommand("", id, "", nil, "", "NEVER"); err == nil {
+		t.Fatal("execution option without development action accepted")
+	}
+}

@@ -43,6 +43,31 @@ message Pong {
 message GetStatus {}
 message GetInventory {}
 
+message ExecutionPlan {
+  string execution_id = 1;
+  string executable = 2;
+  repeated string args = 3;
+  map<string, string> environment = 4;
+  string working_directory = 5;
+  string restart_policy = 6;
+}
+message StartExecution { ExecutionPlan plan = 1; }
+message StopExecution { string execution_id = 1; }
+message RestartExecution { string execution_id = 1; }
+message GetExecutions {}
+message Execution {
+  string execution_id = 1;
+  string state = 2;
+  int64 pid = 3;
+  google.protobuf.Timestamp started_at = 4;
+  int32 exit_code = 5;
+  bool has_exit_code = 6;
+  uint32 restart_count = 7;
+  string last_error = 8;
+}
+message ExecutionResult { Execution execution = 1; string message = 2; }
+message Executions { repeated Execution executions = 1; }
+
 // The agent state vocabulary is not yet defined in M0.2.
 message Status {
   string agent_state = 1;
@@ -86,6 +111,10 @@ message CommandEnvelope {
     Ping ping = 2;
     GetStatus get_status = 3;
     GetInventory get_inventory = 4;
+    StartExecution start_execution = 5;
+    StopExecution stop_execution = 6;
+    RestartExecution restart_execution = 7;
+    GetExecutions get_executions = 8;
   }
 }
 
@@ -96,6 +125,8 @@ message CommandResult {
     Status status = 3;
     Inventory inventory = 4;
     TypedError error = 5;
+    ExecutionResult execution = 6;
+    Executions executions = 7;
   }
 }
 

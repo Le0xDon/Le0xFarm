@@ -132,10 +132,13 @@ type DesiredMining struct {
 type ExecutionStatus string
 
 const (
-	ExecutionPending ExecutionStatus = "pending"
-	ExecutionRunning ExecutionStatus = "running"
-	ExecutionStopped ExecutionStatus = "stopped"
-	ExecutionFailed  ExecutionStatus = "failed"
+	ExecutionStarting ExecutionStatus = "STARTING"
+	ExecutionRunning  ExecutionStatus = "RUNNING"
+	ExecutionStopping ExecutionStatus = "STOPPING"
+	ExecutionStopped  ExecutionStatus = "STOPPED"
+	ExecutionCrashed  ExecutionStatus = "CRASHED"
+	ExecutionBackoff  ExecutionStatus = "BACKOFF"
+	ExecutionFailed   ExecutionStatus = "FAILED"
 )
 
 type ObservedState struct {
@@ -147,21 +150,36 @@ type ObservedState struct {
 }
 
 type ExecutionObservation struct {
-	ExecutionID identity.ExecutionID
-	Status      ExecutionStatus
-	Error       *farmerr.Error
+	ExecutionID  identity.ExecutionID
+	Status       ExecutionStatus
+	Error        *farmerr.Error
+	PID          int
+	StartedAt    time.Time
+	ExitCode     *int
+	RestartCount uint32
+	LastError    string
 }
 
-// ExecutionPlan links an intended execution to its profile and allowed devices.
-// It does not yet contain process commands or orchestration logic.
 type ExecutionPlan struct {
-	SchemaVersion protocol.SchemaVersion
-	ExecutionID   identity.ExecutionID
-	HostID        identity.HostID
-	ProfileID     identity.ProfileID
-	DeviceIDs     []identity.DeviceID
-	CPUThreads    *uint32 // Nil means unspecified / auto / inherit.
+	SchemaVersion    protocol.SchemaVersion
+	ExecutionID      identity.ExecutionID
+	HostID           identity.HostID
+	ProfileID        identity.ProfileID
+	DeviceIDs        []identity.DeviceID
+	CPUThreads       *uint32 // Nil means unspecified / auto / inherit.
+	Executable       string
+	Args             []string
+	Environment      map[string]string
+	WorkingDirectory string
+	RestartPolicy    RestartPolicy
 }
+
+type RestartPolicy string
+
+const (
+	RestartNever     RestartPolicy = "NEVER"
+	RestartOnFailure RestartPolicy = "ON_FAILURE"
+)
 
 type Event struct {
 	SchemaVersion protocol.SchemaVersion

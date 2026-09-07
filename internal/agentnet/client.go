@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"strings"
@@ -24,7 +25,9 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
+	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 	"github.com/le0xdon/le0xfarm/internal/wiremap"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
@@ -51,6 +54,7 @@ type Config struct {
 	TrustDir          string
 	TLSFingerprint    string
 	tlsConfig         *tls.Config
+	Supervisor        *supervisor.Supervisor
 }
 
 type sessionError struct {
@@ -122,6 +126,11 @@ func Run(ctx context.Context, config Config) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		// A completed handshake/session resets the next reconnect delay
+		// immediately, even when earlier dial attempts reached the maximum.
+		if established {
+			backoff = config.ReconnectInitial
+		}
 		if err != nil && nonTransient(err) {
 			return err
 		}
@@ -135,9 +144,7 @@ func Run(ctx context.Context, config Config) error {
 			return nil
 		case <-timer.C:
 		}
-		if established {
-			backoff = config.ReconnectInitial
-		} else if backoff < config.ReconnectMax {
+		if !established && backoff < config.ReconnectMax {
 			backoff *= 2
 			if backoff > config.ReconnectMax {
 				backoff = config.ReconnectMax
@@ -410,12 +417,109 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 	case command.GetGetInventory() != nil:
 		facts, _ := config.Inventory.Discover(config.HostID)
 		result.Result = &le0xv1.CommandResult_Inventory{Inventory: wiremap.Inventory(facts)}
+	case command.GetStartExecution() != nil:
+		if config.Supervisor == nil {
+			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
+			break
+		}
+		plan, err := parsePlan(command.GetStartExecution().GetPlan())
+		if err != nil {
+			result.Result = errorResult(err)
+			break
+		}
+		snap, msg, err := config.Supervisor.Start(plan)
+		if err != nil {
+			result.Result = errorResult(err)
+		} else {
+			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
+		}
+	case command.GetStopExecution() != nil:
+		if config.Supervisor == nil {
+			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
+			break
+		}
+		id, err := identity.ParseExecutionID(command.GetStopExecution().ExecutionId)
+		if err != nil {
+			result.Result = wireError(farmerr.CONFIG_CONFLICT, "invalid ExecutionID")
+			break
+		}
+		snap, msg, err := config.Supervisor.Stop(id)
+		if err != nil {
+			result.Result = errorResult(err)
+		} else {
+			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
+		}
+	case command.GetRestartExecution() != nil:
+		if config.Supervisor == nil {
+			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
+			break
+		}
+		id, err := identity.ParseExecutionID(command.GetRestartExecution().ExecutionId)
+		if err != nil {
+			result.Result = wireError(farmerr.CONFIG_CONFLICT, "invalid ExecutionID")
+			break
+		}
+		snap, msg, err := config.Supervisor.Restart(id)
+		if err != nil {
+			result.Result = errorResult(err)
+		} else {
+			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
+		}
+	case command.GetGetExecutions() != nil:
+		if config.Supervisor == nil {
+			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
+			break
+		}
+		items := config.Supervisor.List()
+		wire := make([]*le0xv1.Execution, 0, len(items))
+		for _, item := range items {
+			wire = append(wire, wireExecution(item))
+		}
+		result.Result = &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{Executions: wire}}
 	default:
 		result.Result = &le0xv1.CommandResult_Error{Error: &le0xv1.TypedError{Code: "MISSING_COMMAND", HumanMessage: "Command variant is missing"}}
 	}
 	sendMu.Lock()
 	defer sendMu.Unlock()
 	return stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: result}})
+}
+
+func parsePlan(in *le0xv1.ExecutionPlan) (model.ExecutionPlan, error) {
+	if in == nil {
+		return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ExecutionPlan is required"}
+	}
+	id, err := identity.ParseExecutionID(in.ExecutionId)
+	if err != nil {
+		return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid ExecutionID"}
+	}
+	return model.ExecutionPlan{ExecutionID: id, Executable: in.Executable, Args: append([]string(nil), in.Args...), Environment: maps.Clone(in.Environment), WorkingDirectory: in.WorkingDirectory, RestartPolicy: model.RestartPolicy(in.RestartPolicy)}, nil
+}
+func wireExecution(s supervisor.Snapshot) *le0xv1.Execution {
+	out := &le0xv1.Execution{ExecutionId: s.ExecutionID.String(), State: string(s.State), Pid: int64(s.PID), RestartCount: s.RestartCount, LastError: s.LastError}
+	if !s.StartedAt.IsZero() {
+		out.StartedAt = timestamppb.New(s.StartedAt)
+	}
+	if s.ExitCode != nil {
+		out.HasExitCode = true
+		out.ExitCode = int32(*s.ExitCode)
+	}
+	return out
+}
+func wireError(code farmerr.Code, msg string) *le0xv1.CommandResult_Error {
+	return &le0xv1.CommandResult_Error{Error: &le0xv1.TypedError{Code: string(code), HumanMessage: msg}}
+}
+func errorResult(err error) *le0xv1.CommandResult_Error {
+	var typed farmerr.Error
+	if errors.As(err, &typed) {
+		return &le0xv1.CommandResult_Error{Error: &le0xv1.TypedError{
+			Code:         string(typed.Code),
+			HumanMessage: typed.HumanMessage,
+			Details:      maps.Clone(typed.Details),
+			SuggestedFix: typed.SuggestedFix,
+			LogsRef:      typed.LogsRef,
+		}}
+	}
+	return wireError(farmerr.INTERNAL_ERROR, err.Error())
 }
 
 func nonTransient(err error) bool {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,9 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
+	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
@@ -30,6 +33,41 @@ type helloServer struct {
 	le0xv1.UnimplementedAgentControlServer
 	controllerID identity.ControllerID
 	farmID       identity.FarmID
+}
+
+type switchingListener struct {
+	mu       sync.RWMutex
+	listener *bufconn.Listener
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (s *switchingListener) Dial() (net.Conn, error) {
+	s.mu.RLock()
+	listener := s.listener
+	s.mu.RUnlock()
+	return listener.Dial()
+}
+
+func (s *switchingListener) Set(listener *bufconn.Listener) {
+	s.mu.Lock()
+	s.listener = listener
+	s.mu.Unlock()
 }
 
 func (s helloServer) Connect(stream le0xv1.AgentControl_ConnectServer) error {
@@ -243,33 +281,39 @@ func TestSecureBootstrapThenMutualTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := controllernet.New(controllernet.Config{ControllerID: controllerID, FarmID: farmID, Trust: trust, Pairing: window, PKI: pki})
+	agentID, _ := identity.NewAgentID()
+	hostID, _ := identity.NewHostID()
+	executionID, _ := identity.NewExecutionID()
+	runtimeCommand := &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: executionID.String(), Executable: "/bin/sleep", Args: []string{"60"}, RestartPolicy: string(model.RestartNever)}}}}
+	var controllerOutput lockedBuffer
+	server, err := controllernet.New(controllernet.Config{ControllerID: controllerID, FarmID: farmID, Trust: trust, Pairing: window, PKI: pki, RuntimeCommands: []*le0xv1.CommandEnvelope{runtimeCommand}, RuntimeTarget: agentID, Output: log.New(&controllerOutput, "", 0), ShutdownGracePeriod: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	listener := bufconn.Listen(1024 * 1024)
+	dialer := &switchingListener{listener: listener}
 	serverCtx, stopServer := context.WithCancel(context.Background())
 	defer stopServer()
 	doneServer := make(chan error, 1)
 	go func() { doneServer <- server.Serve(serverCtx, listener) }()
 	agentDir := t.TempDir()
-	agentID, _ := identity.NewAgentID()
-	hostID, _ := identity.NewHostID()
 	if err := agenttrust.Save(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
 		t.Fatal(err)
 	}
-	var output bytes.Buffer
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	var output lockedBuffer
+	runtimeSupervisor := supervisor.New(supervisor.Config{StopGrace: 100 * time.Millisecond})
+	defer runtimeSupervisor.Shutdown(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Config{Target: "buf", TrustDir: agentDir, EnrollmentToken: token, TLSFingerprint: pki.ServerFingerprint(), AgentID: agentID, HostID: hostID, Hostname: "secure-test", Inventory: inventory.Local(), HeartbeatInterval: 10 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Dialer: func(context.Context, string) (net.Conn, error) { return listener.Dial() }, Output: log.New(&output, "", 0)})
+		done <- Run(ctx, Config{Target: "buf", TrustDir: agentDir, EnrollmentToken: token, TLSFingerprint: pki.ServerFingerprint(), AgentID: agentID, HostID: hostID, Hostname: "secure-test", Inventory: inventory.Local(), Supervisor: runtimeSupervisor, HeartbeatInterval: 10 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Dialer: func(context.Context, string) (net.Conn, error) { return dialer.Dial() }, Output: log.New(&output, "", 0)})
 	}()
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !bytes.Contains(output.Bytes(), []byte("Connected to Controller")) {
+	for time.Now().Before(deadline) && !strings.Contains(output.String(), "Connected to Controller") {
 		time.Sleep(time.Millisecond)
 	}
-	if !bytes.Contains(output.Bytes(), []byte("TLS enrollment complete")) || !bytes.Contains(output.Bytes(), []byte("Connected to Controller")) {
+	if !strings.Contains(output.String(), "TLS enrollment complete") || !strings.Contains(output.String(), "Connected to Controller") {
 		t.Fatalf("output=%s", output.String())
 	}
 	if _, err := agentpki.Load(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}, agentID, hostID); err != nil {
@@ -278,10 +322,51 @@ func TestSecureBootstrapThenMutualTLS(t *testing.T) {
 	if record, ok := trust.Find(agentID); !ok || record.HostID != hostID {
 		t.Fatal("Controller trust not persisted")
 	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if snapshot, ok := runtimeSupervisor.Get(executionID); ok && snapshot.State == model.ExecutionRunning {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	snapshot, ok := runtimeSupervisor.Get(executionID)
+	if !ok || snapshot.State != model.ExecutionRunning || snapshot.PID <= 0 {
+		t.Fatalf("authenticated mTLS START not executed: %+v", snapshot)
+	}
+	originalPID := snapshot.PID
+	// Enrollment streams return immediately after issuing credentials and never
+	// carry commands; the START above was accepted only on the subsequent mTLS stream.
+	secondListener := bufconn.Listen(1024 * 1024)
+	var reconnectOutput lockedBuffer
+	getCommand := &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}
+	secondServer, err := controllernet.New(controllernet.Config{ControllerID: controllerID, FarmID: farmID, Trust: trust, PKI: pki, RuntimeCommands: []*le0xv1.CommandEnvelope{getCommand}, RuntimeTarget: agentID, Output: log.New(&reconnectOutput, "", 0), ShutdownGracePeriod: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCtx, stopSecond := context.WithCancel(context.Background())
+	defer stopSecond()
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- secondServer.Serve(secondCtx, secondListener) }()
+	dialer.Set(secondListener)
+	stopServer()
+	if err := <-doneServer; err != nil {
+		t.Fatal(err)
+	}
+	if snapshot, _ := runtimeSupervisor.Get(executionID); snapshot.State != model.ExecutionRunning || snapshot.PID != originalPID {
+		t.Fatalf("Controller disconnect changed execution: %+v", snapshot)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	wantPID := fmt.Sprintf("pid=%d", originalPID)
+	for time.Now().Before(deadline) && (!strings.Contains(reconnectOutput.String(), executionID.String()) || !strings.Contains(reconnectOutput.String(), wantPID)) {
+		time.Sleep(time.Millisecond)
+	}
+	if !strings.Contains(reconnectOutput.String(), executionID.String()) || !strings.Contains(reconnectOutput.String(), wantPID) {
+		t.Fatalf("reconnect did not report same execution: %s", reconnectOutput.String())
+	}
 	cancel()
 	<-done
-	stopServer()
-	<-doneServer
+	stopSecond()
+	<-secondDone
 }
 
 func TestSecureBootstrapRejectsWrongFingerprint(t *testing.T) {
