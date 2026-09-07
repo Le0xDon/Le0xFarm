@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controllerpki"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
@@ -20,6 +22,8 @@ import (
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -35,6 +39,7 @@ type Config struct {
 	ShutdownGracePeriod time.Duration
 	Trust               *controllertrust.Store
 	Pairing             *PairingWindow
+	PKI                 *controllerpki.PKI
 }
 
 type Server struct {
@@ -53,8 +58,8 @@ type pendingCommand struct {
 }
 
 func New(config Config) (*Server, error) {
-	if !config.InsecureDev {
-		return nil, farmerr.Error{Code: farmerr.PERMISSION_DENIED, HumanMessage: "Secure transport is not implemented yet; refusing plaintext listener", SuggestedFix: "Pass --insecure-dev only for development/test transport."}
+	if !config.InsecureDev && config.PKI == nil {
+		return nil, farmerr.Error{Code: farmerr.TLS_CREDENTIALS_REQUIRED, HumanMessage: "Controller TLS credentials are required"}
 	}
 	if config.ProtocolVersion == 0 {
 		config.ProtocolVersion = uint32(protocol.CurrentProtocolVersion)
@@ -83,7 +88,11 @@ func New(config Config) (*Server, error) {
 func (s *Server) IDs() (identity.ControllerID, identity.FarmID) { return s.controllerID, s.farmID }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	s.grpcServer = grpc.NewServer()
+	options := []grpc.ServerOption{}
+	if !s.config.InsecureDev {
+		options = append(options, grpc.Creds(credentials.NewTLS(s.config.PKI.TLSConfig(s.config.Pairing != nil))))
+	}
+	s.grpcServer = grpc.NewServer(options...)
 	le0xv1.RegisterAgentControlServer(s.grpcServer, s)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- s.grpcServer.Serve(listener) }()
@@ -145,22 +154,77 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 		s.log("Rejected agent: invalid HostID")
 		return statusError(farmerr.CONFIG_CONFLICT, "invalid HostID")
 	}
-	if record, paired := s.config.Trust.Find(agentID); paired {
-		if record.HostID != hostID {
-			return statusError(farmerr.CONFIG_CONFLICT, "AgentID is paired to another HostID")
+	if !s.config.InsecureDev {
+		cert, hasCert := clientCertificate(stream.Context())
+		if !hasCert {
+			if hello.EnrollmentToken == "" {
+				return statusError(farmerr.TLS_CREDENTIALS_REQUIRED, "Agent client certificate or enrollment credentials are required")
+			}
+			if len(hello.CertificateRequestDer) == 0 {
+				return statusError(farmerr.TLS_CREDENTIALS_REQUIRED, "Agent certificate request is required")
+			}
+			if s.config.Pairing == nil {
+				return statusError(farmerr.PAIRING_REQUIRED, "Controller pairing window is not enabled")
+			}
+			csr, parseErr := x509.ParseCertificateRequest(hello.CertificateRequestDer)
+			if parseErr != nil || csr.CheckSignature() != nil {
+				return statusError(farmerr.TLS_IDENTITY_MISMATCH, "invalid Agent certificate request")
+			}
+			if !csrMatches(csr, s.farmID, agentID, hostID) {
+				return statusError(farmerr.TLS_IDENTITY_MISMATCH, "Agent CSR identity does not match AgentHello")
+			}
+			var issued []byte
+			err := s.config.Pairing.Use(hello.EnrollmentToken, func() error {
+				var issueErr error
+				issued, issueErr = s.config.PKI.IssueAgent(hello.CertificateRequestDer, agentID, hostID, time.Now())
+				if issueErr != nil {
+					return issueErr
+				}
+				if record, ok := s.config.Trust.Find(agentID); ok {
+					if record.HostID != hostID {
+						return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "AgentID is paired to another HostID"}
+					}
+					return nil
+				}
+				return s.config.Trust.Pair(agentID, hostID)
+			})
+			if err != nil {
+				if code, ok := farmerr.CodeOf(err); ok {
+					return statusError(code, err.Error())
+				}
+				return err
+			}
+			return stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: s.config.ProtocolVersion, SchemaVersion: s.config.SchemaVersion, ControllerId: s.controllerID.String(), FarmId: s.farmID.String(), AgentCertificateDer: issued, FarmCaCertificateDer: s.config.PKI.CACertificateDER()}}})
 		}
-	} else {
-		if hello.EnrollmentToken == "" {
-			return statusError(farmerr.PAIRING_REQUIRED, "Agent is not paired; enrollment token required")
-		}
-		if s.config.Pairing == nil {
-			return statusError(farmerr.PAIRING_REQUIRED, "Controller pairing window is not enabled")
-		}
-		if err := s.config.Pairing.Use(hello.EnrollmentToken, func() error { return s.config.Trust.Pair(agentID, hostID) }); err != nil {
+		if err := controllerpki.VerifyAgentCertificate(cert, s.config.PKI.CA, s.farmID, agentID, hostID, time.Now()); err != nil {
 			if code, ok := farmerr.CodeOf(err); ok {
 				return statusError(code, err.Error())
 			}
 			return err
+		}
+		if record, ok := s.config.Trust.Find(agentID); !ok {
+			return statusError(farmerr.PAIRING_REQUIRED, "Agent certificate is valid but Agent is not paired")
+		} else if record.HostID != hostID {
+			return statusError(farmerr.TLS_IDENTITY_MISMATCH, "Agent trust record does not match certificate")
+		}
+	} else {
+		if record, paired := s.config.Trust.Find(agentID); paired {
+			if record.HostID != hostID {
+				return statusError(farmerr.CONFIG_CONFLICT, "AgentID is paired to another HostID")
+			}
+		} else {
+			if hello.EnrollmentToken == "" {
+				return statusError(farmerr.PAIRING_REQUIRED, "Agent is not paired; enrollment token required")
+			}
+			if s.config.Pairing == nil {
+				return statusError(farmerr.PAIRING_REQUIRED, "Controller pairing window is not enabled")
+			}
+			if err := s.config.Pairing.Use(hello.EnrollmentToken, func() error { return s.config.Trust.Pair(agentID, hostID) }); err != nil {
+				if code, ok := farmerr.CodeOf(err); ok {
+					return statusError(code, err.Error())
+				}
+				return err
+			}
 		}
 	}
 	s.mu.Lock()
@@ -295,6 +359,27 @@ func commandID() string { var b [16]byte; _, _ = rand.Read(b[:]); return fmt.Spr
 func nonce() []byte     { var b [16]byte; _, _ = rand.Read(b[:]); return b[:] }
 func statusError(code farmerr.Code, message string) error {
 	return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: %s", code, message))
+}
+
+func clientCertificate(ctx context.Context) (*x509.Certificate, bool) {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return nil, false
+	}
+	info, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok || len(info.State.PeerCertificates) == 0 {
+		return nil, false
+	}
+	return info.State.PeerCertificates[0], true
+}
+func csrMatches(csr *x509.CertificateRequest, farmID identity.FarmID, agentID identity.AgentID, hostID identity.HostID) bool {
+	want := controllerpki.AgentURI(farmID, agentID, hostID).String()
+	for _, u := range csr.URIs {
+		if u.String() == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) ActiveConnections() int { s.mu.Lock(); defer s.mu.Unlock(); return s.connections }

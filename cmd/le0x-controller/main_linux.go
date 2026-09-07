@@ -16,6 +16,7 @@ import (
 
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
 	"github.com/le0xdon/le0xfarm/internal/controllernet"
+	"github.com/le0xdon/le0xfarm/internal/controllerpki"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 )
@@ -28,6 +29,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	listen := flags.String("listen", "127.0.0.1:50051", "TCP listen address")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
 	initIdentity := flags.Bool("init", false, "Initialize a new Controller/Farm identity")
+	initPKI := flags.Bool("init-pki", false, "Initialize PKI for an existing Controller identity")
 	pairing := flags.Bool("pairing", false, "Enable temporary development enrollment pairing")
 	pairingTTL := flags.Duration("pairing-ttl", 15*time.Minute, "Enrollment token lifetime")
 	if err := flags.Parse(args); err != nil {
@@ -50,9 +52,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--pairing-ttl requires --pairing")
 		return 2
 	}
-	if !*insecureDev {
-		fmt.Fprintln(stderr, "Secure transport will be implemented in a future stage; refusing plaintext. Pass --insecure-dev for development/test only.")
-		return 1
+	if *initIdentity && *initPKI {
+		fmt.Fprintln(stderr, "--init and --init-pki cannot be combined")
+		return 2
 	}
 	dataDir, err := controlleridentity.DataDir()
 	if err != nil {
@@ -79,6 +81,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		printError(stderr, err)
 		return 1
 	}
+	var pki *controllerpki.PKI
+	if *initIdentity || *initPKI {
+		pki, err = controllerpki.Initialize(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
+	} else if !*insecureDev {
+		pki, err = controllerpki.Load(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
+	}
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
 	trust, err := controllertrust.Open(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
 	if err != nil {
 		printError(stderr, err)
@@ -90,15 +102,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer listener.Close()
-	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: true, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Trust: trust, Pairing: pairingWindow, Output: log.New(stdout, "", 0)})
+	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: *insecureDev, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Trust: trust, Pairing: pairingWindow, PKI: pki, Output: log.New(stdout, "", 0)})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	controllerID, farmID := server.IDs()
-	fmt.Fprintf(stdout, "Le0xController\nControllerID: %s\nFarmID: %s\nListening: %s\nSecurity: INSECURE DEVELOPMENT MODE\n", controllerID, farmID, listener.Addr())
+	security := "TLS 1.3 MUTUAL TLS"
+	if *insecureDev {
+		security = "INSECURE DEVELOPMENT MODE"
+	}
+	fmt.Fprintf(stdout, "Le0xController\nControllerID: %s\nFarmID: %s\nListening: %s\nSecurity: %s\n", controllerID, farmID, listener.Addr(), security)
 	if *pairing {
-		fmt.Fprintf(stdout, "Pairing: ENABLED — DEVELOPMENT MODE\nEnrollment token: %s\nExpires: %s\n", token, expiry.Format(time.RFC3339))
+		if *insecureDev {
+			fmt.Fprintf(stdout, "Pairing: ENABLED — DEVELOPMENT MODE\nEnrollment token: %s\nExpires: %s\n", token, expiry.Format(time.RFC3339))
+		} else {
+			fmt.Fprintf(stdout, "Pairing: ENABLED\nEnrollment token: %s\nTLS fingerprint: %s\nExpires: %s\n", token, pki.ServerFingerprint(), expiry.Format(time.RFC3339))
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

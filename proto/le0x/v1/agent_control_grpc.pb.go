@@ -27,7 +27,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // Agent initiates the bidirectional stream to its authoritative Controller.
-// M0.2 defines only the contract; transport security and runtime are not implemented.
+// M1.5 uses this stream over TLS 1.3 with mutual TLS after enrollment.
 type AgentControlClient interface {
 	Connect(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AgentMessage, ControllerMessage], error)
 }
@@ -58,7 +58,7 @@ type AgentControl_ConnectClient = grpc.BidiStreamingClient[AgentMessage, Control
 // for forward compatibility.
 //
 // Agent initiates the bidirectional stream to its authoritative Controller.
-// M0.2 defines only the contract; transport security and runtime are not implemented.
+// M1.5 uses this stream over TLS 1.3 with mutual TLS after enrollment.
 type AgentControlServer interface {
 	Connect(grpc.BidiStreamingServer[AgentMessage, ControllerMessage]) error
 	mustEmbedUnimplementedAgentControlServer()

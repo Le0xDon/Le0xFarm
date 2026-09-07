@@ -260,3 +260,17 @@ go vet ./...
 ## M1.4 pairing foundation
 
 Development pairing uses a one-time 256-bit enrollment token held only in Controller memory. Start an initialized Controller with `--pairing` (optionally `--pairing-ttl 15m`), then connect a new Agent with `--controller HOST:PORT --insecure-dev --pair TOKEN`. The token travels over plaintext development transport and is not production security. After pairing, Controller trust is stored in `paired_agents.json` and Agent trust in `controller.json`; reconnects do not require the token. Production pairing will use mTLS/bootstrap security in a later stage.
+
+## M1.5 secure transport
+
+The default Agent–Controller transport is persistent gRPC over TLS 1.3 with mutual TLS. The Farm CA and Controller certificate use Ed25519 and live under the Controller data directory in `pki/`. Existing M1.4 Controllers initialize this PKI once with `--init-pki`; a fresh `--init` creates identity and PKI together. PKI is never regenerated automatically. `--insecure-dev` remains an explicit plaintext development mode and is never used as a fallback.
+
+Secure enrollment starts the Controller with `--pairing`. It prints a temporary token and the SHA-256 fingerprint of its current server certificate. The Agent reads the token from stdin and verifies the exact certificate fingerprint:
+
+```sh
+printf '%s\n' "$TOKEN" | le0x-agent --controller HOST:PORT --pair-stdin --tls-fingerprint SHA256:...
+```
+
+The Agent creates its Ed25519 key locally, sends only a signed CSR, persists the returned Agent certificate and Farm CA, closes the bootstrap stream, and reconnects with mutual TLS. Normal reconnect is simply `le0x-agent --controller HOST:PORT`. Controller certificates use the stable synthetic DNS name `<ControllerID>.controller.le0xfarm`; IP address, hostname and listen address do not define identity. Machine identities are also encoded in URI SANs and checked against protocol IDs and persistent trust.
+
+Controller PKI permissions are `pki/` 0700, private keys 0600 and certificates 0644. Agent PKI uses the same directory and file permission policy. Farm CA validity is 10 years, Controller server certificate validity is one year, and Agent client certificate validity is 180 days. Automatic renewal is future work and should renew Agent certificates around 30 days before expiration.

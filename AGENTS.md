@@ -179,3 +179,10 @@
 - Data sent to Brain for diagnosis must be sanitized.
 - Untrusted crypto repositories are built/tested in disposable VM isolation, not on production Agent/Controller/Noda.
 - Brain uses offline root signing key and replaceable/revocable online signing key.
+
+## Milestone workflow
+
+- For milestones that affect runtime behavior: IMPLEMENT -> UNIT TEST -> INTEGRATION TEST -> BUILD -> REAL VM ACCEPTANCE -> FIX IF NEEDED -> REPEAT UNTIL PASS -> REPORT -> STOP BEFORE COMMIT.
+- Codex must not commit milestone changes until the user explicitly accepts them.
+- Allowed real test hosts are only the SSH aliases controller-test and agent-1.
+- Do not access any other host.

@@ -10,13 +10,18 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
 )
 
-func TestControllerCLIRefusesPlaintextByDefault(t *testing.T) {
+func TestControllerSecureStartRequiresPKI(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "controller")
+	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)
+	if _, err := controlleridentity.Initialize(dir); err != nil {
+		t.Fatal(err)
+	}
 	var out, errOut bytes.Buffer
 	if code := run([]string{"--listen", "127.0.0.1:0"}, &out, &errOut); code != 1 {
 		t.Fatalf("exit %d", code)
 	}
-	if !strings.Contains(errOut.String(), "--insecure-dev") {
-		t.Fatalf("missing explicit development warning: %s", errOut.String())
+	if !strings.Contains(errOut.String(), "TLS_CREDENTIALS_REQUIRED") {
+		t.Fatalf("stderr=%s", errOut.String())
 	}
 }
 

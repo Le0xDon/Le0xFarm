@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,15 +28,17 @@ type report struct {
 	Warnings  []string        `json:"warnings"`
 }
 
-func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("le0x-agent", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	asJSON := flags.Bool("json", false, "Print local identity and inventory as JSON")
 	controller := flags.String("controller", "", "Controller host:port (enables persistent network mode)")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
 	pair := flags.String("pair", "", "Controller enrollment token (development only)")
+	pairStdin := flags.Bool("pair-stdin", false, "Read one secure enrollment token from stdin")
+	tlsFingerprint := flags.String("tls-fingerprint", "", "Controller certificate SHA-256 fingerprint")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -48,6 +51,33 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if *pair != "" && *controller == "" {
 		return fail(stderr, false, errors.New("--pair requires --controller"))
+	}
+	if *pair != "" && !*insecureDev {
+		return fail(stderr, false, errors.New("--pair is allowed only with --insecure-dev; use --pair-stdin for secure enrollment"))
+	}
+	if *pairStdin && (*controller == "" || *insecureDev) {
+		return fail(stderr, false, errors.New("--pair-stdin requires secure --controller mode"))
+	}
+	if *pairStdin && *tlsFingerprint == "" {
+		return fail(stderr, false, errors.New("--pair-stdin requires --tls-fingerprint"))
+	}
+	if *tlsFingerprint != "" && !*pairStdin {
+		return fail(stderr, false, errors.New("--tls-fingerprint requires --pair-stdin"))
+	}
+	token := *pair
+	if *pairStdin {
+		scanner := bufio.NewScanner(stdin)
+		scanner.Buffer(make([]byte, 1024), 4096)
+		if !scanner.Scan() || scanner.Text() == "" {
+			return fail(stderr, false, errors.New("expected one enrollment token on stdin"))
+		}
+		token = scanner.Text()
+		if scanner.Scan() {
+			return fail(stderr, false, errors.New("expected exactly one enrollment token line"))
+		}
+		if err := scanner.Err(); err != nil {
+			return fail(stderr, false, err)
+		}
 	}
 	dir, err := agentidentity.DataDir()
 	if err != nil {
@@ -64,7 +94,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, EnrollmentToken: *pair, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Output: log.New(stdout, "", 0)})
+		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Output: log.New(stdout, "", 0)})
 		if err != nil {
 			return fail(stderr, false, err)
 		}
@@ -72,6 +102,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if *insecureDev {
 		return fail(stderr, false, errors.New("--insecure-dev requires --controller"))
+	}
+	if *pairStdin || *tlsFingerprint != "" {
+		return fail(stderr, false, errors.New("pairing options require --controller"))
 	}
 	if err := present(stdout, report{Identity: id, Inventory: facts, Warnings: warnings}, *asJSON); err != nil {
 		return fail(stderr, *asJSON, farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "Cannot write Agent output", Details: map[string]string{"reason": err.Error()}})

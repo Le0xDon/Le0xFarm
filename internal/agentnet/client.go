@@ -4,15 +4,23 @@ package agentnet
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/agentpki"
 	"github.com/le0xdon/le0xfarm/internal/agenttrust"
+	"github.com/le0xdon/le0xfarm/internal/controllerpki"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
@@ -21,6 +29,7 @@ import (
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -40,6 +49,8 @@ type Config struct {
 	Output            *log.Logger
 	EnrollmentToken   string
 	TrustDir          string
+	TLSFingerprint    string
+	tlsConfig         *tls.Config
 }
 
 type sessionError struct {
@@ -52,9 +63,6 @@ func (e sessionError) Unwrap() error { return e.err }
 
 // Run blocks until ctx is cancelled. It reconnects transient failures with bounded exponential backoff.
 func Run(ctx context.Context, config Config) error {
-	if !config.InsecureDev {
-		return errors.New("secure transport is not implemented; pass --insecure-dev for development only")
-	}
 	if config.HeartbeatInterval <= 0 {
 		config.HeartbeatInterval = 10 * time.Second
 	}
@@ -70,12 +78,37 @@ func Run(ctx context.Context, config Config) error {
 	if config.TrustDir == "" {
 		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "Agent network mode requires a Controller trust directory"}
 	}
-	_, trustErr := agenttrust.Load(config.TrustDir)
+	binding, trustErr := agenttrust.Load(config.TrustDir)
 	if trustErr != nil && !errors.Is(trustErr, os.ErrNotExist) {
 		return trustErr
 	}
-	if errors.Is(trustErr, os.ErrNotExist) && config.EnrollmentToken == "" {
+	if config.InsecureDev && errors.Is(trustErr, os.ErrNotExist) && config.EnrollmentToken == "" {
 		return farmerr.Error{Code: farmerr.PAIRING_REQUIRED, HumanMessage: "Agent is not paired with a Controller", SuggestedFix: "Use --pair with a Controller enrollment token."}
+	}
+	if !config.InsecureDev {
+		creds, err := agentpki.Load(config.TrustDir, binding, config.AgentID, config.HostID)
+		if err != nil {
+			if code, ok := farmerr.CodeOf(err); !ok || code != farmerr.TLS_CREDENTIALS_REQUIRED {
+				return err
+			}
+			if config.EnrollmentToken == "" || config.TLSFingerprint == "" {
+				return err
+			}
+			if err := bootstrap(ctx, config, binding, !errors.Is(trustErr, os.ErrNotExist)); err != nil {
+				return err
+			}
+			binding, err = agenttrust.Load(config.TrustDir)
+			if err != nil {
+				return err
+			}
+			creds, err = agentpki.Load(config.TrustDir, binding, config.AgentID, config.HostID)
+			if err != nil {
+				return err
+			}
+		}
+		config.EnrollmentToken = ""
+		config.TLSFingerprint = ""
+		config.tlsConfig = agentpki.TLSConfig(creds)
 	}
 	backoff := config.ReconnectInitial
 	for {
@@ -114,11 +147,24 @@ func Run(ctx context.Context, config Config) error {
 }
 
 func connectOnce(ctx context.Context, config Config) error {
+	if !config.InsecureDev {
+		if err := verifyTLSEndpoint(ctx, config); err != nil {
+			return err
+		}
+	}
 	var opts []grpc.DialOption
 	if config.Dialer != nil {
 		opts = append(opts, grpc.WithContextDialer(config.Dialer))
 	}
-	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	if config.InsecureDev {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else {
+		if config.tlsConfig == nil {
+			return farmerr.Error{Code: farmerr.TLS_CREDENTIALS_REQUIRED, HumanMessage: "Agent TLS credentials are required"}
+		}
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(config.tlsConfig)))
+	}
+	opts = append(opts, grpc.WithBlock())
 	conn, err := grpc.DialContext(ctx, config.Target, opts...)
 	if err != nil {
 		return err
@@ -189,6 +235,153 @@ func connectOnce(ctx context.Context, config Config) error {
 	}
 }
 
+func bootstrap(ctx context.Context, config Config, binding agenttrust.Binding, hasBinding bool) error {
+	want, err := parseFingerprint(config.TLSFingerprint)
+	if err != nil {
+		return farmerr.Error{Code: farmerr.TLS_FINGERPRINT_MISMATCH, HumanMessage: "Invalid TLS fingerprint format"}
+	}
+	var controllerID identity.ControllerID
+	var farmID identity.FarmID
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true, VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return farmerr.Error{Code: farmerr.TLS_FINGERPRINT_MISMATCH, HumanMessage: "Controller did not present a certificate"}
+		}
+		got := sha256.Sum256(rawCerts[0])
+		if subtle.ConstantTimeCompare(got[:], want) != 1 {
+			return farmerr.Error{Code: farmerr.TLS_FINGERPRINT_MISMATCH, HumanMessage: "Controller TLS certificate fingerprint does not match"}
+		}
+		cert, e := x509.ParseCertificate(rawCerts[0])
+		if e != nil {
+			return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "Invalid Controller certificate"}
+		}
+		now := time.Now()
+		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+			return farmerr.Error{Code: farmerr.CERTIFICATE_EXPIRED, HumanMessage: "Controller certificate is not currently valid"}
+		}
+		controllerID, farmID, e = controllerpki.ParseControllerIdentity(cert)
+		if e != nil {
+			return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "Controller certificate identity is invalid"}
+		}
+		if hasBinding && (binding.ControllerID != controllerID || binding.FarmID != farmID) {
+			return farmerr.Error{Code: farmerr.CONTROLLER_IDENTITY_MISMATCH, HumanMessage: "Controller certificate differs from trusted binding"}
+		}
+		return nil
+	}}
+	if err := verifyBootstrapEndpoint(ctx, config, tlsConfig); err != nil {
+		return err
+	}
+	var opts []grpc.DialOption
+	if config.Dialer != nil {
+		opts = append(opts, grpc.WithContextDialer(config.Dialer))
+	}
+	opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, config.Target, opts...)
+	if err != nil {
+		return classifyBootstrapTLS(err)
+	}
+	defer conn.Close()
+	// TLS verification has populated the certificate identities before the stream starts.
+	enrollment, err := agentpki.NewEnrollment(config.AgentID, config.HostID, farmID)
+	if err != nil {
+		return err
+	}
+	stream, err := le0xv1.NewAgentControlClient(conn).Connect(ctx)
+	if err != nil {
+		return err
+	}
+	hello := &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: config.AgentID.String(), HostId: config.HostID.String(), Hostname: config.Hostname, EnrollmentToken: config.EnrollmentToken, CertificateRequestDer: enrollment.CSRDER}
+	if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: hello}}); err != nil {
+		return err
+	}
+	message, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	response := message.GetHello()
+	if response == nil || len(response.AgentCertificateDer) == 0 || len(response.FarmCaCertificateDer) == 0 {
+		return farmerr.Error{Code: farmerr.TLS_CREDENTIALS_REQUIRED, HumanMessage: "Controller did not return enrollment certificates"}
+	}
+	if response.ControllerId != controllerID.String() || response.FarmId != farmID.String() {
+		return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "ControllerHello identity does not match TLS certificate"}
+	}
+	if !hasBinding {
+		if err = agenttrust.Save(config.TrustDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
+			return err
+		}
+		binding = agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}
+	}
+	if err = agentpki.Save(config.TrustDir, enrollment, response.AgentCertificateDer, response.FarmCaCertificateDer, binding, config.AgentID, config.HostID); err != nil {
+		return err
+	}
+	config.Output.Printf("TLS enrollment complete; reconnecting with mutual TLS")
+	return nil
+}
+
+func parseFingerprint(value string) ([]byte, error) {
+	if !strings.HasPrefix(strings.ToUpper(value), "SHA256:") {
+		return nil, errors.New("missing SHA256 prefix")
+	}
+	raw := strings.ReplaceAll(value[len("SHA256:"):], ":", "")
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != sha256.Size {
+		return nil, errors.New("invalid SHA-256 fingerprint")
+	}
+	return decoded, nil
+}
+func classifyBootstrapTLS(err error) error {
+	var typed farmerr.Error
+	if errors.As(err, &typed) {
+		return typed
+	}
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) {
+		if invalid.Reason == x509.Expired {
+			return farmerr.Error{Code: farmerr.CERTIFICATE_EXPIRED, HumanMessage: "TLS certificate is not currently valid"}
+		}
+		return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "TLS certificate validation failed"}
+	}
+	var unknown x509.UnknownAuthorityError
+	if errors.As(err, &unknown) {
+		return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "Controller certificate is not signed by the trusted Farm CA"}
+	}
+	var hostname x509.HostnameError
+	if errors.As(err, &hostname) {
+		return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "Controller certificate server identity is invalid"}
+	}
+	var roots x509.SystemRootsError
+	if errors.As(err, &roots) {
+		return farmerr.Error{Code: farmerr.TLS_IDENTITY_MISMATCH, HumanMessage: "Trusted Farm CA roots are unavailable"}
+	}
+	return err
+}
+
+func verifyBootstrapEndpoint(ctx context.Context, config Config, tlsConfig *tls.Config) error {
+	var raw net.Conn
+	var err error
+	if config.Dialer != nil {
+		raw, err = config.Dialer(ctx, config.Target)
+	} else {
+		var dialer net.Dialer
+		raw, err = dialer.DialContext(ctx, "tcp", config.Target)
+	}
+	if err != nil {
+		return err
+	}
+	conn := tls.Client(raw, tlsConfig.Clone())
+	defer conn.Close()
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return classifyBootstrapTLS(err)
+	}
+	return nil
+}
+
+func verifyTLSEndpoint(ctx context.Context, config Config) error {
+	if config.tlsConfig == nil {
+		return farmerr.Error{Code: farmerr.TLS_CREDENTIALS_REQUIRED, HumanMessage: "Agent TLS credentials are required"}
+	}
+	return verifyBootstrapEndpoint(ctx, config, config.tlsConfig)
+}
+
 func heartbeatLoop(ctx context.Context, stream le0xv1.AgentControl_ConnectClient, interval time.Duration, sendMu *sync.Mutex) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -233,6 +426,9 @@ func nonTransient(err error) bool {
 		return true
 	}
 	if code, ok := farmerr.CodeOf(err); ok && (code == farmerr.PAIRING_REQUIRED || code == farmerr.PAIRING_TOKEN_INVALID || code == farmerr.PAIRING_TOKEN_EXPIRED || code == farmerr.CONTROLLER_IDENTITY_MISMATCH || code == farmerr.CONFIG_CONFLICT) {
+		return true
+	}
+	if code, ok := farmerr.CodeOf(err); ok && (code == farmerr.TLS_CREDENTIALS_REQUIRED || code == farmerr.TLS_FINGERPRINT_MISMATCH || code == farmerr.TLS_IDENTITY_MISMATCH || code == farmerr.CERTIFICATE_EXPIRED) {
 		return true
 	}
 	if status.Code(err) == codes.InvalidArgument {

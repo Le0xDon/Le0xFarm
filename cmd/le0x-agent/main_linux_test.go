@@ -62,7 +62,7 @@ func TestCLIErrorDoesNotReplaceIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"--json"}, &stdout, &stderr); code != 1 {
+	if code := run([]string{"--json"}, bytes.NewReader(nil), &stdout, &stderr); code != 1 {
 		t.Fatalf("exit %d", code)
 	}
 	if stdout.Len() != 0 {
@@ -88,11 +88,25 @@ func TestCLIHelpAndBadFlagsDoNotBootstrap(t *testing.T) {
 		code int
 	}{{[]string{"--help"}, 0}, {[]string{"--unknown"}, 2}, {[]string{"unexpected"}, 2}} {
 		var stdout, stderr bytes.Buffer
-		if got := run(tc.args, &stdout, &stderr); got != tc.code {
+		if got := run(tc.args, bytes.NewReader(nil), &stdout, &stderr); got != tc.code {
 			t.Fatalf("exit %d, want %d", got, tc.code)
 		}
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("argument handling created identity")
+	}
+}
+
+func TestSecurePairingCLIRejectsArgvTokenAndRequiresFingerprint(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agent")
+	t.Setenv("LE0X_DATA_DIR", dir)
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--controller", "127.0.0.1:1", "--pair", "secret"}, bytes.NewReader(nil), &out, &errOut); code != 1 || !strings.Contains(errOut.String(), "--pair-stdin") {
+		t.Fatalf("argv token: code=%d err=%q", code, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"--controller", "127.0.0.1:1", "--pair-stdin"}, strings.NewReader("secret\n"), &out, &errOut); code != 1 || !strings.Contains(errOut.String(), "--tls-fingerprint") {
+		t.Fatalf("fingerprint: code=%d err=%q", code, errOut.String())
 	}
 }

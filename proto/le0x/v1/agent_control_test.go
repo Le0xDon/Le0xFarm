@@ -34,12 +34,12 @@ func TestHelloVersions(t *testing.T) {
 	agent := &le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{
 		ProtocolVersion: 7, SchemaVersion: 19,
 		AgentId: "agent_0123456789abcdef0123456789abcdef",
-		HostId:  "host_0123456789abcdef0123456789abcdef", Hostname: "worker", EnrollmentToken: "token",
+		HostId:  "host_0123456789abcdef0123456789abcdef", Hostname: "worker", EnrollmentToken: "token", CertificateRequestDer: []byte{1, 2, 3},
 	}}}
 	controller := &le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{
 		ProtocolVersion: 7, SchemaVersion: 19,
 		ControllerId: "controller_0123456789abcdef0123456789abcdef",
-		FarmId:       "farm_0123456789abcdef0123456789abcdef",
+		FarmId:       "farm_0123456789abcdef0123456789abcdef", AgentCertificateDer: []byte{4, 5}, FarmCaCertificateDer: []byte{6, 7},
 	}}}
 	a := roundTrip(t, agent).(*le0xv1.AgentMessage).GetHello()
 	c := roundTrip(t, controller).(*le0xv1.ControllerMessage).GetHello()
@@ -48,6 +48,9 @@ func TestHelloVersions(t *testing.T) {
 	}
 	if a.GetEnrollmentToken() != "token" {
 		t.Fatal("enrollment token lost")
+	}
+	if !bytes.Equal(a.GetCertificateRequestDer(), []byte{1, 2, 3}) || !bytes.Equal(c.GetAgentCertificateDer(), []byte{4, 5}) || !bytes.Equal(c.GetFarmCaCertificateDer(), []byte{6, 7}) {
+		t.Fatal("certificate bootstrap fields lost")
 	}
 	for _, message := range []proto.Message{a, c} {
 		for _, name := range []protoreflect.Name{"protocol_version", "schema_version"} {

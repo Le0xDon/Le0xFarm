@@ -14,6 +14,7 @@ message AgentHello {
   string host_id = 4;
   string hostname = 5;
   string enrollment_token = 6;
+  bytes certificate_request_der = 7;
 }
 
 message ControllerHello {
@@ -21,6 +22,8 @@ message ControllerHello {
   uint32 schema_version = 2;
   string controller_id = 3;
   string farm_id = 4;
+  bytes agent_certificate_der = 5;
+  bytes farm_ca_certificate_der = 6;
 }
 
 message Heartbeat {
@@ -112,7 +115,7 @@ message ControllerMessage {
 }
 
 // Agent initiates the bidirectional stream to its authoritative Controller.
-// M0.2 defines only the contract; transport security and runtime are not implemented.
+// M1.5 uses this stream over TLS 1.3 with mutual TLS after enrollment.
 service AgentControl {
   rpc Connect(stream AgentMessage) returns (stream ControllerMessage);
 }

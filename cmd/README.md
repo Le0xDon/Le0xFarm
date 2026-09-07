@@ -1,1 +1,1 @@
-M1.3: `le0x-controller` загружает persistent ControllerID/FarmID из `LE0X_CONTROLLER_DATA_DIR` или XDG user data path и передаёт их в runtime. Network transport остаётся development-only plaintext через явный `--insecure-dev`; production mTLS и runtime компонентов не реализованы.
+M1.5: `le0x-controller` загружает persistent ControllerID/FarmID и Farm PKI из `LE0X_CONTROLLER_DATA_DIR` или XDG user data path. Основной transport — persistent gRPC через TLS 1.3 с mutual TLS; plaintext доступен только через явный `--insecure-dev`.

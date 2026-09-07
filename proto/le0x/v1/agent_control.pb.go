@@ -24,15 +24,16 @@ const (
 
 // Versions are independent. IDs are opaque strings, validated at the domain boundary.
 type AgentHello struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	ProtocolVersion uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
-	SchemaVersion   uint32                 `protobuf:"varint,2,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
-	AgentId         string                 `protobuf:"bytes,3,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
-	HostId          string                 `protobuf:"bytes,4,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
-	Hostname        string                 `protobuf:"bytes,5,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	EnrollmentToken string                 `protobuf:"bytes,6,opt,name=enrollment_token,json=enrollmentToken,proto3" json:"enrollment_token,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion       uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	SchemaVersion         uint32                 `protobuf:"varint,2,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	AgentId               string                 `protobuf:"bytes,3,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	HostId                string                 `protobuf:"bytes,4,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	Hostname              string                 `protobuf:"bytes,5,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	EnrollmentToken       string                 `protobuf:"bytes,6,opt,name=enrollment_token,json=enrollmentToken,proto3" json:"enrollment_token,omitempty"`
+	CertificateRequestDer []byte                 `protobuf:"bytes,7,opt,name=certificate_request_der,json=certificateRequestDer,proto3" json:"certificate_request_der,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *AgentHello) Reset() {
@@ -107,14 +108,23 @@ func (x *AgentHello) GetEnrollmentToken() string {
 	return ""
 }
 
+func (x *AgentHello) GetCertificateRequestDer() []byte {
+	if x != nil {
+		return x.CertificateRequestDer
+	}
+	return nil
+}
+
 type ControllerHello struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	ProtocolVersion uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
-	SchemaVersion   uint32                 `protobuf:"varint,2,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
-	ControllerId    string                 `protobuf:"bytes,3,opt,name=controller_id,json=controllerId,proto3" json:"controller_id,omitempty"`
-	FarmId          string                 `protobuf:"bytes,4,opt,name=farm_id,json=farmId,proto3" json:"farm_id,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion      uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	SchemaVersion        uint32                 `protobuf:"varint,2,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	ControllerId         string                 `protobuf:"bytes,3,opt,name=controller_id,json=controllerId,proto3" json:"controller_id,omitempty"`
+	FarmId               string                 `protobuf:"bytes,4,opt,name=farm_id,json=farmId,proto3" json:"farm_id,omitempty"`
+	AgentCertificateDer  []byte                 `protobuf:"bytes,5,opt,name=agent_certificate_der,json=agentCertificateDer,proto3" json:"agent_certificate_der,omitempty"`
+	FarmCaCertificateDer []byte                 `protobuf:"bytes,6,opt,name=farm_ca_certificate_der,json=farmCaCertificateDer,proto3" json:"farm_ca_certificate_der,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ControllerHello) Reset() {
@@ -173,6 +183,20 @@ func (x *ControllerHello) GetFarmId() string {
 		return x.FarmId
 	}
 	return ""
+}
+
+func (x *ControllerHello) GetAgentCertificateDer() []byte {
+	if x != nil {
+		return x.AgentCertificateDer
+	}
+	return nil
+}
+
+func (x *ControllerHello) GetFarmCaCertificateDer() []byte {
+	if x != nil {
+		return x.FarmCaCertificateDer
+	}
+	return nil
 }
 
 type Heartbeat struct {
@@ -1130,7 +1154,7 @@ var File_proto_le0x_v1_agent_control_proto protoreflect.FileDescriptor
 
 const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\n" +
-	"!proto/le0x/v1/agent_control.proto\x12\ale0x.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd9\x01\n" +
+	"!proto/le0x/v1/agent_control.proto\x12\ale0x.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x91\x02\n" +
 	"\n" +
 	"AgentHello\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12%\n" +
@@ -1138,12 +1162,15 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\bagent_id\x18\x03 \x01(\tR\aagentId\x12\x17\n" +
 	"\ahost_id\x18\x04 \x01(\tR\x06hostId\x12\x1a\n" +
 	"\bhostname\x18\x05 \x01(\tR\bhostname\x12)\n" +
-	"\x10enrollment_token\x18\x06 \x01(\tR\x0fenrollmentToken\"\xa1\x01\n" +
+	"\x10enrollment_token\x18\x06 \x01(\tR\x0fenrollmentToken\x126\n" +
+	"\x17certificate_request_der\x18\a \x01(\fR\x15certificateRequestDer\"\x8c\x02\n" +
 	"\x0fControllerHello\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12%\n" +
 	"\x0eschema_version\x18\x02 \x01(\rR\rschemaVersion\x12#\n" +
 	"\rcontroller_id\x18\x03 \x01(\tR\fcontrollerId\x12\x17\n" +
-	"\afarm_id\x18\x04 \x01(\tR\x06farmId\"}\n" +
+	"\afarm_id\x18\x04 \x01(\tR\x06farmId\x122\n" +
+	"\x15agent_certificate_der\x18\x05 \x01(\fR\x13agentCertificateDer\x125\n" +
+	"\x17farm_ca_certificate_der\x18\x06 \x01(\fR\x14farmCaCertificateDer\"}\n" +
 	"\tHeartbeat\x128\n" +
 	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x126\n" +
 	"\x17observed_state_revision\x18\x02 \x01(\x04R\x15observedStateRevision\"\x1c\n" +
