@@ -2,15 +2,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/le0xdon/le0xfarm/internal/agentidentity"
+	"github.com/le0xdon/le0xfarm/internal/agentnet"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
 	"github.com/le0xdon/le0xfarm/internal/model"
@@ -28,6 +33,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("le0x-agent", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	asJSON := flags.Bool("json", false, "Print local identity and inventory as JSON")
+	controller := flags.String("controller", "", "Controller host:port (enables persistent network mode)")
+	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -47,6 +54,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, *asJSON, err)
 	}
 	facts, warnings := inventory.Local().Discover(id.HostID)
+	if *controller != "" {
+		if *asJSON {
+			return fail(stderr, true, fmt.Errorf("--json cannot be combined with --controller"))
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Output: log.New(stdout, "", 0)})
+		if err != nil {
+			return fail(stderr, false, err)
+		}
+		return 0
+	}
+	if *insecureDev {
+		return fail(stderr, false, errors.New("--insecure-dev requires --controller"))
+	}
 	if err := present(stdout, report{Identity: id, Inventory: facts, Warnings: warnings}, *asJSON); err != nil {
 		return fail(stderr, *asJSON, farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "Cannot write Agent output", Details: map[string]string{"reason": err.Error()}})
 	}

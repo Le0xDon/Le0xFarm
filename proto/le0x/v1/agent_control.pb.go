@@ -435,19 +435,20 @@ func (x *Status) GetMessage() string {
 
 // Physical facts only. This is deliberately a subset of domain Inventory.
 type Inventory struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostId        string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
-	Hostname      string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	OsId          string                 `protobuf:"bytes,3,opt,name=os_id,json=osId,proto3" json:"os_id,omitempty"`
-	OsVersion     string                 `protobuf:"bytes,4,opt,name=os_version,json=osVersion,proto3" json:"os_version,omitempty"`
-	Architecture  string                 `protobuf:"bytes,5,opt,name=architecture,proto3" json:"architecture,omitempty"`
-	CpuVendor     string                 `protobuf:"bytes,6,opt,name=cpu_vendor,json=cpuVendor,proto3" json:"cpu_vendor,omitempty"`
-	CpuModel      string                 `protobuf:"bytes,7,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`
-	CpuCores      uint32                 `protobuf:"varint,8,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`
-	CpuThreads    uint32                 `protobuf:"varint,9,opt,name=cpu_threads,json=cpuThreads,proto3" json:"cpu_threads,omitempty"`
-	Gpus          []*GPU                 `protobuf:"bytes,10,rep,name=gpus,proto3" json:"gpus,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	HostId           string                 `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	Hostname         string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	OsId             string                 `protobuf:"bytes,3,opt,name=os_id,json=osId,proto3" json:"os_id,omitempty"`
+	OsVersion        string                 `protobuf:"bytes,4,opt,name=os_version,json=osVersion,proto3" json:"os_version,omitempty"`
+	Architecture     string                 `protobuf:"bytes,5,opt,name=architecture,proto3" json:"architecture,omitempty"`
+	CpuVendor        string                 `protobuf:"bytes,6,opt,name=cpu_vendor,json=cpuVendor,proto3" json:"cpu_vendor,omitempty"`
+	CpuModel         string                 `protobuf:"bytes,7,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`
+	CpuCores         uint32                 `protobuf:"varint,8,opt,name=cpu_cores,json=cpuCores,proto3" json:"cpu_cores,omitempty"`
+	CpuThreads       uint32                 `protobuf:"varint,9,opt,name=cpu_threads,json=cpuThreads,proto3" json:"cpu_threads,omitempty"`
+	Gpus             []*GPU                 `protobuf:"bytes,10,rep,name=gpus,proto3" json:"gpus,omitempty"`
+	MemoryTotalBytes uint64                 `protobuf:"varint,11,opt,name=memory_total_bytes,json=memoryTotalBytes,proto3" json:"memory_total_bytes,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Inventory) Reset() {
@@ -548,6 +549,13 @@ func (x *Inventory) GetGpus() []*GPU {
 		return x.Gpus
 	}
 	return nil
+}
+
+func (x *Inventory) GetMemoryTotalBytes() uint64 {
+	if x != nil {
+		return x.MemoryTotalBytes
+	}
+	return 0
 }
 
 type GPU struct {
@@ -1139,7 +1147,7 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\x06Status\x12\x1f\n" +
 	"\vagent_state\x18\x01 \x01(\tR\n" +
 	"agentState\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\xb4\x02\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xe2\x02\n" +
 	"\tInventory\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12\x13\n" +
@@ -1154,7 +1162,8 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\vcpu_threads\x18\t \x01(\rR\n" +
 	"cpuThreads\x12 \n" +
 	"\x04gpus\x18\n" +
-	" \x03(\v2\f.le0x.v1.GPUR\x04gpus\"\x82\x01\n" +
+	" \x03(\v2\f.le0x.v1.GPUR\x04gpus\x12,\n" +
+	"\x12memory_total_bytes\x18\v \x01(\x04R\x10memoryTotalBytes\"\x82\x01\n" +
 	"\x03GPU\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x16\n" +
 	"\x06vendor\x18\x02 \x01(\tR\x06vendor\x12\x14\n" +

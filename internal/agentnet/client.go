@@ -1,0 +1,212 @@
+// Package agentnet contains the Agent's reconnecting development gRPC client.
+// Plaintext is intentionally available only when InsecureDev is explicitly true.
+package agentnet
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/protocol"
+	"github.com/le0xdon/le0xfarm/internal/wiremap"
+	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type Config struct {
+	Target            string
+	InsecureDev       bool
+	AgentID           identity.AgentID
+	HostID            identity.HostID
+	Hostname          string
+	Inventory         inventory.Source
+	HeartbeatInterval time.Duration
+	ReconnectInitial  time.Duration
+	ReconnectMax      time.Duration
+	Dialer            func(context.Context, string) (net.Conn, error)
+	Output            *log.Logger
+}
+
+type sessionError struct {
+	err         error
+	established bool
+}
+
+func (e sessionError) Error() string { return e.err.Error() }
+func (e sessionError) Unwrap() error { return e.err }
+
+// Run blocks until ctx is cancelled. It reconnects transient failures with bounded exponential backoff.
+func Run(ctx context.Context, config Config) error {
+	if !config.InsecureDev {
+		return errors.New("secure transport is not implemented; pass --insecure-dev for development only")
+	}
+	if config.HeartbeatInterval <= 0 {
+		config.HeartbeatInterval = 10 * time.Second
+	}
+	if config.ReconnectInitial <= 0 {
+		config.ReconnectInitial = time.Second
+	}
+	if config.ReconnectMax <= 0 {
+		config.ReconnectMax = 30 * time.Second
+	}
+	if config.Output == nil {
+		config.Output = log.Default()
+	}
+	backoff := config.ReconnectInitial
+	for {
+		err := connectOnce(ctx, config)
+		established := false
+		var session sessionError
+		if errors.As(err, &session) {
+			established = session.established
+			err = session.err
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil && nonTransient(err) {
+			return err
+		}
+		if err != nil {
+			config.Output.Printf("Controller connection lost: %v; reconnecting in %s", err, backoff)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+		if established {
+			backoff = config.ReconnectInitial
+		} else if backoff < config.ReconnectMax {
+			backoff *= 2
+			if backoff > config.ReconnectMax {
+				backoff = config.ReconnectMax
+			}
+		}
+	}
+}
+
+func connectOnce(ctx context.Context, config Config) error {
+	var opts []grpc.DialOption
+	if config.Dialer != nil {
+		opts = append(opts, grpc.WithContextDialer(config.Dialer))
+	}
+	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, config.Target, opts...)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := le0xv1.NewAgentControlClient(conn)
+	stream, err := client.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: config.AgentID.String(), HostId: config.HostID.String(), Hostname: config.Hostname}}}); err != nil {
+		return err
+	}
+	message, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	hello := message.GetHello()
+	if hello == nil {
+		return errors.New("controller did not send ControllerHello")
+	}
+	if hello.ProtocolVersion != uint32(protocol.CurrentProtocolVersion) {
+		return farmerr.Error{Code: farmerr.PROTOCOL_VERSION_MISMATCH, HumanMessage: fmt.Sprintf("controller protocol version %d is unsupported", hello.ProtocolVersion)}
+	}
+	if hello.SchemaVersion != uint32(protocol.CurrentSchemaVersion) {
+		return farmerr.Error{Code: farmerr.SCHEMA_VERSION_MISMATCH, HumanMessage: fmt.Sprintf("controller schema version %d is unsupported", hello.SchemaVersion)}
+	}
+	if _, err := identity.ParseControllerID(hello.ControllerId); err != nil {
+		return fmt.Errorf("invalid ControllerID: %w", err)
+	}
+	if _, err := identity.ParseFarmID(hello.FarmId); err != nil {
+		return fmt.Errorf("invalid FarmID: %w", err)
+	}
+	config.Output.Printf("Connected to Controller %s (Farm %s)", hello.ControllerId, hello.FarmId)
+	heartbeats := make(chan error, 1)
+	var sendMu sync.Mutex
+	go func() { heartbeats <- heartbeatLoop(ctx, stream, config.HeartbeatInterval, &sendMu) }()
+	for {
+		message, err := stream.Recv()
+		if err != nil {
+			return sessionError{err: err, established: true}
+		}
+		command := message.GetCommand()
+		if command == nil {
+			continue
+		}
+		if err := handleCommand(stream, command, config, &sendMu); err != nil {
+			return err
+		}
+		select {
+		case err := <-heartbeats:
+			return sessionError{err: err, established: true}
+		default:
+		}
+	}
+}
+
+func heartbeatLoop(ctx context.Context, stream le0xv1.AgentControl_ConnectClient, interval time.Duration, sendMu *sync.Mutex) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case now := <-ticker.C:
+			sendMu.Lock()
+			if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Heartbeat{Heartbeat: &le0xv1.Heartbeat{Timestamp: timestamppb.New(now), ObservedStateRevision: 0}}}); err != nil {
+				sendMu.Unlock()
+				return err
+			}
+			sendMu.Unlock()
+		}
+	}
+}
+
+func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.CommandEnvelope, config Config, sendMu *sync.Mutex) error {
+	result := &le0xv1.CommandResult{CommandId: command.CommandId}
+	switch {
+	case command.GetPing() != nil:
+		result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: append([]byte(nil), command.GetPing().Nonce...)}}
+	case command.GetGetStatus() != nil:
+		result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "IDLE"}}
+	case command.GetGetInventory() != nil:
+		facts, _ := config.Inventory.Discover(config.HostID)
+		result.Result = &le0xv1.CommandResult_Inventory{Inventory: wiremap.Inventory(facts)}
+	default:
+		result.Result = &le0xv1.CommandResult_Error{Error: &le0xv1.TypedError{Code: "MISSING_COMMAND", HumanMessage: "Command variant is missing"}}
+	}
+	sendMu.Lock()
+	defer sendMu.Unlock()
+	return stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: result}})
+}
+
+func nonTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if code, ok := farmerr.CodeOf(err); ok && (code == farmerr.PROTOCOL_VERSION_MISMATCH || code == farmerr.SCHEMA_VERSION_MISMATCH) {
+		return true
+	}
+	if status.Code(err) == codes.InvalidArgument {
+		return true
+	}
+	return false
+}

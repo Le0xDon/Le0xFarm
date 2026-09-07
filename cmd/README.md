@@ -1,1 +1,1 @@
-M1.1: le0x-agent выполняет local bootstrap и выводит inventory. Запуск: go run ./cmd/le0x-agent [--json]. Сетевой runtime не реализован.
+M1.2: le0x-agent выполняет local bootstrap или подключается к development-only Controller через `--controller HOST:PORT --insecure-dev`. `le0x-controller` предоставляет минимальный plaintext gRPC skeleton только с явным `--insecure-dev`. Production mTLS и runtime компонентов не реализованы.

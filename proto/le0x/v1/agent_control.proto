@@ -57,6 +57,7 @@ message Inventory {
   uint32 cpu_cores = 8;
   uint32 cpu_threads = 9;
   repeated GPU gpus = 10;
+  uint64 memory_total_bytes = 11;
 }
 
 message GPU {

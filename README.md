@@ -8,16 +8,49 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Сейчас реализован **M1.1 — Le0xAgent local bootstrap** поверх M0.1 foundation
+Сейчас реализован **M1.2 — first Agent ↔ Controller connection** поверх M0.1 foundation
 и M0.2 protocol contracts. Agent сохраняет локальные IDs, собирает Linux inventory,
-выводит результат и завершает работу. Сетевые соединения, Controller runtime, mTLS,
-pairing, miner runtime, watchdog, Le0xNoda/Le0xBrain runtime и установка systemd
-не реализованы.
+может работать локально или подключаться к минимальному Controller через development-only
+plaintext gRPC. Production mTLS, pairing, miner runtime, watchdog, Le0xNoda/Le0xBrain
+runtime и установка systemd не реализованы.
+
+## M1.2 — first Agent ↔ Controller connection
+
+`le0x-controller` и network mode `le0x-agent --controller HOST:PORT --insecure-dev` теперь
+поднимают первый persistent bidirectional gRPC stream на базе `AgentControl.Connect`.
+`--insecure-dev` — только development/test механизм и никогда не является transport по
+умолчанию. Без него Controller отказывается запускать plaintext, а Agent не подключается;
+production architecture остаётся persistent gRPC + mTLS и будет реализована отдельно.
+
+Controller создаёт временные ControllerID/FarmID на каждый процесс и ничего не сохраняет.
+После handshake он отправляет Ping, GetStatus и GetInventory, сопоставляет ответы по
+непрозрачным уникальным command_id и показывает результат. Agent отвечает `Pong`, `IDLE`
+и текущим inventory, затем отправляет heartbeat с revision 0.
+
+При разрыве Agent переподключается с backoff 1, 2, 4, 8, 16 и до 30 секунд; после
+успешного handshake backoff сбрасывается. Ошибки несовместимых protocol/schema версий
+считаются non-transient и не запускают reconnect storm. Cancellation останавливает loop.
+Сетевой слой не управляет mining lifecycle; mining runtime в M1.2 отсутствует.
+
+Loopback development example:
+
+```sh
+go run ./cmd/le0x-controller --listen 127.0.0.1:50051 --insecure-dev
+LE0X_DATA_DIR="$PWD/.le0x-data" go run ./cmd/le0x-agent --controller 127.0.0.1:50051 --insecure-dev
+```
+
+`--json` предназначен для локального режима и не комбинируется с `--controller`.
+Controller поддерживает тот же флаг `--insecure-dev` для явного plaintext listener.
+Узлы, сертификаты, CA, mTLS, pairing и persistent Controller state не реализованы.
 
 ## Структура
 
 - `cmd/le0x-agent/` — запускаемый local bootstrap и CLI presentation.
+- `cmd/le0x-controller/` — development-only Controller CLI skeleton.
 - `internal/agentidentity/` — выбор data directory и атомарное хранение identity.
+- `internal/agentnet/` — Agent gRPC client, handshake и reconnect backoff.
+- `internal/controllernet/` — Controller gRPC stream handling and command correlation.
+- `internal/wiremap/` — преобразование domain inventory в protobuf wire model.
 - `internal/inventory/` — Linux discovery с подменяемыми источниками для тестов.
 - `internal/identity/` — типобезопасные идентификаторы.
 - `internal/model/` — доменные модели без исполняющей логики.

@@ -1,0 +1,60 @@
+// Le0xController M1.2 development-only gRPC runtime skeleton.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/le0xdon/le0xfarm/internal/controllernet"
+)
+
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+
+func run(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("le0x-controller", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	listen := flags.String("listen", "127.0.0.1:50051", "TCP listen address")
+	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(stderr, "Unexpected positional arguments")
+		return 2
+	}
+	if !*insecureDev {
+		fmt.Fprintln(stderr, "Secure transport will be implemented in a future stage; refusing plaintext. Pass --insecure-dev for development/test only.")
+		return 1
+	}
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer listener.Close()
+	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: true, Output: log.New(stdout, "", 0)})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	controllerID, farmID := server.IDs()
+	fmt.Fprintf(stdout, "Le0xController\nControllerID: %s\nFarmID: %s\nListening: %s\nSecurity: INSECURE DEVELOPMENT MODE\n", controllerID, farmID, listener.Addr())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := server.Serve(ctx, listener); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
