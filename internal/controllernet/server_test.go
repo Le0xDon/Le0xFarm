@@ -169,6 +169,85 @@ func TestControllerConnectionCounterLifecycle(t *testing.T) {
 	}
 }
 
+func startTestServe(t *testing.T, server *Server, listener *bufconn.Listener, ctx context.Context) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	return done
+}
+
+func TestServeShutdownForcesLongLivedStreamToStop(t *testing.T) {
+	server, err := New(Config{InsecureDev: true, ShutdownGracePeriod: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := bufconn.Listen(1024 * 1024)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTestServe(t, server, listener, ctx)
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	defer clientCancel()
+	conn, err := grpc.DialContext(clientCtx, "buf", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stream, err := le0xv1.NewAgentControlClient(conn).Connect(clientCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for server.ActiveConnections() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.ActiveConnections() != 1 {
+		t.Fatalf("active connection not registered: %d", server.ActiveConnections())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop after grace timeout")
+	}
+	deadline = time.Now().Add(time.Second)
+	for server.ActiveConnections() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := server.ActiveConnections(); got != 0 {
+		t.Fatalf("connections after forced shutdown: %d", got)
+	}
+}
+
+func TestServeShutdownWithoutStreamsIsImmediate(t *testing.T) {
+	server, err := New(Config{InsecureDev: true, ShutdownGracePeriod: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := bufconn.Listen(1024 * 1024)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTestServe(t, server, listener, ctx)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("idle Serve waited for grace period")
+	}
+	if server.ActiveConnections() != 0 {
+		t.Fatal("idle shutdown changed connection count")
+	}
+}
+
 func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 	cases := []struct {
 		name  string

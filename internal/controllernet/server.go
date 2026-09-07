@@ -23,12 +23,13 @@ import (
 )
 
 type Config struct {
-	ListenAddress   string
-	InsecureDev     bool
-	ProtocolVersion uint32
-	SchemaVersion   uint32
-	Inventory       inventory.Source
-	Output          *log.Logger
+	ListenAddress       string
+	InsecureDev         bool
+	ProtocolVersion     uint32
+	SchemaVersion       uint32
+	Inventory           inventory.Source
+	Output              *log.Logger
+	ShutdownGracePeriod time.Duration
 }
 
 type Server struct {
@@ -59,6 +60,9 @@ func New(config Config) (*Server, error) {
 	if config.Output == nil {
 		config.Output = log.Default()
 	}
+	if config.ShutdownGracePeriod <= 0 {
+		config.ShutdownGracePeriod = 3 * time.Second
+	}
 	controllerID, err := identity.NewControllerID()
 	if err != nil {
 		return nil, err
@@ -75,12 +79,37 @@ func (s *Server) IDs() (identity.ControllerID, identity.FarmID) { return s.contr
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	s.grpcServer = grpc.NewServer()
 	le0xv1.RegisterAgentControlServer(s.grpcServer, s)
-	go func() { <-ctx.Done(); s.grpcServer.GracefulStop() }()
-	err := s.grpcServer.Serve(listener)
-	if err == grpc.ErrServerStopped {
-		return nil
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.grpcServer.Serve(listener) }()
+	select {
+	case err := <-serveErr:
+		if err == grpc.ErrServerStopped {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		// GracefulStop waits for active streams, so bound it and force-close if needed.
+		gracefulDone := make(chan struct{})
+		go func() { s.grpcServer.GracefulStop(); close(gracefulDone) }()
+		timer := time.NewTimer(s.config.ShutdownGracePeriod)
+		select {
+		case <-gracefulDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			s.grpcServer.Stop()
+			<-gracefulDone
+		}
+		err := <-serveErr
+		if err == grpc.ErrServerStopped {
+			return nil
+		}
+		return err
 	}
-	return err
 }
 
 func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
