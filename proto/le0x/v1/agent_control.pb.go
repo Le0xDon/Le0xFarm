@@ -513,9 +513,6 @@ type MinerSpec struct {
 	Mode           string                 `protobuf:"bytes,5,opt,name=mode,proto3" json:"mode,omitempty"`
 	Coin           string                 `protobuf:"bytes,6,opt,name=coin,proto3" json:"coin,omitempty"`
 	Algorithm      string                 `protobuf:"bytes,7,opt,name=algorithm,proto3" json:"algorithm,omitempty"`
-	PoolUrl        string                 `protobuf:"bytes,8,opt,name=pool_url,json=poolUrl,proto3" json:"pool_url,omitempty"`
-	WalletAddress  string                 `protobuf:"bytes,9,opt,name=wallet_address,json=walletAddress,proto3" json:"wallet_address,omitempty"`
-	Worker         string                 `protobuf:"bytes,10,opt,name=worker,proto3" json:"worker,omitempty"`
 	CpuThreads     *uint32                `protobuf:"varint,11,opt,name=cpu_threads,json=cpuThreads,proto3,oneof" json:"cpu_threads,omitempty"`
 	GpuDeviceIds   []string               `protobuf:"bytes,12,rep,name=gpu_device_ids,json=gpuDeviceIds,proto3" json:"gpu_device_ids,omitempty"`
 	HugePages      *bool                  `protobuf:"varint,13,opt,name=huge_pages,json=hugePages,proto3,oneof" json:"huge_pages,omitempty"`
@@ -523,6 +520,7 @@ type MinerSpec struct {
 	Options        map[string]string      `protobuf:"bytes,15,rep,name=options,proto3" json:"options,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	WalletId       string                 `protobuf:"bytes,16,opt,name=wallet_id,json=walletId,proto3" json:"wallet_id,omitempty"`
 	PoolId         string                 `protobuf:"bytes,17,opt,name=pool_id,json=poolId,proto3" json:"pool_id,omitempty"`
+	Endpoint       *MiningEndpoint        `protobuf:"bytes,18,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -606,27 +604,6 @@ func (x *MinerSpec) GetAlgorithm() string {
 	return ""
 }
 
-func (x *MinerSpec) GetPoolUrl() string {
-	if x != nil {
-		return x.PoolUrl
-	}
-	return ""
-}
-
-func (x *MinerSpec) GetWalletAddress() string {
-	if x != nil {
-		return x.WalletAddress
-	}
-	return ""
-}
-
-func (x *MinerSpec) GetWorker() string {
-	if x != nil {
-		return x.Worker
-	}
-	return ""
-}
-
 func (x *MinerSpec) GetCpuThreads() uint32 {
 	if x != nil && x.CpuThreads != nil {
 		return *x.CpuThreads
@@ -676,6 +653,91 @@ func (x *MinerSpec) GetPoolId() string {
 	return ""
 }
 
+func (x *MinerSpec) GetEndpoint() *MiningEndpoint {
+	if x != nil {
+		return x.Endpoint
+	}
+	return nil
+}
+
+// Resolved transient pool connection data. Password is potentially sensitive
+// and must never be logged or persisted by the command transport.
+type MiningEndpoint struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	Tls           bool                   `protobuf:"varint,2,opt,name=tls,proto3" json:"tls,omitempty"`
+	User          string                 `protobuf:"bytes,3,opt,name=user,proto3" json:"user,omitempty"`
+	Password      string                 `protobuf:"bytes,4,opt,name=password,proto3" json:"password,omitempty"`
+	Worker        string                 `protobuf:"bytes,5,opt,name=worker,proto3" json:"worker,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MiningEndpoint) Reset() {
+	*x = MiningEndpoint{}
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MiningEndpoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MiningEndpoint) ProtoMessage() {}
+
+func (x *MiningEndpoint) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MiningEndpoint.ProtoReflect.Descriptor instead.
+func (*MiningEndpoint) Descriptor() ([]byte, []int) {
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *MiningEndpoint) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *MiningEndpoint) GetTls() bool {
+	if x != nil {
+		return x.Tls
+	}
+	return false
+}
+
+func (x *MiningEndpoint) GetUser() string {
+	if x != nil {
+		return x.User
+	}
+	return ""
+}
+
+func (x *MiningEndpoint) GetPassword() string {
+	if x != nil {
+		return x.Password
+	}
+	return ""
+}
+
+func (x *MiningEndpoint) GetWorker() string {
+	if x != nil {
+		return x.Worker
+	}
+	return ""
+}
+
 type StartExecution struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Plan          *ExecutionPlan         `protobuf:"bytes,1,opt,name=plan,proto3" json:"plan,omitempty"`
@@ -685,7 +747,7 @@ type StartExecution struct {
 
 func (x *StartExecution) Reset() {
 	*x = StartExecution{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[9]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -697,7 +759,7 @@ func (x *StartExecution) String() string {
 func (*StartExecution) ProtoMessage() {}
 
 func (x *StartExecution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[9]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -710,7 +772,7 @@ func (x *StartExecution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartExecution.ProtoReflect.Descriptor instead.
 func (*StartExecution) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{9}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *StartExecution) GetPlan() *ExecutionPlan {
@@ -729,7 +791,7 @@ type StopExecution struct {
 
 func (x *StopExecution) Reset() {
 	*x = StopExecution{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[10]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -741,7 +803,7 @@ func (x *StopExecution) String() string {
 func (*StopExecution) ProtoMessage() {}
 
 func (x *StopExecution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[10]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -754,7 +816,7 @@ func (x *StopExecution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopExecution.ProtoReflect.Descriptor instead.
 func (*StopExecution) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{10}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *StopExecution) GetExecutionId() string {
@@ -773,7 +835,7 @@ type RestartExecution struct {
 
 func (x *RestartExecution) Reset() {
 	*x = RestartExecution{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[11]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -785,7 +847,7 @@ func (x *RestartExecution) String() string {
 func (*RestartExecution) ProtoMessage() {}
 
 func (x *RestartExecution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[11]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -798,7 +860,7 @@ func (x *RestartExecution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestartExecution.ProtoReflect.Descriptor instead.
 func (*RestartExecution) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{11}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *RestartExecution) GetExecutionId() string {
@@ -816,7 +878,7 @@ type GetExecutions struct {
 
 func (x *GetExecutions) Reset() {
 	*x = GetExecutions{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[12]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -828,7 +890,7 @@ func (x *GetExecutions) String() string {
 func (*GetExecutions) ProtoMessage() {}
 
 func (x *GetExecutions) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[12]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -841,7 +903,7 @@ func (x *GetExecutions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetExecutions.ProtoReflect.Descriptor instead.
 func (*GetExecutions) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{12}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{13}
 }
 
 type Execution struct {
@@ -862,7 +924,7 @@ type Execution struct {
 
 func (x *Execution) Reset() {
 	*x = Execution{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[13]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -874,7 +936,7 @@ func (x *Execution) String() string {
 func (*Execution) ProtoMessage() {}
 
 func (x *Execution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[13]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -887,7 +949,7 @@ func (x *Execution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Execution.ProtoReflect.Descriptor instead.
 func (*Execution) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{13}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Execution) GetExecutionId() string {
@@ -970,7 +1032,7 @@ type DeviceHashrate struct {
 
 func (x *DeviceHashrate) Reset() {
 	*x = DeviceHashrate{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[14]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -982,7 +1044,7 @@ func (x *DeviceHashrate) String() string {
 func (*DeviceHashrate) ProtoMessage() {}
 
 func (x *DeviceHashrate) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[14]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -995,7 +1057,7 @@ func (x *DeviceHashrate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeviceHashrate.ProtoReflect.Descriptor instead.
 func (*DeviceHashrate) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{14}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *DeviceHashrate) GetDeviceId() string {
@@ -1043,7 +1105,7 @@ type MinerTelemetry struct {
 
 func (x *MinerTelemetry) Reset() {
 	*x = MinerTelemetry{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[15]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1055,7 +1117,7 @@ func (x *MinerTelemetry) String() string {
 func (*MinerTelemetry) ProtoMessage() {}
 
 func (x *MinerTelemetry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[15]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1068,7 +1130,7 @@ func (x *MinerTelemetry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MinerTelemetry.ProtoReflect.Descriptor instead.
 func (*MinerTelemetry) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{15}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *MinerTelemetry) GetAdapterId() string {
@@ -1242,7 +1304,7 @@ type ExecutionResult struct {
 
 func (x *ExecutionResult) Reset() {
 	*x = ExecutionResult{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[16]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1254,7 +1316,7 @@ func (x *ExecutionResult) String() string {
 func (*ExecutionResult) ProtoMessage() {}
 
 func (x *ExecutionResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[16]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1267,7 +1329,7 @@ func (x *ExecutionResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionResult.ProtoReflect.Descriptor instead.
 func (*ExecutionResult) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{16}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ExecutionResult) GetExecution() *Execution {
@@ -1293,7 +1355,7 @@ type Executions struct {
 
 func (x *Executions) Reset() {
 	*x = Executions{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[17]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1305,7 +1367,7 @@ func (x *Executions) String() string {
 func (*Executions) ProtoMessage() {}
 
 func (x *Executions) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[17]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1318,7 +1380,7 @@ func (x *Executions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Executions.ProtoReflect.Descriptor instead.
 func (*Executions) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{17}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *Executions) GetExecutions() []*Execution {
@@ -1339,7 +1401,7 @@ type Status struct {
 
 func (x *Status) Reset() {
 	*x = Status{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[18]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1351,7 +1413,7 @@ func (x *Status) String() string {
 func (*Status) ProtoMessage() {}
 
 func (x *Status) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[18]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1364,7 +1426,7 @@ func (x *Status) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Status.ProtoReflect.Descriptor instead.
 func (*Status) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{18}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Status) GetAgentState() string {
@@ -1401,7 +1463,7 @@ type Inventory struct {
 
 func (x *Inventory) Reset() {
 	*x = Inventory{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[19]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1413,7 +1475,7 @@ func (x *Inventory) String() string {
 func (*Inventory) ProtoMessage() {}
 
 func (x *Inventory) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[19]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1426,7 +1488,7 @@ func (x *Inventory) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Inventory.ProtoReflect.Descriptor instead.
 func (*Inventory) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{19}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Inventory) GetHostId() string {
@@ -1519,7 +1581,7 @@ type GPU struct {
 
 func (x *GPU) Reset() {
 	*x = GPU{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[20]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1531,7 +1593,7 @@ func (x *GPU) String() string {
 func (*GPU) ProtoMessage() {}
 
 func (x *GPU) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[20]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1544,7 +1606,7 @@ func (x *GPU) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GPU.ProtoReflect.Descriptor instead.
 func (*GPU) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{20}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *GPU) GetDeviceId() string {
@@ -1595,7 +1657,7 @@ type TypedError struct {
 
 func (x *TypedError) Reset() {
 	*x = TypedError{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1607,7 +1669,7 @@ func (x *TypedError) String() string {
 func (*TypedError) ProtoMessage() {}
 
 func (x *TypedError) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1620,7 +1682,7 @@ func (x *TypedError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TypedError.ProtoReflect.Descriptor instead.
 func (*TypedError) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{21}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *TypedError) GetCode() string {
@@ -1677,7 +1739,7 @@ type CommandEnvelope struct {
 
 func (x *CommandEnvelope) Reset() {
 	*x = CommandEnvelope{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1689,7 +1751,7 @@ func (x *CommandEnvelope) String() string {
 func (*CommandEnvelope) ProtoMessage() {}
 
 func (x *CommandEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1702,7 +1764,7 @@ func (x *CommandEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandEnvelope.ProtoReflect.Descriptor instead.
 func (*CommandEnvelope) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{22}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *CommandEnvelope) GetCommandId() string {
@@ -1846,7 +1908,7 @@ type CommandResult struct {
 
 func (x *CommandResult) Reset() {
 	*x = CommandResult{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1858,7 +1920,7 @@ func (x *CommandResult) String() string {
 func (*CommandResult) ProtoMessage() {}
 
 func (x *CommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1871,7 +1933,7 @@ func (x *CommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
 func (*CommandResult) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{23}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *CommandResult) GetCommandId() string {
@@ -1996,7 +2058,7 @@ type AgentMessage struct {
 
 func (x *AgentMessage) Reset() {
 	*x = AgentMessage{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2008,7 +2070,7 @@ func (x *AgentMessage) String() string {
 func (*AgentMessage) ProtoMessage() {}
 
 func (x *AgentMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2021,7 +2083,7 @@ func (x *AgentMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentMessage.ProtoReflect.Descriptor instead.
 func (*AgentMessage) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{24}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *AgentMessage) GetPayload() isAgentMessage_Payload {
@@ -2093,7 +2155,7 @@ type ControllerMessage struct {
 
 func (x *ControllerMessage) Reset() {
 	*x = ControllerMessage{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2105,7 +2167,7 @@ func (x *ControllerMessage) String() string {
 func (*ControllerMessage) ProtoMessage() {}
 
 func (x *ControllerMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2118,7 +2180,7 @@ func (x *ControllerMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControllerMessage.ProtoReflect.Descriptor instead.
 func (*ControllerMessage) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{25}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ControllerMessage) GetPayload() isControllerMessage_Payload {
@@ -2204,7 +2266,7 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\x05miner\x18\a \x01(\v2\x12.le0x.v1.MinerSpecR\x05miner\x1a>\n" +
 	"\x10EnvironmentEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x90\x05\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xfd\x04\n" +
 	"\tMinerSpec\x12\x1d\n" +
 	"\n" +
 	"adapter_id\x18\x01 \x01(\tR\tadapterId\x12!\n" +
@@ -2214,11 +2276,7 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\x0fpackage_version\x18\x04 \x01(\tR\x0epackageVersion\x12\x12\n" +
 	"\x04mode\x18\x05 \x01(\tR\x04mode\x12\x12\n" +
 	"\x04coin\x18\x06 \x01(\tR\x04coin\x12\x1c\n" +
-	"\talgorithm\x18\a \x01(\tR\talgorithm\x12\x19\n" +
-	"\bpool_url\x18\b \x01(\tR\apoolUrl\x12%\n" +
-	"\x0ewallet_address\x18\t \x01(\tR\rwalletAddress\x12\x16\n" +
-	"\x06worker\x18\n" +
-	" \x01(\tR\x06worker\x12$\n" +
+	"\talgorithm\x18\a \x01(\tR\talgorithm\x12$\n" +
 	"\vcpu_threads\x18\v \x01(\rH\x00R\n" +
 	"cpuThreads\x88\x01\x01\x12$\n" +
 	"\x0egpu_device_ids\x18\f \x03(\tR\fgpuDeviceIds\x12\"\n" +
@@ -2227,13 +2285,22 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\x03msr\x18\x0e \x01(\bH\x02R\x03msr\x88\x01\x01\x129\n" +
 	"\aoptions\x18\x0f \x03(\v2\x1f.le0x.v1.MinerSpec.OptionsEntryR\aoptions\x12\x1b\n" +
 	"\twallet_id\x18\x10 \x01(\tR\bwalletId\x12\x17\n" +
-	"\apool_id\x18\x11 \x01(\tR\x06poolId\x1a:\n" +
+	"\apool_id\x18\x11 \x01(\tR\x06poolId\x123\n" +
+	"\bendpoint\x18\x12 \x01(\v2\x17.le0x.v1.MiningEndpointR\bendpoint\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x0e\n" +
 	"\f_cpu_threadsB\r\n" +
 	"\v_huge_pagesB\x06\n" +
-	"\x04_msr\"<\n" +
+	"\x04_msrJ\x04\b\b\x10\tJ\x04\b\t\x10\n" +
+	"J\x04\b\n" +
+	"\x10\v\"\x84\x01\n" +
+	"\x0eMiningEndpoint\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x10\n" +
+	"\x03tls\x18\x02 \x01(\bR\x03tls\x12\x12\n" +
+	"\x04user\x18\x03 \x01(\tR\x04user\x12\x1a\n" +
+	"\bpassword\x18\x04 \x01(\tR\bpassword\x12\x16\n" +
+	"\x06worker\x18\x05 \x01(\tR\x06worker\"<\n" +
 	"\x0eStartExecution\x12*\n" +
 	"\x04plan\x18\x01 \x01(\v2\x16.le0x.v1.ExecutionPlanR\x04plan\"2\n" +
 	"\rStopExecution\x12!\n" +
@@ -2394,7 +2461,7 @@ func file_proto_le0x_v1_agent_control_proto_rawDescGZIP() []byte {
 	return file_proto_le0x_v1_agent_control_proto_rawDescData
 }
 
-var file_proto_le0x_v1_agent_control_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_proto_le0x_v1_agent_control_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
 var file_proto_le0x_v1_agent_control_proto_goTypes = []any{
 	(*AgentHello)(nil),            // 0: le0x.v1.AgentHello
 	(*ControllerHello)(nil),       // 1: le0x.v1.ControllerHello
@@ -2405,67 +2472,69 @@ var file_proto_le0x_v1_agent_control_proto_goTypes = []any{
 	(*GetInventory)(nil),          // 6: le0x.v1.GetInventory
 	(*ExecutionPlan)(nil),         // 7: le0x.v1.ExecutionPlan
 	(*MinerSpec)(nil),             // 8: le0x.v1.MinerSpec
-	(*StartExecution)(nil),        // 9: le0x.v1.StartExecution
-	(*StopExecution)(nil),         // 10: le0x.v1.StopExecution
-	(*RestartExecution)(nil),      // 11: le0x.v1.RestartExecution
-	(*GetExecutions)(nil),         // 12: le0x.v1.GetExecutions
-	(*Execution)(nil),             // 13: le0x.v1.Execution
-	(*DeviceHashrate)(nil),        // 14: le0x.v1.DeviceHashrate
-	(*MinerTelemetry)(nil),        // 15: le0x.v1.MinerTelemetry
-	(*ExecutionResult)(nil),       // 16: le0x.v1.ExecutionResult
-	(*Executions)(nil),            // 17: le0x.v1.Executions
-	(*Status)(nil),                // 18: le0x.v1.Status
-	(*Inventory)(nil),             // 19: le0x.v1.Inventory
-	(*GPU)(nil),                   // 20: le0x.v1.GPU
-	(*TypedError)(nil),            // 21: le0x.v1.TypedError
-	(*CommandEnvelope)(nil),       // 22: le0x.v1.CommandEnvelope
-	(*CommandResult)(nil),         // 23: le0x.v1.CommandResult
-	(*AgentMessage)(nil),          // 24: le0x.v1.AgentMessage
-	(*ControllerMessage)(nil),     // 25: le0x.v1.ControllerMessage
-	nil,                           // 26: le0x.v1.ExecutionPlan.EnvironmentEntry
-	nil,                           // 27: le0x.v1.MinerSpec.OptionsEntry
-	nil,                           // 28: le0x.v1.TypedError.DetailsEntry
-	(*timestamppb.Timestamp)(nil), // 29: google.protobuf.Timestamp
+	(*MiningEndpoint)(nil),        // 9: le0x.v1.MiningEndpoint
+	(*StartExecution)(nil),        // 10: le0x.v1.StartExecution
+	(*StopExecution)(nil),         // 11: le0x.v1.StopExecution
+	(*RestartExecution)(nil),      // 12: le0x.v1.RestartExecution
+	(*GetExecutions)(nil),         // 13: le0x.v1.GetExecutions
+	(*Execution)(nil),             // 14: le0x.v1.Execution
+	(*DeviceHashrate)(nil),        // 15: le0x.v1.DeviceHashrate
+	(*MinerTelemetry)(nil),        // 16: le0x.v1.MinerTelemetry
+	(*ExecutionResult)(nil),       // 17: le0x.v1.ExecutionResult
+	(*Executions)(nil),            // 18: le0x.v1.Executions
+	(*Status)(nil),                // 19: le0x.v1.Status
+	(*Inventory)(nil),             // 20: le0x.v1.Inventory
+	(*GPU)(nil),                   // 21: le0x.v1.GPU
+	(*TypedError)(nil),            // 22: le0x.v1.TypedError
+	(*CommandEnvelope)(nil),       // 23: le0x.v1.CommandEnvelope
+	(*CommandResult)(nil),         // 24: le0x.v1.CommandResult
+	(*AgentMessage)(nil),          // 25: le0x.v1.AgentMessage
+	(*ControllerMessage)(nil),     // 26: le0x.v1.ControllerMessage
+	nil,                           // 27: le0x.v1.ExecutionPlan.EnvironmentEntry
+	nil,                           // 28: le0x.v1.MinerSpec.OptionsEntry
+	nil,                           // 29: le0x.v1.TypedError.DetailsEntry
+	(*timestamppb.Timestamp)(nil), // 30: google.protobuf.Timestamp
 }
 var file_proto_le0x_v1_agent_control_proto_depIdxs = []int32{
-	29, // 0: le0x.v1.Heartbeat.timestamp:type_name -> google.protobuf.Timestamp
-	26, // 1: le0x.v1.ExecutionPlan.environment:type_name -> le0x.v1.ExecutionPlan.EnvironmentEntry
+	30, // 0: le0x.v1.Heartbeat.timestamp:type_name -> google.protobuf.Timestamp
+	27, // 1: le0x.v1.ExecutionPlan.environment:type_name -> le0x.v1.ExecutionPlan.EnvironmentEntry
 	8,  // 2: le0x.v1.ExecutionPlan.miner:type_name -> le0x.v1.MinerSpec
-	27, // 3: le0x.v1.MinerSpec.options:type_name -> le0x.v1.MinerSpec.OptionsEntry
-	7,  // 4: le0x.v1.StartExecution.plan:type_name -> le0x.v1.ExecutionPlan
-	29, // 5: le0x.v1.Execution.started_at:type_name -> google.protobuf.Timestamp
-	15, // 6: le0x.v1.Execution.miner_telemetry:type_name -> le0x.v1.MinerTelemetry
-	14, // 7: le0x.v1.MinerTelemetry.per_device:type_name -> le0x.v1.DeviceHashrate
-	29, // 8: le0x.v1.MinerTelemetry.collected_at:type_name -> google.protobuf.Timestamp
-	13, // 9: le0x.v1.ExecutionResult.execution:type_name -> le0x.v1.Execution
-	13, // 10: le0x.v1.Executions.executions:type_name -> le0x.v1.Execution
-	20, // 11: le0x.v1.Inventory.gpus:type_name -> le0x.v1.GPU
-	28, // 12: le0x.v1.TypedError.details:type_name -> le0x.v1.TypedError.DetailsEntry
-	3,  // 13: le0x.v1.CommandEnvelope.ping:type_name -> le0x.v1.Ping
-	5,  // 14: le0x.v1.CommandEnvelope.get_status:type_name -> le0x.v1.GetStatus
-	6,  // 15: le0x.v1.CommandEnvelope.get_inventory:type_name -> le0x.v1.GetInventory
-	9,  // 16: le0x.v1.CommandEnvelope.start_execution:type_name -> le0x.v1.StartExecution
-	10, // 17: le0x.v1.CommandEnvelope.stop_execution:type_name -> le0x.v1.StopExecution
-	11, // 18: le0x.v1.CommandEnvelope.restart_execution:type_name -> le0x.v1.RestartExecution
-	12, // 19: le0x.v1.CommandEnvelope.get_executions:type_name -> le0x.v1.GetExecutions
-	4,  // 20: le0x.v1.CommandResult.pong:type_name -> le0x.v1.Pong
-	18, // 21: le0x.v1.CommandResult.status:type_name -> le0x.v1.Status
-	19, // 22: le0x.v1.CommandResult.inventory:type_name -> le0x.v1.Inventory
-	21, // 23: le0x.v1.CommandResult.error:type_name -> le0x.v1.TypedError
-	16, // 24: le0x.v1.CommandResult.execution:type_name -> le0x.v1.ExecutionResult
-	17, // 25: le0x.v1.CommandResult.executions:type_name -> le0x.v1.Executions
-	0,  // 26: le0x.v1.AgentMessage.hello:type_name -> le0x.v1.AgentHello
-	2,  // 27: le0x.v1.AgentMessage.heartbeat:type_name -> le0x.v1.Heartbeat
-	23, // 28: le0x.v1.AgentMessage.command_result:type_name -> le0x.v1.CommandResult
-	1,  // 29: le0x.v1.ControllerMessage.hello:type_name -> le0x.v1.ControllerHello
-	22, // 30: le0x.v1.ControllerMessage.command:type_name -> le0x.v1.CommandEnvelope
-	24, // 31: le0x.v1.AgentControl.Connect:input_type -> le0x.v1.AgentMessage
-	25, // 32: le0x.v1.AgentControl.Connect:output_type -> le0x.v1.ControllerMessage
-	32, // [32:33] is the sub-list for method output_type
-	31, // [31:32] is the sub-list for method input_type
-	31, // [31:31] is the sub-list for extension type_name
-	31, // [31:31] is the sub-list for extension extendee
-	0,  // [0:31] is the sub-list for field type_name
+	28, // 3: le0x.v1.MinerSpec.options:type_name -> le0x.v1.MinerSpec.OptionsEntry
+	9,  // 4: le0x.v1.MinerSpec.endpoint:type_name -> le0x.v1.MiningEndpoint
+	7,  // 5: le0x.v1.StartExecution.plan:type_name -> le0x.v1.ExecutionPlan
+	30, // 6: le0x.v1.Execution.started_at:type_name -> google.protobuf.Timestamp
+	16, // 7: le0x.v1.Execution.miner_telemetry:type_name -> le0x.v1.MinerTelemetry
+	15, // 8: le0x.v1.MinerTelemetry.per_device:type_name -> le0x.v1.DeviceHashrate
+	30, // 9: le0x.v1.MinerTelemetry.collected_at:type_name -> google.protobuf.Timestamp
+	14, // 10: le0x.v1.ExecutionResult.execution:type_name -> le0x.v1.Execution
+	14, // 11: le0x.v1.Executions.executions:type_name -> le0x.v1.Execution
+	21, // 12: le0x.v1.Inventory.gpus:type_name -> le0x.v1.GPU
+	29, // 13: le0x.v1.TypedError.details:type_name -> le0x.v1.TypedError.DetailsEntry
+	3,  // 14: le0x.v1.CommandEnvelope.ping:type_name -> le0x.v1.Ping
+	5,  // 15: le0x.v1.CommandEnvelope.get_status:type_name -> le0x.v1.GetStatus
+	6,  // 16: le0x.v1.CommandEnvelope.get_inventory:type_name -> le0x.v1.GetInventory
+	10, // 17: le0x.v1.CommandEnvelope.start_execution:type_name -> le0x.v1.StartExecution
+	11, // 18: le0x.v1.CommandEnvelope.stop_execution:type_name -> le0x.v1.StopExecution
+	12, // 19: le0x.v1.CommandEnvelope.restart_execution:type_name -> le0x.v1.RestartExecution
+	13, // 20: le0x.v1.CommandEnvelope.get_executions:type_name -> le0x.v1.GetExecutions
+	4,  // 21: le0x.v1.CommandResult.pong:type_name -> le0x.v1.Pong
+	19, // 22: le0x.v1.CommandResult.status:type_name -> le0x.v1.Status
+	20, // 23: le0x.v1.CommandResult.inventory:type_name -> le0x.v1.Inventory
+	22, // 24: le0x.v1.CommandResult.error:type_name -> le0x.v1.TypedError
+	17, // 25: le0x.v1.CommandResult.execution:type_name -> le0x.v1.ExecutionResult
+	18, // 26: le0x.v1.CommandResult.executions:type_name -> le0x.v1.Executions
+	0,  // 27: le0x.v1.AgentMessage.hello:type_name -> le0x.v1.AgentHello
+	2,  // 28: le0x.v1.AgentMessage.heartbeat:type_name -> le0x.v1.Heartbeat
+	24, // 29: le0x.v1.AgentMessage.command_result:type_name -> le0x.v1.CommandResult
+	1,  // 30: le0x.v1.ControllerMessage.hello:type_name -> le0x.v1.ControllerHello
+	23, // 31: le0x.v1.ControllerMessage.command:type_name -> le0x.v1.CommandEnvelope
+	25, // 32: le0x.v1.AgentControl.Connect:input_type -> le0x.v1.AgentMessage
+	26, // 33: le0x.v1.AgentControl.Connect:output_type -> le0x.v1.ControllerMessage
+	33, // [33:34] is the sub-list for method output_type
+	32, // [32:33] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_proto_le0x_v1_agent_control_proto_init() }
@@ -2474,8 +2543,8 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 		return
 	}
 	file_proto_le0x_v1_agent_control_proto_msgTypes[8].OneofWrappers = []any{}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[15].OneofWrappers = []any{}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[22].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[16].OneofWrappers = []any{}
+	file_proto_le0x_v1_agent_control_proto_msgTypes[23].OneofWrappers = []any{
 		(*CommandEnvelope_Ping)(nil),
 		(*CommandEnvelope_GetStatus)(nil),
 		(*CommandEnvelope_GetInventory)(nil),
@@ -2484,7 +2553,7 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 		(*CommandEnvelope_RestartExecution)(nil),
 		(*CommandEnvelope_GetExecutions)(nil),
 	}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[23].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[24].OneofWrappers = []any{
 		(*CommandResult_Pong)(nil),
 		(*CommandResult_Status)(nil),
 		(*CommandResult_Inventory)(nil),
@@ -2492,12 +2561,12 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 		(*CommandResult_Execution)(nil),
 		(*CommandResult_Executions)(nil),
 	}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[24].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[25].OneofWrappers = []any{
 		(*AgentMessage_Hello)(nil),
 		(*AgentMessage_Heartbeat)(nil),
 		(*AgentMessage_CommandResult)(nil),
 	}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[25].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[26].OneofWrappers = []any{
 		(*ControllerMessage_Hello)(nil),
 		(*ControllerMessage_Command)(nil),
 	}
@@ -2507,7 +2576,7 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_le0x_v1_agent_control_proto_rawDesc), len(file_proto_le0x_v1_agent_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   29,
+			NumMessages:   30,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,9 +34,13 @@ func (values *stringList) Set(value string) error {
 	return nil
 }
 
-func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
+func main() { os.Exit(runWithInput(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithInput(args, strings.NewReader(""), stdout, stderr)
+}
+
+func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("le0x-controller", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	listen := flags.String("listen", "127.0.0.1:50051", "TCP listen address")
@@ -53,8 +59,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	packageID := flags.String("package-id", "", "Installed PackageID for start-miner")
 	packageVersion := flags.String("package-version", "", "Installed package version for start-miner")
 	minerMode := flags.String("miner-mode", "", "Miner mode for start-miner")
+	coin := flags.String("coin", "", "Optional resolved coin for start-miner")
 	algorithm := flags.String("algorithm", "", "Optional miner algorithm")
 	cpuThreads := flags.Uint("cpu-threads", 0, "CPU threads for start-miner")
+	poolAddress := flags.String("pool-address", "", "Resolved pool host:port for start-miner")
+	poolTLS := flags.Bool("pool-tls", false, "Require TLS for the resolved pool connection")
+	poolUser := flags.String("pool-user", "", "Exact public pool login for start-miner")
+	poolWorker := flags.String("pool-worker", "", "Optional separate pool worker identity")
+	poolPasswordStdin := flags.Bool("pool-password-stdin", false, "Read a potentially sensitive pool password from one stdin line")
 	var executionArgs stringList
 	flags.Var(&executionArgs, "execution-arg", "Argument for a development/test start; repeat for multiple argv entries")
 	if err := flags.Parse(args); err != nil {
@@ -88,9 +100,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "--cpu-threads exceeds uint32")
 			return 2
 		}
-		runtimeCommand, err = buildMinerRuntimeCommand(*executionID, *minerAdapter, *packageID, *packageVersion, *minerMode, *algorithm, uint32(*cpuThreads), *restartPolicy)
+		poolPassword := ""
+		if *poolPasswordStdin {
+			poolPassword, err = readOneLine(stdin)
+			if err != nil {
+				fmt.Fprintln(stderr, "cannot read pool password from stdin")
+				return 2
+			}
+		}
+		runtimeCommand, err = buildMinerRuntimeCommand(*executionID, *minerAdapter, *packageID, *packageVersion, *minerMode, *coin, *algorithm, uint32(*cpuThreads), *restartPolicy, endpointFromFlags(*poolAddress, *poolTLS, *poolUser, poolPassword, *poolWorker))
 	} else {
-		if *minerAdapter != "" || *packageID != "" || *packageVersion != "" || *minerMode != "" || *algorithm != "" || *cpuThreads != 0 {
+		if *minerAdapter != "" || *packageID != "" || *packageVersion != "" || *minerMode != "" || *coin != "" || *algorithm != "" || *cpuThreads != 0 || *poolAddress != "" || *poolTLS || *poolUser != "" || *poolWorker != "" || *poolPasswordStdin {
 			fmt.Fprintln(stderr, "miner options require --dev-runtime-action start-miner")
 			return 2
 		}
@@ -220,18 +240,45 @@ func buildRuntimeCommand(action, executionID, executable string, args []string, 
 	}
 }
 
-func buildMinerRuntimeCommand(executionID, adapterID, packageID, packageVersion, mode, algorithm string, cpuThreads uint32, restartPolicy string) (*le0xv1.CommandEnvelope, error) {
+func buildMinerRuntimeCommand(executionID, adapterID, packageID, packageVersion, mode, coin, algorithm string, cpuThreads uint32, restartPolicy string, endpoint *le0xv1.MiningEndpoint) (*le0xv1.CommandEnvelope, error) {
 	if executionID == "" || adapterID == "" || packageID == "" || packageVersion == "" || mode == "" {
 		return nil, errors.New("start-miner requires execution, adapter, package, version, and mode")
 	}
 	if restartPolicy != "NEVER" && restartPolicy != "ON_FAILURE" {
 		return nil, errors.New("--restart-policy must be NEVER or ON_FAILURE")
 	}
-	miner := &le0xv1.MinerSpec{AdapterId: adapterID, SpecVersion: 1, PackageId: packageID, PackageVersion: packageVersion, Mode: mode, Algorithm: algorithm}
+	miner := &le0xv1.MinerSpec{AdapterId: adapterID, SpecVersion: 1, PackageId: packageID, PackageVersion: packageVersion, Mode: mode, Coin: coin, Algorithm: algorithm, Endpoint: endpoint}
 	if cpuThreads > 0 {
 		miner.CpuThreads = &cpuThreads
 	}
 	return &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: executionID, RestartPolicy: restartPolicy, Miner: miner}}}}, nil
+}
+
+func endpointFromFlags(address string, tls bool, user, password, worker string) *le0xv1.MiningEndpoint {
+	if address == "" && !tls && user == "" && password == "" && worker == "" {
+		return nil
+	}
+	return &le0xv1.MiningEndpoint{Address: address, Tls: tls, User: user, Password: password, Worker: worker}
+}
+
+func readOneLine(in io.Reader) (string, error) {
+	scanner := bufio.NewScanner(io.LimitReader(in, 64<<10))
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", err
+		}
+		return "", errors.New("missing input")
+	}
+	value := scanner.Text()
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			return "", errors.New("unexpected additional input")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func printError(out io.Writer, err error) {

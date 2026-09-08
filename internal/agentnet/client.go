@@ -415,7 +415,11 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 	case command.GetPing() != nil:
 		result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: append([]byte(nil), command.GetPing().Nonce...)}}
 	case command.GetGetStatus() != nil:
-		result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "IDLE"}}
+		state := model.AgentStateIdle
+		if config.MinerRuntime != nil {
+			state = config.MinerRuntime.OverallStatus()
+		}
+		result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: string(state)}}
 	case command.GetGetInventory() != nil:
 		facts, _ := config.Inventory.Discover(config.HostID)
 		result.Result = &le0xv1.CommandResult_Inventory{Inventory: wiremap.Inventory(facts)}
@@ -556,7 +560,11 @@ func parsePlan(in *le0xv1.ExecutionPlan) (model.ExecutionPlan, error) {
 			}
 			poolID = &parsed
 		}
-		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, WalletID: walletID, PoolID: poolID, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, PoolURL: wire.PoolUrl, WalletAddress: wire.WalletAddress, Worker: wire.Worker, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
+		var endpoint *model.MiningEndpoint
+		if value := wire.GetEndpoint(); value != nil {
+			endpoint = &model.MiningEndpoint{Address: value.Address, TLS: value.Tls, User: value.User, Password: value.Password, Worker: value.Worker}
+		}
+		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, WalletID: walletID, PoolID: poolID, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, Endpoint: endpoint, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
 	}
 	return plan, nil
 }

@@ -149,10 +149,11 @@ func TestGenericMinerContractRoundTrip(t *testing.T) {
 	hashrate := 123.5
 	connected := true
 	message := &le0xv1.ExecutionPlan{ExecutionId: "execution_0123456789abcdef0123456789abcdef", RestartPolicy: "ON_FAILURE", Miner: &le0xv1.MinerSpec{
-		AdapterId: "test-no-http", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "1.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "STRESS", Algorithm: "test-algorithm", CpuThreads: &threads,
+		AdapterId: "test-no-http", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "1.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "MINING", Algorithm: "test-algorithm", CpuThreads: &threads,
+		Endpoint: &le0xv1.MiningEndpoint{Address: "pool.example:443", Tls: true, User: "public-login", Password: "transient-credential", Worker: "worker-1"},
 	}}
 	decoded := roundTrip(t, message).(*le0xv1.ExecutionPlan)
-	if decoded.GetMiner().GetAdapterId() != "test-no-http" || decoded.GetMiner().GetCpuThreads() != 2 || decoded.GetMiner().GetWalletId() == "" || decoded.GetMiner().GetPoolId() == "" {
+	if decoded.GetMiner().GetAdapterId() != "test-no-http" || decoded.GetMiner().GetCpuThreads() != 2 || decoded.GetMiner().GetWalletId() == "" || decoded.GetMiner().GetPoolId() == "" || !decoded.GetMiner().GetEndpoint().GetTls() || decoded.GetMiner().GetEndpoint().GetPassword() != "transient-credential" || decoded.GetMiner().GetEndpoint().GetWorker() != "worker-1" {
 		t.Fatalf("miner spec lost: %+v", decoded.GetMiner())
 	}
 	execution := &le0xv1.Execution{ExecutionId: message.ExecutionId, State: "RUNNING", Warnings: []string{"adapter-specific source has no HTTP API"}, MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test-no-http", MinerVersion: "1.0", HashrateShortHps: &hashrate, PoolConnected: &connected, Health: "HEALTHY"}}

@@ -3,6 +3,7 @@ package minerruntime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,6 +142,7 @@ func TestEvaluateMinerStatus(t *testing.T) {
 		code      farmerr.Code
 	}{
 		{"startup", model.MinerModeMining, supervisor.Snapshot{State: model.ExecutionRunning, StartedAt: now}, nil, model.MinerHealthStarting, ""},
+		{"running-only", model.MinerModeMining, running, nil, model.MinerHealthDegraded, farmerr.RPC_UNREACHABLE},
 		{"mining", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, PoolConnected: &connected}, model.MinerHealthMining, ""},
 		{"zero", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &zero, PoolConnected: &connected}, model.MinerHealthDegraded, farmerr.ZERO_HASHRATE},
 		{"pool", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, PoolConnected: &disconnected}, model.MinerHealthDegraded, farmerr.POOL_UNREACHABLE},
@@ -156,6 +158,79 @@ func TestEvaluateMinerStatus(t *testing.T) {
 				t.Fatalf("health=%s code=%s", got.Health, got.ErrorCode)
 			}
 		})
+	}
+}
+
+func TestOverallStatusTracksOnlyHealthyMiningExecution(t *testing.T) {
+	hash := 100.0
+	connected := true
+	source := &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, PoolConnected: &connected}}}}
+	registry := NewRegistry()
+	if err := registry.Register(&fakeAdapter{source: source}); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, model.Inventory{}, Config{PollInterval: time.Millisecond, StartupGrace: time.Millisecond, StaleAfter: time.Second})
+	plan := testPlan(t, model.MinerModeMining)
+	if _, _, err := manager.Start(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for manager.OverallStatus() != "MINING" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := manager.OverallStatus(); got != "MINING" {
+		t.Fatalf("status=%s", got)
+	}
+	if _, _, err := manager.Stop(plan.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.OverallStatus(); got != "IDLE" {
+		t.Fatalf("stopped status=%s", got)
+	}
+}
+
+func TestOverallAgentStatusSemanticsAndPrecedence(t *testing.T) {
+	running := supervisor.Snapshot{State: model.ExecutionRunning}
+	failed := supervisor.Snapshot{State: model.ExecutionFailed}
+	stopped := supervisor.Snapshot{State: model.ExecutionStopped}
+	starting := &model.MinerTelemetry{Health: model.MinerHealthStarting}
+	mining := &model.MinerTelemetry{Health: model.MinerHealthMining}
+	degraded := &model.MinerTelemetry{Health: model.MinerHealthDegraded}
+	terminal := &model.MinerTelemetry{Health: model.MinerHealthError}
+	cases := []struct {
+		name  string
+		items []overallStatusItem
+		want  model.AgentState
+	}{
+		{"none", nil, model.AgentStateIdle},
+		{"stress", []overallStatusItem{{mode: model.MinerModeStress, process: running, telemetry: starting}}, model.AgentStateIdle},
+		{"benchmark", []overallStatusItem{{mode: model.MinerModeBenchmark, process: running, telemetry: degraded}}, model.AgentStateIdle},
+		{"initializing", []overallStatusItem{{mode: model.MinerModeMining, process: running, telemetry: starting}}, model.AgentStateStarting},
+		{"healthy", []overallStatusItem{{mode: model.MinerModeMining, process: running, telemetry: mining}}, model.AgentStateMining},
+		{"degraded", []overallStatusItem{{mode: model.MinerModeMining, process: running, telemetry: degraded}}, model.AgentStateDegraded},
+		{"terminal", []overallStatusItem{{mode: model.MinerModeMining, process: failed, telemetry: terminal}}, model.AgentStateError},
+		{"stopped-terminal", []overallStatusItem{{mode: model.MinerModeMining, process: stopped, telemetry: terminal}}, model.AgentStateIdle},
+		{"error-precedence", []overallStatusItem{{mode: model.MinerModeMining, process: running, telemetry: mining}, {mode: model.MinerModeMining, process: running, telemetry: starting}, {mode: model.MinerModeMining, process: running, telemetry: degraded}, {mode: model.MinerModeMining, process: failed, telemetry: terminal}}, model.AgentStateError},
+		{"degraded-precedence", []overallStatusItem{{mode: model.MinerModeMining, process: running, telemetry: mining}, {mode: model.MinerModeMining, process: running, telemetry: starting}, {mode: model.MinerModeMining, process: running, telemetry: degraded}}, model.AgentStateDegraded},
+		{"starting-precedence", []overallStatusItem{{mode: model.MinerModeMining, process: running, telemetry: mining}, {mode: model.MinerModeMining, process: running, telemetry: starting}}, model.AgentStateStarting},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := aggregateOverallStatus(tc.items); got != tc.want {
+				t.Fatalf("status=%s want=%s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTelemetryFailureDoesNotExposeAdapterErrorText(t *testing.T) {
+	secret := "pool-password-must-not-leak"
+	if got := telemetryErrorMessage(errors.New("request failed with " + secret)); strings.Contains(got, secret) {
+		t.Fatalf("untyped adapter error leaked: %q", got)
+	}
+	typed := farmerr.Error{Code: farmerr.RPC_UNREACHABLE, HumanMessage: "local telemetry unavailable", Details: map[string]string{"credential": secret}}
+	if got := telemetryErrorMessage(typed); got != typed.HumanMessage || strings.Contains(got, secret) {
+		t.Fatalf("typed adapter error leaked details: %q", got)
 	}
 }
 

@@ -39,9 +39,13 @@ func TestValidateModesAndThreads(t *testing.T) {
 	}
 	mining := validSpec(t, model.MinerModeMining)
 	if _, err := adapter.Validate(mining, inventory); errorCode(err) != farmerr.CONFIG_CONFLICT {
-		t.Fatalf("missing pool/wallet error=%v", err)
+		t.Fatalf("missing endpoint error=%v", err)
 	}
-	mining.PoolURL, mining.WalletAddress = "stratum+tls://pool.example:443", "public-payout-address"
+	mining.Endpoint = &model.MiningEndpoint{Address: "pool.example:443"}
+	if _, err := adapter.Validate(mining, inventory); errorCode(err) != farmerr.CONFIG_CONFLICT {
+		t.Fatalf("missing public login error=%v", err)
+	}
+	mining.Endpoint = &model.MiningEndpoint{Address: "pool.example:443", TLS: true, User: "public-payout-address", Password: "private-pool-password", Worker: "worker-1"}
 	if _, err := adapter.Validate(mining, inventory); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +53,38 @@ func TestValidateModesAndThreads(t *testing.T) {
 	mining.CPUThreads = &tooMany
 	if _, err := adapter.Validate(mining, inventory); errorCode(err) != farmerr.CONFIG_CONFLICT {
 		t.Fatalf("threads error=%v", err)
+	}
+}
+
+func TestMiningConfigUsesResolvedEndpointWithoutInventingLoginSyntax(t *testing.T) {
+	spec := validSpec(t, model.MinerModeMining)
+	spec.Coin = "ZEPH"
+	spec.Endpoint = &model.MiningEndpoint{Address: "xmr.kryptex.network:7029", TLS: false, User: "public-account.worker-from-controller", Password: "x", Worker: "separate-worker"}
+	config := buildConfig(spec, 23456)
+	pools, ok := config["pools"].([]map[string]any)
+	if !ok || len(pools) != 1 {
+		t.Fatalf("pools=%#v", config["pools"])
+	}
+	pool := pools[0]
+	if pool["url"] != spec.Endpoint.Address || pool["tls"] != false || pool["user"] != spec.Endpoint.User || pool["pass"] != spec.Endpoint.Password || pool["rig-id"] != spec.Endpoint.Worker || pool["coin"] != "ZEPH" {
+		t.Fatalf("resolved endpoint changed: %#v", pool)
+	}
+	if pool["user"] == "public-account.worker-from-controller.separate-worker" {
+		t.Fatal("adapter implicitly concatenated worker to exact pool login")
+	}
+	spec.Endpoint.TLS = true
+	tlsPool := buildConfig(spec, 23457)["pools"].([]map[string]any)[0]
+	if tlsPool["tls"] != true {
+		t.Fatalf("TLS intent was not preserved: %#v", tlsPool)
+	}
+}
+
+func TestValidationErrorsDoNotLeakPoolPassword(t *testing.T) {
+	spec := validSpec(t, model.MinerModeMining)
+	spec.Endpoint = &model.MiningEndpoint{Password: "do-not-leak-this"}
+	_, err := (&Adapter{}).Validate(spec, model.Inventory{CPU: model.CPU{Threads: 4}})
+	if err == nil || strings.Contains(err.Error(), spec.Endpoint.Password) {
+		t.Fatalf("unsafe validation error: %v", err)
 	}
 }
 

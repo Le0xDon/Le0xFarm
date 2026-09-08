@@ -60,9 +60,7 @@ message MinerSpec {
   string mode = 5;
   string coin = 6;
   string algorithm = 7;
-  string pool_url = 8;
-  string wallet_address = 9;
-  string worker = 10;
+  reserved 8, 9, 10;
   optional uint32 cpu_threads = 11;
   repeated string gpu_device_ids = 12;
   optional bool huge_pages = 13;
@@ -70,6 +68,16 @@ message MinerSpec {
   map<string, string> options = 15;
   string wallet_id = 16;
   string pool_id = 17;
+  MiningEndpoint endpoint = 18;
+}
+// Resolved transient pool connection data. Password is potentially sensitive
+// and must never be logged or persisted by the command transport.
+message MiningEndpoint {
+  string address = 1;
+  bool tls = 2;
+  string user = 3;
+  string password = 4;
+  string worker = 5;
 }
 message StartExecution { ExecutionPlan plan = 1; }
 message StopExecution { string execution_id = 1; }

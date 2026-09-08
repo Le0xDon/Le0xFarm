@@ -244,6 +244,71 @@ func (m *Manager) List() []Observation {
 	return result
 }
 
+// OverallStatus aggregates only active real MINING executions. Diagnostic
+// workloads and historical stopped executions never affect Agent status.
+func (m *Manager) OverallStatus() model.AgentState {
+	snapshots := m.supervisor.List()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	items := make([]overallStatusItem, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		entry := m.executions[snapshot.ExecutionID]
+		if entry == nil || entry.plan.Miner == nil {
+			continue
+		}
+		observation := m.observationLocked(entry, snapshot)
+		items = append(items, overallStatusItem{mode: entry.plan.Miner.Mode, process: snapshot, telemetry: observation.Telemetry})
+	}
+	return aggregateOverallStatus(items)
+}
+
+type overallStatusItem struct {
+	mode      model.MinerMode
+	process   supervisor.Snapshot
+	telemetry *model.MinerTelemetry
+}
+
+// aggregateOverallStatus uses safety precedence ERROR > DEGRADED > STARTING >
+// MINING > IDLE. Stopped/stopping and non-MINING executions do not participate.
+func aggregateOverallStatus(items []overallStatusItem) model.AgentState {
+	result := model.AgentStateIdle
+	for _, item := range items {
+		if item.mode != model.MinerModeMining || item.process.State == model.ExecutionStopped || item.process.State == model.ExecutionStopping {
+			continue
+		}
+		candidate := model.AgentStateStarting
+		if item.telemetry != nil {
+			switch item.telemetry.Health {
+			case model.MinerHealthError:
+				candidate = model.AgentStateError
+			case model.MinerHealthDegraded:
+				candidate = model.AgentStateDegraded
+			case model.MinerHealthMining:
+				candidate = model.AgentStateMining
+			}
+		}
+		if agentStatePriority(candidate) > agentStatePriority(result) {
+			result = candidate
+		}
+	}
+	return result
+}
+
+func agentStatePriority(state model.AgentState) int {
+	switch state {
+	case model.AgentStateError:
+		return 4
+	case model.AgentStateDegraded:
+		return 3
+	case model.AgentStateStarting:
+		return 2
+	case model.AgentStateMining:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	for _, entry := range m.executions {
@@ -275,11 +340,12 @@ func (m *Manager) poll(ctx context.Context, id identity.ExecutionID, entry *mine
 			return
 		}
 		if err != nil {
+			message := telemetryErrorMessage(err)
 			if entry.telemetry == nil {
-				entry.telemetry = &model.MinerTelemetry{AdapterID: entry.plan.Miner.AdapterID, Health: model.MinerHealthStarting, Message: err.Error()}
+				entry.telemetry = &model.MinerTelemetry{AdapterID: entry.plan.Miner.AdapterID, Health: model.MinerHealthStarting, Message: message}
 			} else {
 				entry.telemetry.Age = now.Sub(entry.telemetry.CollectedAt)
-				entry.telemetry.Message = err.Error()
+				entry.telemetry.Message = message
 			}
 			return
 		}
@@ -298,6 +364,14 @@ func (m *Manager) poll(ctx context.Context, id identity.ExecutionID, entry *mine
 			poll()
 		}
 	}
+}
+
+func telemetryErrorMessage(err error) string {
+	var typed farmerr.Error
+	if errors.As(err, &typed) && typed.HumanMessage != "" {
+		return typed.HumanMessage
+	}
+	return "miner telemetry unavailable"
 }
 
 func (m *Manager) observationLocked(entry *minerExecution, process supervisor.Snapshot) Observation {
@@ -325,6 +399,10 @@ func Evaluate(mode model.MinerMode, process supervisor.Snapshot, telemetry *mode
 	}
 	if process.State == model.ExecutionFailed {
 		telemetry.Health, telemetry.ErrorCode, telemetry.Message = model.MinerHealthError, farmerr.PROCESS_CRASHED, process.LastError
+		return telemetry
+	}
+	if mode == model.MinerModeMining && (process.State == model.ExecutionBackoff || process.State == model.ExecutionCrashed) {
+		telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.PROCESS_CRASHED
 		return telemetry
 	}
 	if process.State != model.ExecutionRunning {

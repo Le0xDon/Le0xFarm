@@ -33,9 +33,9 @@ import (
 
 func TestParseGenericMinerPlanValidatesTypedReferences(t *testing.T) {
 	id := "execution_0123456789abcdef0123456789abcdef"
-	base := &le0xv1.ExecutionPlan{ExecutionId: id, Miner: &le0xv1.MinerSpec{AdapterId: "xmrig", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "6.26.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "MINING"}}
+	base := &le0xv1.ExecutionPlan{ExecutionId: id, Miner: &le0xv1.MinerSpec{AdapterId: "xmrig", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "6.26.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "MINING", Endpoint: &le0xv1.MiningEndpoint{Address: "pool.example:443", Tls: true, User: "public-login", Password: "secret", Worker: "worker-1"}}}
 	plan, err := parsePlan(base)
-	if err != nil || plan.Miner == nil || plan.Miner.WalletID == nil || plan.Miner.PoolID == nil {
+	if err != nil || plan.Miner == nil || plan.Miner.WalletID == nil || plan.Miner.PoolID == nil || plan.Miner.Endpoint == nil || !plan.Miner.Endpoint.TLS || plan.Miner.Endpoint.Password != "secret" || plan.Miner.Endpoint.Worker != "worker-1" {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	badWallet := proto.Clone(base).(*le0xv1.ExecutionPlan)
@@ -71,6 +71,30 @@ type helloServer struct {
 	le0xv1.UnimplementedAgentControlServer
 	controllerID identity.ControllerID
 	farmID       identity.FarmID
+}
+
+type oldProtocolServer struct {
+	le0xv1.UnimplementedAgentControlServer
+	controllerID identity.ControllerID
+	farmID       identity.FarmID
+	result       chan bool
+}
+
+func (s oldProtocolServer) Connect(stream le0xv1.AgentControl_ConnectServer) error {
+	executed := false
+	defer func() { s.result <- executed }()
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: 1, SchemaVersion: uint32(protocol.CurrentSchemaVersion), ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
+		return err
+	}
+	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Command{Command: &le0xv1.CommandEnvelope{CommandId: "must-not-run", Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}}}); err != nil {
+		return err
+	}
+	message, err := stream.Recv()
+	executed = err == nil && message.GetCommandResult() != nil
+	return err
 }
 
 type switchingListener struct {
@@ -112,7 +136,7 @@ func (s helloServer) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 	if _, err := stream.Recv(); err != nil {
 		return err
 	}
-	return stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: 1, SchemaVersion: 1, ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}})
+	return stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}})
 }
 
 func testLogger() *log.Logger { return log.New(&bytes.Buffer{}, "", 0) }
@@ -170,6 +194,37 @@ func TestAgentHandshakeRejectsControllerVersion(t *testing.T) {
 	}
 }
 
+func TestNewAgentRejectsOldControllerBeforeRuntimeCommand(t *testing.T) {
+	controllerID, _ := identity.NewControllerID()
+	farmID, _ := identity.NewFarmID()
+	agentID, _ := identity.NewAgentID()
+	hostID, _ := identity.NewHostID()
+	dir := t.TempDir()
+	if err := agenttrust.Save(dir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan bool, 1)
+	listener := bufconn.Listen(1024 * 1024)
+	gs := grpc.NewServer()
+	le0xv1.RegisterAgentControlServer(gs, oldProtocolServer{controllerID: controllerID, farmID: farmID, result: results})
+	go gs.Serve(listener)
+	defer gs.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := connectOnce(ctx, Config{Target: "buf", InsecureDev: true, TrustDir: dir, AgentID: agentID, HostID: hostID, Inventory: inventory.Local(), Dialer: func(context.Context, string) (net.Conn, error) { return listener.Dial() }, Output: testLogger()})
+	if code, ok := farmerr.CodeOf(err); !ok || code != farmerr.PROTOCOL_VERSION_MISMATCH || !nonTransient(err) {
+		t.Fatalf("error=%v code=%v", err, code)
+	}
+	select {
+	case executed := <-results:
+		if executed {
+			t.Fatal("runtime command was accepted after protocol mismatch")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old Controller stream did not close")
+	}
+}
+
 func TestControllerIdentityMismatchIsNonTransientAndDoesNotOverwriteTrust(t *testing.T) {
 	trustedController, _ := identity.NewControllerID()
 	trustedFarm, _ := identity.NewFarmID()
@@ -208,7 +263,7 @@ func TestCommandMappingPreservesNonce(t *testing.T) {
 	if !bytes.Equal(ping.GetPing().GetNonce(), nonce) {
 		t.Fatal("nonce changed")
 	}
-	if uint32(protocol.CurrentProtocolVersion) != 1 {
+	if uint32(protocol.CurrentProtocolVersion) != 2 {
 		t.Fatal("unexpected protocol test baseline")
 	}
 }
@@ -229,7 +284,7 @@ func (s *reconnectServer) Connect(stream le0xv1.AgentControl_ConnectServer) erro
 	s.count++
 	n := s.count
 	s.calls <- n
-	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: 1, SchemaVersion: 1, ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
+	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
 		return err
 	}
 	if n == 1 {

@@ -49,10 +49,21 @@ Telemetry polling по умолчанию выполняется раз в 3 с�
 version, algorithm, short/medium/long/highest hashrate, shares/results, pool connection,
 latency, uptime и optimization status. Process RUNNING сам по себе не означает MINING.
 MINING требует mining mode, healthy API, connected pool и hashrate > 0. STRESS и
-BENCHMARK никогда не сообщают MINING; без реальной mining execution общий Agent status
-остаётся IDLE. XMRig STRESS не является полностью offline workload: штатная реализация
+BENCHMARK не влияют на общий Agent status. Для активных MINING executions используются
+IDLE, STARTING, MINING, DEGRADED и ERROR с deterministic safety precedence
+ERROR > DEGRADED > STARTING > MINING > IDLE. STOPPED history не влияет на status.
+XMRig STRESS не является полностью offline workload: штатная реализация
 XMRig может подключаться к внешнему upstream stress service `randomx.xmrig.com:443`.
 Это не пользовательский payout pool mining; payout wallet в STRESS не передаётся.
+
+Для MINING Controller передаёт resolved `MiningEndpoint`: `address`, явный TLS intent,
+точный miner-facing `user`, потенциально чувствительный optional `password` и optional
+отдельный `worker`. Agent не склеивает user и worker и не нуждается в persistent
+Pool/Wallet storage. Если конкретный pool кодирует worker внутри login, Controller
+передаёт уже готовый exact user и оставляет отдельный worker пустым. Password существует
+только в in-memory protobuf command внутри защищённого mTLS stream и в runtime config
+0600; command, config, environment и credential values не логируются и не сохраняются
+в новой базе. Pool address, algorithm, public payout/login и worker считаются публичными.
 
 Huge pages только запрашиваются в config и наблюдаются; M3 не меняет sysctl/GRUB.
 MSR capability проверяется read-only, а XMRig rdmsr/wrmsr отключены: sudo, modprobe и
@@ -223,7 +234,9 @@ resolved executable, argv, environment, working directory и restart policy.
 ObservedState и ExecutionObservation сохраняют наблюдения по ExecutionID.
 
 ProtocolVersion — версия взаимодействия компонентов; SchemaVersion — версия структуры
-документов. Оба начальных значения равны 1, но типы и дальнейшее изменение независимы.
+документов. Текущие значения равны 2 и 1 соответственно; ProtocolVersion повышен для
+M3.5 resolved MiningEndpoint, чтобы M3 и M3.5 peers не смешивали несовместимые runtime
+commands. Типы и дальнейшее изменение остаются независимыми.
 Версия сборки `0.0.0-dev` хранится отдельно.
 
 ## M0.2 — protocol contracts

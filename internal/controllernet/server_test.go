@@ -1,11 +1,11 @@
 package controllernet
 
 import (
-	"bytes"
 	"context"
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,7 +65,7 @@ func TestPairingRequiredAndPairedAgentAcceptedWithoutWindow(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: agentID.String(), HostId: hostID.String()}}}); err != nil {
+		if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: agentID.String(), HostId: hostID.String()}}}); err != nil {
 			return err
 		}
 		_, err = stream.Recv()
@@ -118,7 +118,7 @@ func TestControllerPairingTokenLifecycle(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: agentID.String(), HostId: hostID.String(), EnrollmentToken: token}}}); err != nil {
+		if err = stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: agentID.String(), HostId: hostID.String(), EnrollmentToken: token}}}); err != nil {
 			return err
 		}
 		_, err = stream.Recv()
@@ -213,7 +213,7 @@ func TestInventoryWireTrustBoundary(t *testing.T) {
 }
 
 func TestControllerHandshakeAndCommands(t *testing.T) {
-	var output bytes.Buffer
+	var output lockedBuffer
 	controllerID, _ := identity.NewControllerID()
 	farmID, _ := identity.NewFarmID()
 	trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
@@ -309,7 +309,7 @@ func TestControllerConnectionCounterLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := stream.Recv(); err != nil {
@@ -358,7 +358,7 @@ func TestServeShutdownForcesLongLivedStreamToStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := stream.Recv(); err != nil {
@@ -414,10 +414,10 @@ func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 		hello *le0xv1.AgentHello
 		code  farmerr.Code
 	}{
-		{"agent", &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: "bad", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.CONFIG_CONFLICT},
-		{"host", &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "bad"}, farmerr.CONFIG_CONFLICT},
-		{"protocol", &le0xv1.AgentHello{ProtocolVersion: 999, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.PROTOCOL_VERSION_MISMATCH},
-		{"schema", &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: 999, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.SCHEMA_VERSION_MISMATCH},
+		{"agent", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "bad", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.CONFIG_CONFLICT},
+		{"host", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "bad"}, farmerr.CONFIG_CONFLICT},
+		{"old-protocol", &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.PROTOCOL_VERSION_MISMATCH},
+		{"schema", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: 999, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.SCHEMA_VERSION_MISMATCH},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -445,8 +445,28 @@ func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), string(tc.code)) {
 				t.Fatalf("error %v, want %s", err, tc.code)
 			}
+			if tc.name == "old-protocol" && server.ActiveConnections() != 0 {
+				t.Fatal("old protocol peer established a runtime session")
+			}
 		})
 	}
 }
 
-func testLogger(buffer *bytes.Buffer) *log.Logger { return log.New(buffer, "", 0) }
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *lockedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(value)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func testLogger(buffer *lockedBuffer) *log.Logger { return log.New(buffer, "", 0) }

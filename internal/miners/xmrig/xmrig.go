@@ -74,8 +74,8 @@ func (a *Adapter) Validate(spec model.MinerSpec, inventory model.Inventory) ([]s
 	if spec.Mode != model.MinerModeMining && spec.Mode != model.MinerModeStress && spec.Mode != model.MinerModeBenchmark {
 		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "unsupported XMRig mode"}
 	}
-	if spec.Mode == model.MinerModeMining && (spec.PoolURL == "" || spec.WalletAddress == "") {
-		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "MINING mode requires pool URL and public payout address"}
+	if spec.Mode == model.MinerModeMining && (spec.Endpoint == nil || spec.Endpoint.Address == "" || spec.Endpoint.User == "") {
+		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "MINING mode requires a pool endpoint and public login identity"}
 	}
 	if spec.CPUThreads != nil {
 		if *spec.CPUThreads == 0 || (inventory.CPU.Threads > 0 && *spec.CPUThreads > inventory.CPU.Threads) {
@@ -165,11 +165,18 @@ func buildConfig(spec model.MinerSpec, port int) map[string]any {
 		"randomx": map[string]any{"1gb-pages": false, "rdmsr": false, "wrmsr": false},
 		"opencl":  false, "cuda": false, "log-file": nil,
 	}
-	if spec.Worker != "" {
-		config["api"] = map[string]any{"worker-id": spec.Worker}
+	if spec.Endpoint != nil && spec.Endpoint.Worker != "" {
+		config["api"] = map[string]any{"worker-id": spec.Endpoint.Worker}
 	}
 	if spec.Mode == model.MinerModeMining {
-		config["pools"] = []map[string]any{{"url": spec.PoolURL, "user": spec.WalletAddress, "pass": "x", "rig-id": spec.Worker, "keepalive": true}}
+		pool := map[string]any{"url": spec.Endpoint.Address, "user": spec.Endpoint.User, "pass": spec.Endpoint.Password, "tls": spec.Endpoint.TLS, "keepalive": true}
+		if spec.Endpoint.Worker != "" {
+			pool["rig-id"] = spec.Endpoint.Worker
+		}
+		if spec.Coin != "" {
+			pool["coin"] = spec.Coin
+		}
+		config["pools"] = []map[string]any{pool}
 	}
 	return config
 }

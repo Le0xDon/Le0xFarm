@@ -129,6 +129,16 @@ type DesiredMining struct {
 	DeviceIDs []identity.DeviceID
 }
 
+type AgentState string
+
+const (
+	AgentStateIdle     AgentState = "IDLE"
+	AgentStateStarting AgentState = "STARTING"
+	AgentStateMining   AgentState = "MINING"
+	AgentStateDegraded AgentState = "DEGRADED"
+	AgentStateError    AgentState = "ERROR"
+)
+
 type ExecutionStatus string
 
 const (
@@ -196,14 +206,24 @@ type MinerSpec struct {
 	Mode           MinerMode
 	Coin           string
 	Algorithm      string
-	PoolURL        string
-	WalletAddress  string
-	Worker         string
+	Endpoint       *MiningEndpoint
 	CPUThreads     *uint32
 	GPUDeviceIDs   []identity.DeviceID
 	HugePages      *bool
 	MSR            *bool
 	Options        map[string]string
+}
+
+// MiningEndpoint is the resolved connection snapshot sent to an Agent. User is
+// the exact miner-facing pool login; it may be a public payout address or a
+// pool account identity. Worker is separate and is never implicitly appended
+// to User. Password is potentially sensitive and must not be logged.
+type MiningEndpoint struct {
+	Address  string
+	TLS      bool
+	User     string
+	Password string
+	Worker   string
 }
 
 type MinerHealth string
