@@ -5,6 +5,8 @@
 
 **Revision note (2026-09-09):** v1.2 сохраняет решения v1.1 и фиксирует отдельно утверждённые product-readiness stages, initial-user scope, safe migration, maintenance, useful-work, hardware re-resolution, Owner authentication, Telegram linking, operational-secrets и Controller-backup decisions. Вопросы, которые этими решениями не закрыты, остаются **OPEN**.
 
+**Revision note (2026-09-10):** v1.2 дополнена approved FROZEN portfolio/mining-accounting lifecycle, forgotten-asset, market/Telegram intelligence, local SecretProvider input и open-source Core/private official Brain boundaries. Exact provider, ledger, entitlement protocol и legal/commercial mechanics остаются **OPEN**.
+
 ## 0. Статусы решений
 
 - **FROZEN** — решение принято и не должно молча меняться реализацией.
@@ -84,10 +86,14 @@ TECHNICAL MVP не обязан включать весь финальный Pro
 - remote/Telegram convenience;
 - useful-work validation;
 - diagnostics и понятный recovery path.
+- local portfolio/mining accounting и Brain market/project intelligence для historical, dormant, unpaid и locked assets;
+- proactive Telegram portfolio/project/market alerts с честными freshness, provenance и uncertainty.
 
 Profitability/autoswitch может развиваться постепенно, но система уже должна быть осмысленно пригодна для discovery и безопасного запуска новых mining projects.
 
 Если PAVEL DAILY-USE / PRO BETA включает contribution-based Pro entitlement, она не может пройти без первого полного **PRO ABUSE / ENTITLEMENT RED-TEAM GATE** из §36B.
+
+Также обязательны portfolio/market и lifecycle-aware mining-accounting acceptance §27I, а official Brain entitlement boundary проверяется с hostile forked/patched public Controller и direct API client по threat model §28A/§36B.
 
 ### 3. PUBLIC RELEASE
 
@@ -96,6 +102,8 @@ Profitability/autoswitch может развиваться постепенно,
 PUBLIC RELEASE не определяется только наличием mining loop: весь пользовательский lifecycle должен быть безопасен без участия авторов проекта.
 
 PUBLIC PRO release требует повторного прохождения **PRO ABUSE / ENTITLEMENT RED-TEAM GATE** из §36B против complete production system.
+
+Public release также доказывает public Core/private Brain boundary §28A и provider/portfolio/Telegram quality §27C–§27I/§55F.
 
 ---
 
@@ -371,6 +379,9 @@ Controller отвечает за:
 - Packages;
 - DesiredWorkloads;
 - Groups;
+- local portfolio, mining accounting и historical asset awareness;
+- balance/provider freshness и local portfolio export;
+- Operational Secrets/SecretRefs и local SecretProvider boundary;
 - logs/history/audit;
 - CLI;
 - Web UI;
@@ -640,6 +651,8 @@ Essential alert evaluation относится к **CORE/FREE** и не зави�
 
 **PLANNED:** Telegram, local UI notifications, email/web push/local notification interfaces.
 
+Proactive Telegram Portfolio / Project / Market Intelligence — это явно **PRO** scope (§27H). Local portfolio/accounting state, provider failures и access к user-owned data остаются CORE/FREE; Brain/Telegram outage не скрывает их.
+
 **PLANNED/OPTIONAL:** внешний dead-man monitor для обнаружения падения самого Controller, поскольку Controller не может надёжно уведомить о собственной полной недоступности.
 
 ---
@@ -874,6 +887,8 @@ ControllerData/
 
 WalletRef — public mining-facing reference, не secret store.
 
+WalletRef также может быть minimum-authority read-only input для local balance observation. Portfolio identity и accounting определяются §27C–§27F; они не превращают WalletRef в secret или transaction authority.
+
 Working wallet path concept:
 
 ```text
@@ -925,6 +940,8 @@ Managed wallet creation/storage/recovery — отдельный более по�
 Managed wallet subsystem не нужен для начала early Controller/Agent mining tests и TECHNICAL MVP. Он нужен до полного PAVEL DAILY-USE / PRO BETA там, где discovery и запуск нового project требуют создания wallet.
 
 **OPEN:** будет ли Le0xFarm когда-либо конструировать/sign/broadcast transactions. Это не следует автоматически из текущей wallet architecture.
+
+Текущие Portfolio/Market Intelligence requirements не авторизуют automatic selling, orders, withdrawals, transfers, swaps, migrations или transaction signing (§27H). Future Trading / Assisted Selling / Automated Exit требует отдельного explicit architecture/security decision.
 
 ---
 
@@ -1067,7 +1084,12 @@ Private Recovery Key там не обязателен.
 - private pool-account credentials;
 - node RPC passwords/tokens;
 - SMTP credentials;
-- notification tokens;
+- Telegram Bot Token и required Telegram identifiers;
+- Discord bot credentials там, где supported;
+- explorer/API credentials;
+- read-only exchange API credentials;
+- market-data API credentials;
+- webhook/notification provider credentials;
 - Relay/service credentials;
 - future external API tokens.
 
@@ -1099,6 +1121,393 @@ Operational secrets образуют отдельный security domain и не 
 
 ---
 
+## 27B. Local operational secret input and `.env` — FROZEN PRODUCT / SECURITY DIRECTION
+
+Ordinary integration objects ссылаются на operational secrets только через `SecretRef`:
+
+```text
+ExchangeProvider → APIKeySecretRef
+TelegramIntegration → BotTokenSecretRef
+ExplorerProvider → APIKeySecretRef
+```
+
+Le0xFarm может поддерживать local `.env`-style mechanism как convenient self-hosted/development/bootstrap **INPUT** для personal operational secrets, например:
+
+```text
+LE0X_TELEGRAM_BOT_TOKEN=...
+LE0X_TELEGRAM_CHAT_ID=...
+LE0X_SAFETRADE_API_KEY=...
+LE0X_COINGECKO_API_KEY=...
+LE0X_EXPLORER_API_KEY=...
+```
+
+`.env` не является canonical domain model. Это лишь один local `SecretProvider`/input backend; future secure/encrypted providers могут его заменить или дополнить. Exact secret-store encryption, unlock model, parser/library и provider precedence остаются OPEN.
+
+Реальный `.env` с personal data/secrets:
+
+- MUST NOT попадать в Git;
+- должен быть excluded через `.gitignore`;
+- должен иметь restrictive owner-only permissions, conceptually `0600`, где это поддерживается;
+- не должен попадать в normal logs, telemetry, diagnostics/crash reports, Brain requests без explicit need, support bundles или default config export.
+
+Repository может содержать только `.env.example` с variable names, descriptions и fake/example placeholders, никогда с real values. Secret values redacted и, где возможно, не показываются повторно в UI после initial entry.
+
+General operational `.env` **запрещён** как canonical storage для:
+
+- wallet seed/mnemonic/recovery phrase;
+- private spend key и wallet private key;
+- Wallet Recovery Private Key;
+- Farm Recovery private material;
+- Controller CA private key;
+- Controller identity private key;
+- other cryptographic root/recovery keys.
+
+Wallet security, Recovery, PKI и Operational Secrets остаются separate security domains.
+
+Portfolio/market integrations по умолчанию используют **READ-ONLY** exchange credentials. Если exchange имеет scopes, такой credential не имеет trade, withdrawal, transfer или subaccount-management permission. Portfolio observation не получает transaction authority молча.
+
+---
+
+## 27C. Asset identity and CORE portfolio — FROZEN PRODUCT REQUIREMENT
+
+Le0xFarm ведёт local portfolio view всех known mining assets и known WalletRefs/managed wallets, где balance observation технически возможно.
+
+Asset identity не может определяться ticker-only. Canonical identity должна различать Project/Coin, network/chain, contract где applicable, forks, mainnet/testnet и migration identity. Assets с одинаковым ticker, но разными network/chain/contract, никогда не сливаются молча.
+
+Для каждого asset показываются, где доступно:
+
+- Project/Coin и ticker/symbol;
+- canonical Network/chain/contract identity;
+- WalletRef(s), balance per WalletRef и aggregate balance;
+- confirmed, pending/immature и locked balances по их точным semantics;
+- balance source/provider, provenance, observed-at timestamp, freshness и provider health/error;
+- current market quote, quote currency/source/freshness;
+- estimated fiat/stablecoin value;
+- confidence/uncertainty, достаточная для honest presentation.
+
+Mandatory distinct balance states:
+
+```text
+ZERO BALANCE
+BALANCE UNKNOWN
+PROVIDER UNAVAILABLE
+BALANCE STALE
+```
+
+Unknown — это не zero. Provider failure не может производить fabricated zero.
+
+Balance observation использует minimum authority. Где возможно, public payout address/WalletRef достаточен. Read-only sources могут включать local wallet RPC, Noda/node RPC, official project API, official или approved third-party explorer/API, read-only exchange API и Manual Provider. Balance display не требует seed, private spend key, recovery phrase, transaction-signing authority или exchange withdrawal authority. Brain никогда не требует wallet secrets для portfolio calculation.
+
+**CORE/FREE** включает:
+
+- known WalletRefs и locally obtainable balances;
+- portfolio inventory и historical/mined asset inventory;
+- balance freshness и provider status;
+- local portfolio UI/API/CLI по мере реализации;
+- local export user-owned portfolio information.
+
+Brain outage, Pro suspension/expiry и developer-service failure не скрывают WalletRefs, known balances, portfolio history и locally obtainable portfolio data. User-owned portfolio information никогда не становится hostage to Pro.
+
+---
+
+## 27D. Mining accounting ledger and reward lifecycle — FROZEN PRODUCT REQUIREMENT
+
+Portfolio работает как mining accounting, а не как набор independent balance snapshots. Le0xFarm понимает lifecycle одних и тех же economically attributable rewards:
+
+```text
+MINED / EARNED
+→ IMMATURE / LOCKED
+→ MATURED
+→ POOL AVAILABLE / UNPAID
+→ PAYOUT PENDING
+→ PAYOUT SENT
+→ WALLET RECEIVED
+```
+
+Где provider semantics это позволяют, Le0xFarm различает:
+
+- IMMATURE mining rewards;
+- LOCKED mining rewards;
+- PENDING payout;
+- UNPAID / pool balance;
+- AVAILABLE pool balance;
+- PAID / historical payouts;
+- WALLET confirmed balance.
+
+Эти states не склеиваются в одно число. Transition between stages не увеличивает total attributable amount, если не были реально earned new rewards.
+
+```text
+Before maturity:
+Immature: 300 PBC
+Pool available: 0 PBC
+Wallet: 100 PBC
+Total attributable: 400 PBC
+
+After 100 PBC matures:
+Immature: 200 PBC
+Pool available: 100 PBC
+Wallet: 100 PBC
+Total attributable: still 400 PBC
+```
+
+### No double counting — FROZEN
+
+Accounting model предотвращает, где evidence это позволяет:
+
+- repeated counting immature reward после maturity;
+- repeated counting pool balance после payout;
+- repeated counting payout после wallet receipt;
+- duplicate discovery одного payout через Pool и Wallet providers;
+- duplication после Controller restart, provider retry или repeated API history;
+- attribution одной physical reward к several lifecycle stages.
+
+Где exact correlation невозможна, Le0xFarm показывает uncertainty, а не exact-looking aggregate. Accounting correctness важнее convenient total.
+
+Evidence может приходить из Pool API, miner/provider API, chain/node, wallet, explorer, payout transaction, project-specific reward API и Manual accounting source. Observation/event сохраняет provenance, достаточную для объяснения number. Exact ledger/event schema, correlation identifiers и reconciliation algorithm остаются OPEN.
+
+Accounting должен уметь показать today, yesterday, last 24 hours, week, month и custom range, где evidence sufficient:
+
+- newly earned units by Project/Coin;
+- attribution by Host/resource где доказуемо;
+- matured, paid и received by known WalletRefs;
+- current immature/locked, pool unpaid и wallet amounts.
+
+`Newly mined` не выводится просто из wallet balance delta, если transfers/payouts могут исказить result.
+
+Где есть reliable market data, можно хранить estimated value when earned, matured/paid и current value с quote source, timestamp, freshness и uncertainty. Если historical price не был надёжно известен, он не фабрикуется.
+
+Presentation явно различает:
+
+1. newly earned mining production;
+2. total economically attributable assets;
+3. spendable/available assets;
+4. immature/locked assets;
+5. unpaid/pending pool assets;
+6. wallet balances;
+7. historical paid amounts.
+
+`PAID HISTORICALLY` не добавляется автоматически к `CURRENT PORTFOLIO`: funds могли быть transferred, sold, swapped или иначе выведены из tracked WalletRefs. Reduced wallet balance не равен loss/corruption. Transaction-aware outflow/sale accounting — future separate design; automatic trading остаётся OUT OF SCOPE.
+
+Accounting status не скрывает gaps за exact total. Conceptually нужны `ACCOUNTING COMPLETE`, `ACCOUNTING PARTIAL`, `ACCOUNTING UNKNOWN`, `PROVIDER UNAVAILABLE`, `RECONCILIATION REQUIRED`; exact naming остаётся OPEN.
+
+Daily/weekly/monthly local Mining Accounting summary относится к CORE/FREE. Brain interpretation и proactive Telegram delivery таких summaries — PRO.
+
+---
+
+## 27E. Reward maturity, refresh and lifecycle persistence — FROZEN PRODUCT REQUIREMENT
+
+Где Pool/Project/chain публикует maturity/unlock evidence, Le0xFarm хранит:
+
+- unlock/maturity timestamp;
+- block/maturity height;
+- unlock epoch или vesting schedule;
+- remaining blocks/time;
+- staged unlock amounts.
+
+Если rewards unlock in stages, stages сохраняются отдельно. Exact amount/time не изобретается. Если provider знает только `IMMATURE`, presentation говорит `UNLOCK DATE: UNKNOWN`, а не гадает.
+
+Le0xFarm периодически refresh observable wallet balances, pool unpaid/available balances, immature/locked rewards, pending payouts, paid history и maturity/unlock state. Exact intervals configurable/OPEN; architecture поддерживает:
+
+- provider-specific cadence;
+- более частый refresh active mining/pool accounting;
+- более редкий refresh dormant wallets;
+- event-driven refresh, где available;
+- forced refresh после payout, unlock, listing, migration и provider reconnect;
+- rate limits, retry/backoff и API quotas.
+
+Третьи стороны не опрашиваются непрерывно и безотносительно к quotas.
+
+Portfolio totals conceptually distinguish:
+
+```text
+SPENDABLE NOW
++ PENDING / UNPAID
++ IMMATURE / LOCKED
+= TOTAL ECONOMICALLY ATTRIBUTABLE ASSETS
+```
+
+Locked/immature не показываются как spendable/sellable. Если есть market quote, estimated values показываются separately для available, locked/immature и total attributable с explicit warning.
+
+Conceptual maturity/accounting events:
+
+- `REWARD_MATURING_SOON`;
+- `REWARD_UNLOCKED`;
+- `PAYOUT_READY`;
+- `PAYOUT_SENT`;
+- `PAYOUT_RECEIVED`.
+
+Exact event schema OPEN. Meaningful events могут вызывать PRO Telegram notification после fresh balance/market refresh, где practical. Notifications deduplicated.
+
+Stopping mining или deleting/deactivating DesiredWorkload, MiningProfile или Package не удаляет known earned, unpaid, immature/locked rewards, payouts и asset awareness. Tracking продолжается, пока они mature, paid, reach wallet, demonstrably expire/become invalid или user explicitly removes tracking. Accounting history — persistent Farm state, не transient telemetry.
+
+---
+
+## 27F. Historical and forgotten assets — FROZEN PRODUCT REQUIREMENT
+
+Le0xFarm сохраняет awareness об assets, исторически mined Farm, даже после:
+
+- DesiredWorkload stopped;
+- MiningProfile inactive/deleted;
+- miner/Package removed;
+- long inactivity.
+
+Stopped mining не удаляет portfolio relevance. Product может rediscover dormant asset, когда появляется verified market, delisting, swap/migration, wallet upgrade или EOL notice, особенно при known non-zero/unpaid/locked balance. Exact retention policy остаётся OPEN.
+
+---
+
+## 27G. Market events and valuation correctness — FROZEN PRODUCT / SAFETY REQUIREMENT
+
+Product-level `MarketEvent` concept минимум различает:
+
+- `LISTING_ANNOUNCED`;
+- `DEPOSITS_OPEN`;
+- `TRADING_OPEN`;
+- `WITHDRAWALS_OPEN`;
+- `DELISTING_ANNOUNCED`;
+- `DELISTING_IMMINENT`;
+- `DELISTED`;
+- `SWAP_REQUIRED`;
+- `MIGRATION_REQUIRED`;
+- `NETWORK_MIGRATION`;
+- `MAINNET_LAUNCHED` where relevant;
+- `WALLET_UPGRADE_REQUIRED`;
+- `PROJECT_EOL` / `SHUTDOWN` where relevant;
+- `IMPORTANT_PROJECT_NOTICE`.
+
+Exact schema OPEN. Critical distinction:
+
+```text
+listing announced
+→ deposits may open
+→ trading actually opens
+→ withdrawals may open
+```
+
+`LISTING_ANNOUNCED != TRADING_OPEN`. Social/announcement evidence о future listing не превращается в fabricated live market.
+
+Portfolio valuation — **ESTIMATE**, а не guaranteed realizable proceeds. Где available, evidence включает exchange, pair, current/last/mark price, quote timestamp, market status, volume/liquidity/spread, deposit/withdrawal status и source confidence.
+
+- insufficient confidence → balance shown, valuation `UNKNOWN` / `UNCERTAIN`;
+- stale quote → explicitly stale;
+- halted trading → no normal live valuation without warning;
+- thin/illiquid market → conservative presentation and material uncertainty disclosure;
+- locked rewards → not described as presently sellable.
+
+Future liquidity-adjusted liquidation value, exact quote/price algorithm, provider precedence и confidence scoring остаются OPEN.
+
+---
+
+## 27H. Brain portfolio intelligence and Telegram alerts — FROZEN PRO PRODUCT REQUIREMENT
+
+PRO может давать:
+
+- automatic project monitoring;
+- first-listing discovery и verification;
+- trading/deposits/withdrawals-open detection;
+- delisting/deadline, project EOL, swap/mainnet/network migration и wallet-upgrade intelligence;
+- project releases/security notices;
+- market-price/status monitoring и cross-source verification;
+- dormant/forgotten-asset rediscovery;
+- richer valuation and event prioritization by known balance/value;
+- proactive Telegram delivery;
+- periodic intelligent accounting summaries.
+
+Brain коррелирует:
+
+```text
+verified MarketEvent
++ canonical Asset/Network identity
++ Controller-known balance/accounting state
++ balance freshness
++ verified market quote/status
+= actionable portfolio intelligence
+```
+
+Known non-zero, valuable, unpaid или locked balance повышает priority. Exact prioritization algorithm OPEN. Market listing может быть important, даже если rewards ещё locked; alert отдельно показывает spendable, pool available, pending payout, immature/locked, next evidenced maturity stage и total attributable, не называя locked amount sellable.
+
+Proactive Telegram Portfolio / Project / Market Intelligence — **PRO**. High-value message содержит, где trustworthy data exists:
+
+- event type, Project/Coin и canonical Network;
+- exchange/market/pair и actual trading state;
+- known spendable, unpaid/pending, immature/locked и total attributable balance;
+- current price, quote currency и **approximate** portfolio value;
+- balance/quote freshness;
+- deposits/withdrawals state;
+- deadline/recommended user action;
+- source provenance/confidence;
+- verified official market/announcement link.
+
+Value language явно говорит `Оценочная стоимость`, `≈`, `по текущей доступной цене`; не обещает продажу всего amount по этой цене. Unknown balance не заменяется zero; unknown/stale quote, unopened trading, thin market и disabled deposits/withdrawals показываются честно.
+
+High-value events включают first verified listing, listing announcement, trading/deposits/withdrawals open, delisting/imminent delisting, swap/migration, wallet upgrade, dormant asset becoming tradable, project shutdown, reward maturing/unlocked и payout transitions. Repeated polling/provider delivery не spam one event: event lifecycle/deduplication — required direction; exact timing/thresholds OPEN.
+
+### Trusted-link and social-source safety — FROZEN
+
+Telegram не становится phishing delivery mechanism. Market/trading URL берётся из или verified against trusted approved official sources. Arbitrary URLs из Discord, Telegram, X/social, community forums и AI-generated text не пересылаются вслепую. Где possible, provenance различает official exchange market page, official exchange announcement и official project announcement. Exact trusted-domain/catalog mechanism OPEN.
+
+Le0xFarm не строится на automation normal Discord user account владельца, не требует его Discord password/session token и не использует self-bot impersonation. Compliant sources могут включать official bot, announcement-channel following, webhook/feed, official Telegram API/channel, GitHub releases, project websites, RSS и official exchange sources. Social post — evidence/provenance, не truth; important events по возможности подтверждаются stronger sources.
+
+Source provenance conceptually distinguishes official exchange/API, official project site/announcement, official repository/release, explorer/node evidence, established market-data provider, secondary aggregator, community/social и unknown/unverified source. Exact confidence formula OPEN. UI объясняет, почему event считается occurred; unexplained AI conclusion не показывается verified fact.
+
+### Privacy boundary — FROZEN
+
+Controller локально знает Asset identity, WalletRefs, balances и accounting. Brain получает only minimum sanitized context — conceptually canonical Asset/Network identity, aggregate balance где necessary, freshness/status — когда это нужно для Pro correlation. Brain не требует raw wallet addresses, если может выполнить role без них, и никогда не получает seeds, private keys, wallet passwords или operational API secrets без separately approved narrow integration.
+
+### Current transaction boundary — FROZEN
+
+Этот product area не авторизует automatic selling, market/limit orders, exchange withdrawals, asset transfers, automatic swaps/migrations и transaction signing. Future Trading / Assisted Selling / Automated Exit требует отдельного explicit architecture/security decision. Read-only monitoring keys не получают trading/withdrawal authority заранее.
+
+---
+
+## 27I. Portfolio/accounting Pro beta acceptance — FROZEN RELEASE GATE
+
+До PAVEL DAILY-USE / PRO BETA нужен synthetic/non-production end-to-end scenario:
+
+1. historical tracked asset с canonical Asset/Network identity существует;
+2. Controller знает non-zero balance/accounting state;
+3. Brain discovers listing и verifies authoritative evidence;
+4. actual trading status и market quote obtained separately;
+5. Asset/Network identity matches without ticker collision;
+6. Controller передаёт только permitted minimum balance context;
+7. estimated value рассчитана с uncertainty;
+8. Telegram получает exactly one deduplicated notification;
+9. message содержит asset/network, event/trading status, known balance, approximate value, freshness/confidence и verified official link;
+10. seed/private key/trading credential не exposed.
+
+Отдельный lifecycle/accounting scenario доказывает:
+
+1. newly mined rewards появляются as immature/locked, затем приходят new rewards;
+2. provider даёт available, immature/locked и historical paid amounts;
+3. locked rewards содержат multiple evidenced maturity stages;
+4. part matures into pool available, payout becomes pending/sent и reaches WalletRef;
+5. Controller restarts between stages, including immediately around unlock;
+6. mining completely stops, но asset/rewards/history remain tracked;
+7. later provider/time state advances и maturity обнаруживается;
+8. transitions не меняют total attributable без genuinely new earnings;
+9. spendable, unpaid/pending, immature/locked, wallet и historical paid totals update without double counting;
+10. repeated/reordered provider events и Pool+Wallet discovery одного payout не duplicate accounting;
+11. period earnings remain historically queryable;
+12. Telegram unlock notification generated once;
+13. later listing alert separately reports spendable, locked/immature, total attributable, estimated value и explicit not-currently-sellable warning.
+
+Fail-safe degraded cases включают:
+
+- balance or maturity date UNKNOWN;
+- provider unavailable during expected maturity;
+- quote UNKNOWN/stale;
+- listing announced while trading not open;
+- wrong-network/same-ticker collision;
+- suspicious URL;
+- exchange API, Brain или Telegram temporarily unavailable;
+- unlock amount changes и payout occurs between polls;
+- duplicate provider event, stale provider state, provider reset и missing history;
+- wallet amount decreases;
+- unreconciled/UNKNOWN accounting state.
+
+Все cases показывают uncertainty и fail safely. No asset/reward может быть silently lost, duplicated или counted twice.
+
+---
+
 ## 28. Le0xBrain — FROZEN DIRECTION / PLANNED
 
 Brain — developer-hosted intelligence/service layer, но не runtime single point of failure.
@@ -1117,9 +1526,100 @@ Brain может:
 - shared verified catalog;
 - diagnostics;
 - release monitoring;
+- project/market event intelligence и cross-source verification;
+- dormant/forgotten-asset rediscovery и portfolio correlation по minimum sanitized context;
+- proactive portfolio/mining-accounting Telegram intelligence;
 - AI troubleshooting;
 - Telegram;
 - future profitability/autoswitch/self-healing.
+
+---
+
+## 28A. Open Core and private official Brain boundary — FROZEN PRODUCT / SECURITY DIRECTION
+
+Le0xFarm использует **OPEN-CORE** model. Local Farm-management Core остаётся open source, independently buildable и genuinely useful без developer infrastructure. Official Le0xBrain implementation — proprietary developer infrastructure и не входит в public Le0xFarm source distribution.
+
+### Public/open-source Core — FROZEN
+
+Public Core включает:
+
+- Le0xAgent, Le0xController и Le0xNoda;
+- self-hosted Le0xRelay;
+- CLI и Web/Core UI where applicable;
+- local configuration, runtime и mining management;
+- local portfolio/accounting Core data;
+- Controller-side Brain client boundary;
+- public protocol/data contracts required by Controller;
+- signature verification и local validation Brain-produced artifacts;
+- all local Free functionality;
+- Core export, recovery и uninstall capabilities.
+
+Closing Brain source не оправдывает crippled Core или hidden mandatory Brain dependency. Brain outage, discontinuation или Pro suspension не:
+
+- останавливает current local mining;
+- скрывает local configuration, WalletRefs и user-owned portfolio/accounting data;
+- блокирует local recovery/export;
+- делает Brain prerequisite для ordinary Free runtime.
+
+Pro-only Brain intelligence/services могут стать unavailable. Phone-home-or-stop-mining architecture запрещена.
+
+### Private developer infrastructure — FROZEN
+
+Private developer-controlled Brain infrastructure/repository может содержать:
+
+- official Le0xBrain server implementation и AI orchestration;
+- project/coin discovery, repository/document/release analysis и market/listing pipelines;
+- verified shared-catalog и recipe/Profile/Package generation infrastructure;
+- catalog signing infrastructure;
+- official entitlement backend и contribution-accounting authority;
+- managed Telegram intelligence и other developer services;
+- future profitability/autoswitch intelligence pipelines;
+- private developer operations.
+
+Public Core repository не публикует Brain server, private AI/crawlers/catalog pipelines, private entitlement backend, private operations или private signing keys только потому, что Controller общается с Brain. Brain internals могут использовать AI services, crawlers, databases, queues, indexes, market feeds, official APIs и protected credentials; они не становятся public Core contract, пока externally visible behavior этого не требует.
+
+### Official Pro is a service, not a local boolean — FROZEN SECURITY PRINCIPLE
+
+Official developer-service entitlement не доказывается locally editable `pro=true`, `contribution_paid=true`, farm.db или local configuration. Farm owner контролирует machines и может иметь root, поэтому local state alone не является authoritative proof official Pro.
+
+Official Brain трактует public Controller как untrusted client на service-security boundary. Authorization conceptually привязывает requests к server-verifiable Controller/Farm identity, entitlement/accounting state where applicable, service/session identity, freshness/replay protection и issued signed credentials/equivalent authority. Exact protocol, receipt/token и contribution-proof mechanism остаются OPEN.
+
+**CLIENT ASSERTION IS NOT AUTHORITATIVE PROOF OF OFFICIAL PRO ENTITLEMENT.** Patched Controller не получает official Pro, просто заявляя `Pro`, paid contribution, zero debt, complimentary status или чужую identity.
+
+### Hostile fork/patched client threat model — FROZEN
+
+Предполагается, что technically capable owner может:
+
+- читать, fork, modify и rebuild public Controller/Agent;
+- удалять local contribution scheduling и entitlement checks;
+- менять database и arbitrary local Farm/Controller state;
+- inspect/replay Brain protocol и imitate normal Controller behavior.
+
+Security не полагается на obscurity, hidden constants, obfuscated checks, secrets в public binaries, client-reported entitlement flags или client-reported contribution totals alone. Public wire schemas, response semantics, artifact/signature formats и API meaning могут быть public; secrecy wire format не security control. Exact Brain API stability/third-party compatibility promise OPEN.
+
+Open-source fork technically может изменять local UI/runtime, убрать local contribution behavior, создать integrations или independent Brain-like backend. Это не даёт access к official Le0xBrain, official Pro, managed intelligence/Telegram, official catalog issuance, private infrastructure/data или developer signing keys. Independent backend — другой service, а не bypass official entitlement.
+
+Official Le0xBrain явно отличается от third-party/self-developed/fork-specific Brain-like backend. Third-party backend не становится trusted или official. Support configurable alternative Brain endpoints и его trust/UI/security design остаются OPEN, а не implied requirement official Controller.
+
+### Source license, official service and brand — FROZEN BOUNDARY / PLANNED LEGAL DIRECTION
+
+`SOURCE LICENSE` регулирует use/modify/distribute rights для open-source Core. `OFFICIAL SERVICE ENTITLEMENT` регулирует access к developer-operated Le0xBrain/official Pro. Это separate concerns: possession/modification Core source не даёт official service entitlement. Текущая Core licensing direction не меняется этим document decision; exact legal license/ToS wording не фиксируется здесь.
+
+Code licensing и right to use official Le0xFarm/Le0xBrain names, logos и `official` designation — separate. Before PUBLIC RELEASE нужен trademark/brand policy для forks, modified builds и misleading affiliation. Exact legal text/process остаётся OPEN/future legal work.
+
+Product trust proposition:
+
+> You own and can inspect the software that controls your Farm. The developer does not need to control your Farm to provide Pro. You can continue using the Free Core without developer infrastructure. Official Pro is paid/intelligence infrastructure delivered by the developer, not a DRM switch that owns your machines.
+
+Architecture предпочитает эту boundary local anti-user DRM.
+
+### Private keys and distributed binaries — FROZEN SECURITY REQUIREMENT
+
+Developer private signing keys никогда не попадают в public Core repo, private Brain repo as plaintext source/config, `.env.example`, docs, CI logs, fixtures и diagnostics. Signing material живёт в dedicated protected key/secret-management domain; Controller содержит только public verification material. Brain source leak не должен означать compromise offline signing root.
+
+Public/distributed Controller, Agent, Noda и Relay binaries не embed Brain private API master credentials, developer private signing keys, entitlement authority secrets, crawler/service credentials, infrastructure root credentials или reusable secrets for impersonating Brain. Всё shipped на owner-controlled Host считается extractable.
+
+Private Brain не означает blind trust. Brain output проходит structured local validation; Brain не может arbitrary shell, bypass Package verification/Helper/local safety, kill unmanaged process, alter wallets, obtain wallet secrets или override USER intent. Privacy §29 полностью применяется к proprietary Brain.
 
 ---
 
@@ -1136,6 +1636,8 @@ Brain не собирает произвольно локальные данны
 - seed/mnemonic;
 - private wallet keys;
 - Wallet Recovery Private Key.
+
+Для portfolio/event correlation Controller по возможности передаёт только canonical Asset/Network identity, necessary aggregate balance и freshness/status. Raw WalletRefs/addresses не передаются, если Brain может выполнить role без них. Operational API secrets, wallet passwords и transaction authority не передаются без separately approved narrow integration.
 
 Проектируем так, будто Brain может быть взломан.
 
@@ -1159,6 +1661,8 @@ Brain artifacts подписываются:
 Signing hierarchy:
 - offline root;
 - limited online signing key(s).
+
+Private signing material живёт только в protected key-management domain и не попадает в source repositories, distributed binaries, `.env.example`, fixtures, logs или support bundles (§28A). Controller получает только public verification material.
 
 Controller проверяет:
 - signature;
@@ -1205,6 +1709,8 @@ Low-risk management использует linked identity и normal Controller au
 - destructive wallet/node deletion;
 - trust/security changes.
 
+Proactive portfolio/project/market messages и accounting summaries — PRO scope и подчиняются uncertainty, deduplication, provenance, privacy и trusted-link rules §27H. Telegram не получает wallet secrets, trading credentials или transaction authority.
+
 ---
 
 ## 32. Relay — PLANNED
@@ -1226,6 +1732,8 @@ Managed Relay — может быть Pro.
 
 Free — реально полезный local Farm manager.
 
+Free работает как public open-source Core §28A и не имеет hidden mandatory official Brain dependency.
+
 Включает:
 - Controller;
 - Agent;
@@ -1240,6 +1748,9 @@ Free — реально полезный local Farm manager.
 - SystemGroups;
 - self-hosted Relay;
 - manual/custom Profile setup.
+- known WalletRefs, locally obtainable balances и provider status;
+- local portfolio/mining accounting и historical mined-asset awareness;
+- local portfolio UI/API/CLI и export user-owned portfolio data по мере implementation.
 
 Нет artificial Host/GPU limits.
 
@@ -1251,6 +1762,8 @@ Developer contribution: **0%**.
 
 Pro = тот же runtime core + Brain intelligence/services.
 
+Official Pro service entitlement отделён от Core source license и проверяется official Brain на untrusted-client boundary §28A; local boolean не является authoritative proof.
+
 Может включать:
 - AI Discovery;
 - shared verified catalog;
@@ -1259,6 +1772,10 @@ Pro = тот же runtime core + Brain intelligence/services.
 - auto Profile/Package/Wallet recipes;
 - diagnostics;
 - release monitoring;
+- automatic listing/delisting/swap/migration/project intelligence;
+- cross-source verification, advanced market-price discovery и dormant-asset rediscovery;
+- intelligent event + local portfolio/accounting correlation;
+- proactive Telegram portfolio alerts и accounting summaries с verified links;
 - remote convenience;
 - profitability/autoswitch;
 - schedules/policies;
@@ -1297,6 +1814,8 @@ developer_time / user_time = 3 / 97
 24h USER mining ≈ 44m32s developer mining.
 
 User action всегда выше dev mining.
+
+Official contribution-based Pro опирается на official Brain service entitlement boundary §28A. Удаление contribution behavior из local fork может изменить только этот fork; оно не даёт unauthorized official Brain/Pro access. Normal 3%, Developer/Complimentary 0% и applicable trial/test direction не меняются. Exact proof, receipt, debt, scheduling, offline и suspension mechanics остаются OPEN.
 
 ---
 
@@ -1434,7 +1953,14 @@ Red-team audit обязан явно искать способы:
 - использовать Agent crash/restart во время contribution;
 - downgrade до старой Le0xFarm version с более слабым enforcement;
 - patch/recompile local Controller или Agent;
+- compile Controller с contribution disabled или entitlement always true;
+- modify Agent для fabricated developer mining/useful-work evidence;
+- удалить local debt или forge contribution evidence;
 - вызывать Brain APIs напрямую, минуя normal Controller flow;
+- implement custom fake Controller client или bypass official Controller entirely;
+- patch local signature/validation result;
+- replay old official Brain authorization;
+- impersonate another Controller/Farm;
 - копировать entitlement material между Controllers/Farms;
 - дублировать contribution credit между hardware/resources;
 - учитывать одну physical GPU/CPU несколько раз;
@@ -1442,6 +1968,8 @@ Red-team audit обязан явно искать способы:
 - заставить contribution превысить точные договорные 3%.
 
 Auditor обязан дополнительно искать attack classes, отсутствующие в этом списке.
+
+Required service-security outcome: hostile locally patched Core может контролировать своё local behavior, но не может обманом получить unauthorized official Brain/Pro service. Public Brain protocol и patched client считаются part of threat model (§28A). Symmetric user-protection requirement ниже остаётся равнозначным.
 
 ### User-protection adversarial tests
 
@@ -1626,6 +2154,7 @@ Levels:
 - Recovery Private Key;
 - passwords;
 - enrollment tokens;
+- operational API keys/tokens и personal integration credentials;
 - private signing keys.
 
 Нужны redaction и rotation.
@@ -1786,6 +2315,10 @@ Le0xFarm должен быть модульным.
 - miners;
 - packages;
 - wallets;
+- portfolio;
+- miningaccounting;
+- marketintelligence;
+- secrets;
 - noda;
 - helper;
 - brain;
@@ -1904,11 +2437,11 @@ Stable HostID ≠ permanent certificate.
 
 ---
 
-## 51. Chain/network identity — OPEN
+## 51. Chain/network/asset identity — FROZEN REQUIREMENT / OPEN MODEL
 
-Ticker недостаточен.
+**FROZEN:** ticker недостаточен. Asset identity должна различать network/chain/contract, forks, mainnet/testnet и migrations и не сливать same-ticker assets (§27C).
 
-Нужно учитывать:
+**OPEN:** exact identity/schema/canonicalization model, включая:
 - mainnet/testnet;
 - forks;
 - duplicate tickers;
@@ -2018,6 +2551,7 @@ UI показывает:
 3. Есть ли idle/wasted resources?
 4. Есть ли риск для funds/recovery/security?
 5. Где требуется моё решение?
+6. Какие known, unpaid и locked mining assets требуют внимания и насколько fresh эти данные?
 
 Основные блоки интерфейса:
 
@@ -2027,7 +2561,8 @@ UI показывает:
 - Capacity / idle/unavailable resources;
 - Safety / backups/certs/revocations/disk pressure;
 - Recent changes;
-- optional economics.
+- Portfolio/accounting с separate spendable, unpaid/pending и immature/locked state;
+- optional economics с explicit estimate/uncertainty.
 
 Нельзя бессмысленно суммировать hashrates разных algorithms в один misleading «Total Hashrate».
 
@@ -2136,6 +2671,20 @@ Managed wallet creation, full Brain intelligence, Telegram convenience, industri
 13. remote/Telegram convenience through normal Controller authorization;
 14. workload-specific useful-work validation and actionable diagnostics.
 15. если используется contribution-based Pro entitlement — первый полный PRO ABUSE / ENTITLEMENT RED-TEAM GATE (§36B), включая fixes и повторную independent adversarial verification.
+16. local portfolio/mining accounting с historical/dormant asset awareness, lifecycle/no-double-counting и honest UNKNOWN/stale/provider states (§27C–§27F).
+17. Brain project/market intelligence и proactive deduplicated Telegram portfolio alerts с provenance, verified links и approximate-value language (§27G–§27H).
+18. full synthetic portfolio/market и mining-accounting lifecycle acceptance gate §27I.
+
+Le0xFarm к этой стадии отвечает в одном месте:
+
+- какие projects mined historically и какие WalletRefs получали rewards;
+- какие known balances, unpaid и immature/locked rewards остались;
+- какие balances UNKNOWN и почему;
+- какова approximate current value и uncertainty;
+- какие old assets became tradable, listed/delisted или require swap/migration/wallet upgrade;
+- какой deadline/action user рискует пропустить.
+
+Не требуется automatic balance provider для every obscure blockchain. Unsupported provider явно говорит `UNSUPPORTED` / `UNKNOWN`, а не zero.
 
 Profitability/autoswitch может продолжать постепенно созревать. Pro beta уже должна позволять осмысленно находить, проверять и запускать новые mining projects через canonical safe path.
 
@@ -2161,8 +2710,17 @@ Profitability/autoswitch может продолжать постепенно с
 - accessibility basics и полное RU/EN покрытие;
 - vendor-disappearance/end-of-life plan;
 - sustainable support/operating-cost model.
+- portfolio/provider compatibility and maturity visibility;
+- rate-limit/retry/provider-failure behavior, balance/quote freshness и network/ticker ambiguity handling;
+- market-source provenance/confidence, false-positive correction и duplicate-event suppression;
+- dormant-asset retention/export, privacy и Core availability during Brain outage;
+- Telegram outage/retry, secret redaction/rotation/revocation и exchange/API permission-scope visibility;
+- public Open Core can build/run without private Brain repositories, while official Pro dependencies are explicit (§28A);
+- private signing/entitlement/infrastructure secrets absent from public source and binaries;
+- clear official-vs-fork branding and Core license/service-entitlement distinction;
+- Free export/recovery and user-owned data remain available without Pro.
 
-До public Pro отдельно закрыть contribution accounting/arbitration/privacy/suspension.
+До public Pro отдельно закрыть contribution accounting/arbitration/privacy/suspension и independently review official Brain authorization against hostile forked/patched clients, replay/cloning/impersonation, fake evidence, direct API abuse, downgrade и Brain-compromise containment.
 
 После их design и implementation PUBLIC PRO обязан повторно пройти PRO ABUSE / ENTITLEMENT RED-TEAM GATE (§36B) против complete production system. Overcharge и fee bypass одинаково блокируют release.
 
@@ -2188,6 +2746,12 @@ Profitability/autoswitch может продолжать постепенно с
 - initial Owner authentication и remote second-factor direction → §10A;
 - restored Controller reconciliation против newer physical reality → §49A;
 - обязательная независимая symmetric anti-bypass/anti-overcharge verification перед Pro Beta и PUBLIC PRO → §36B, §55E, §55F; unfinished contribution mechanics остаются OPEN ниже.
+- ticker-only asset identity запрещена; exact chain/network/contract model остаётся OPEN → §27C, §51;
+- Core portfolio/mining-accounting ownership, reward lifecycle и no-double-counting → §27C–§27F;
+- proactive Brain/Telegram market intelligence является PRO, а local user-owned portfolio/accounting — CORE/FREE → §27H, §33, §34;
+- `.env` является local SecretProvider/input, а не canonical secret domain → §27A–§27B;
+- open-source Core/private official Brain source and service-entitlement boundary → §28A;
+- official Brain treats public/patched Controller as untrusted entitlement client; hostile fork attacks входят в mandatory red-team gate → §28A, §36B.
 
 ### Product scope / user
 
@@ -2235,6 +2799,10 @@ Profitability/autoswitch может продолжать постепенно с
 34. Pool-side verification privacy minimum.
 35. Pro entitlement transfer after Controller recovery/key rotation.
 36. Sustainable Brain/Relay/catalog/support cost model.
+74. Exact official Brain entitlement protocol, receipt/token format и contribution-proof mechanism.
+75. Brain API stability promise и whether third-party Brain endpoints are ever supported.
+76. Commercial pricing beyond already FROZEN contribution rules, Brain service continuity и entitlement recovery UX.
+77. Possible future enterprise/on-prem or licensed private Brain distribution.
 
 ### Security / trust
 
@@ -2284,6 +2852,26 @@ Profitability/autoswitch может продолжать постепенно с
 71. Data/privacy consent for Brain/analytics/notifications.
 72. Export/import versioning and safe shared Profile format.
 73. Licensing/provenance handling per redistributed artifact.
+
+### Portfolio / mining accounting / market intelligence
+
+78. Exact Asset/Network identity schema and canonicalization/provider mapping.
+79. BalanceProvider/AccountingProvider interfaces, provider precedence и reconciliation/correlation algorithm.
+80. Ledger/event schema, idempotency identifiers и accounting retention limits.
+81. Provider-specific polling intervals, forced-refresh policy, quotas и backoff.
+82. Market quote selection, historical price retention, liquidity-adjusted valuation и confidence formula.
+83. Dormant asset/portfolio retention and explicit removal lifecycle.
+84. Exact MarketEvent, maturity/unlock event lifecycle, deduplication thresholds и Telegram retry policy.
+85. Trusted-domain/catalog and false-positive correction workflow.
+86. Transaction-aware sale/transfer/outflow reconciliation; automatic trading остаётся separately prohibited без new architecture decision.
+
+### Open Core / private Brain / legal boundary
+
+87. Exact Brain deployment topology, hosting, database, queue, AI model/provider и internal operations.
+88. Exact Brain API compatibility/versioning promise и alternative-backend policy.
+89. Terms of Service и official service commercial/legal wording.
+90. Trademark/brand policy legal text для official names, logos, forks и modified builds.
+91. Exact private key-management/HSM operational process beyond frozen offline-root/online-key boundary.
 
 ---
 
@@ -2374,6 +2962,17 @@ Profitability/autoswitch может продолжать постепенно с
 - silent overwrite user-modified Profile;
 - Relay terminating application trust;
 - Noda как единственное место хранения recoverable wallet.
+- ticker-only asset identity и silent merge same-ticker networks/contracts;
+- unknown/provider-unavailable balance как fabricated zero;
+- independent balance snapshots, дважды counting один reward при maturity/payout/wallet receipt;
+- `.env` как canonical secret domain или storage wallet/recovery/PKI private keys;
+- exchange monitoring credential с trade/withdrawal authority by default;
+- automatic trading/withdrawal/transaction signing без отдельного architecture/security decision;
+- Discord user-token/self-bot impersonation и unverified social/AI URLs в Telegram;
+- locally editable `pro=true` как proof official Pro entitlement;
+- secrecy Brain wire format как security boundary;
+- private developer signing/entitlement/infrastructure secrets в public source или distributed binaries;
+- private Brain как повод скрыть или cripple user-owned Core data/runtime.
 
 ---
 
