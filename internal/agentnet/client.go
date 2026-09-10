@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,8 +41,12 @@ import (
 )
 
 type Config struct {
-	Target            string
-	InsecureDev       bool
+	Target      string
+	InsecureDev bool
+	// AllowRawExecution permits development-only executable/argv plans. It is
+	// rejected unless InsecureDev is also true and is never enabled by the
+	// production Agent entry point implicitly.
+	AllowRawExecution bool
 	AgentID           identity.AgentID
 	HostID            identity.HostID
 	Hostname          string
@@ -69,6 +74,9 @@ func (e sessionError) Unwrap() error { return e.err }
 
 // Run blocks until ctx is cancelled. It reconnects transient failures with bounded exponential backoff.
 func Run(ctx context.Context, config Config) error {
+	if config.AllowRawExecution && !config.InsecureDev {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "raw execution requires explicit insecure development mode"}
+	}
 	if config.HeartbeatInterval <= 0 {
 		config.HeartbeatInterval = 10 * time.Second
 	}
@@ -428,9 +436,26 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
 			break
 		}
-		plan, err := parsePlan(command.GetStartExecution().GetPlan())
+		plan, err := parsePlanForHost(command.GetStartExecution().GetPlan(), config.HostID)
 		if err != nil {
 			result.Result = errorResult(err)
+			break
+		}
+		if plan.Miner == nil {
+			if !config.InsecureDev || !config.AllowRawExecution {
+				result.Result = wireError(farmerr.PERMISSION_DENIED, "raw executable plans are disabled on this Agent")
+				break
+			}
+			if config.Supervisor == nil {
+				result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
+				break
+			}
+			snap, msg, err := config.Supervisor.Start(plan)
+			if err != nil {
+				result.Result = errorResult(err)
+			} else {
+				result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
+			}
 			break
 		}
 		if config.MinerRuntime != nil {
@@ -442,12 +467,7 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			}
 			break
 		}
-		snap, msg, err := config.Supervisor.Start(plan)
-		if err != nil {
-			result.Result = errorResult(err)
-		} else {
-			result.Result = &le0xv1.CommandResult_Execution{Execution: &le0xv1.ExecutionResult{Execution: wireExecution(snap), Message: msg}}
-		}
+		result.Result = wireError(farmerr.CONFIG_CONFLICT, "miner runtime is unavailable")
 	case command.GetStopExecution() != nil:
 		if config.Supervisor == nil && config.MinerRuntime == nil {
 			result.Result = wireError(farmerr.CONFIG_CONFLICT, "runtime supervisor is unavailable")
@@ -523,6 +543,10 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 }
 
 func parsePlan(in *le0xv1.ExecutionPlan) (model.ExecutionPlan, error) {
+	return parsePlanForHost(in, identity.HostID{})
+}
+
+func parsePlanForHost(in *le0xv1.ExecutionPlan, expectedHost identity.HostID) (model.ExecutionPlan, error) {
 	if in == nil {
 		return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ExecutionPlan is required"}
 	}
@@ -530,7 +554,15 @@ func parsePlan(in *le0xv1.ExecutionPlan) (model.ExecutionPlan, error) {
 	if err != nil {
 		return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid ExecutionID"}
 	}
-	plan := model.ExecutionPlan{ExecutionID: id, Executable: in.Executable, Args: append([]string(nil), in.Args...), Environment: maps.Clone(in.Environment), WorkingDirectory: in.WorkingDirectory, RestartPolicy: model.RestartPolicy(in.RestartPolicy)}
+	ownership, err := parseOwnership(in.GetOwnership())
+	if err != nil {
+		return model.ExecutionPlan{}, err
+	}
+	if expectedHost.Validate() == nil && ownership.HostID != expectedHost {
+		return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ExecutionPlan target HostID does not match this Agent"}
+	}
+	plan := model.ExecutionPlan{SchemaVersion: protocol.CurrentSchemaVersion, ExecutionID: id, Ownership: ownership, HostID: ownership.HostID,
+		DeviceIDs: append([]identity.DeviceID(nil), ownership.DeviceIDs...), Executable: in.Executable, Args: append([]string(nil), in.Args...), Environment: maps.Clone(in.Environment), WorkingDirectory: in.WorkingDirectory, RestartPolicy: model.RestartPolicy(in.RestartPolicy)}
 	if wire := in.GetMiner(); wire != nil {
 		packageID, err := identity.ParsePackageID(wire.PackageId)
 		if err != nil {
@@ -544,32 +576,49 @@ func parsePlan(in *le0xv1.ExecutionPlan) (model.ExecutionPlan, error) {
 			}
 			devices = append(devices, device)
 		}
-		var walletID *identity.WalletID
-		if wire.WalletId != "" {
-			parsed, err := identity.ParseWalletID(wire.WalletId)
-			if err != nil {
-				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid miner WalletID"}
-			}
-			walletID = &parsed
-		}
-		var poolID *identity.PoolID
-		if wire.PoolId != "" {
-			parsed, err := identity.ParsePoolID(wire.PoolId)
-			if err != nil {
-				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid miner PoolID"}
-			}
-			poolID = &parsed
-		}
 		var endpoint *model.MiningEndpoint
 		if value := wire.GetEndpoint(); value != nil {
 			endpoint = &model.MiningEndpoint{Address: value.Address, TLS: value.Tls, User: value.User, Password: value.Password, Worker: value.Worker}
 		}
-		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, WalletID: walletID, PoolID: poolID, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, Endpoint: endpoint, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
+		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, Endpoint: endpoint, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
+		if !slices.Equal(devices, ownership.DeviceIDs) {
+			return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "miner DeviceIDs do not match ownership ResourceClaim"}
+		}
 	}
 	return plan, nil
 }
+
+func parseOwnership(in *le0xv1.WorkloadOwnership) (model.WorkloadOwnership, error) {
+	if in == nil || in.GetResourceClaim() == nil {
+		return model.WorkloadOwnership{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "workload ownership metadata is required"}
+	}
+	workloadID, err := identity.ParseWorkloadID(in.WorkloadId)
+	if err != nil {
+		return model.WorkloadOwnership{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid WorkloadID"}
+	}
+	hostID, err := identity.ParseHostID(in.HostId)
+	if err != nil {
+		return model.WorkloadOwnership{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid ownership HostID"}
+	}
+	devices := make([]identity.DeviceID, 0, len(in.ResourceClaim.DeviceIds))
+	for _, raw := range in.ResourceClaim.DeviceIds {
+		deviceID, err := identity.ParseDeviceID(raw)
+		if err != nil {
+			return model.WorkloadOwnership{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid ownership ResourceClaim DeviceID"}
+		}
+		devices = append(devices, deviceID)
+	}
+	ownership := model.WorkloadOwnership{WorkloadID: workloadID, DesiredGeneration: in.DesiredGeneration, ResolvedHash: in.ResolvedHash, HostID: hostID, CPU: in.ResourceClaim.Cpu, DeviceIDs: devices}
+	if err := ownership.Validate(); err != nil {
+		return model.WorkloadOwnership{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid workload ownership metadata", Details: map[string]string{"reason": err.Error()}}
+	}
+	return ownership, nil
+}
 func wireExecution(s supervisor.Snapshot) *le0xv1.Execution {
 	out := &le0xv1.Execution{ExecutionId: s.ExecutionID.String(), State: string(s.State), Pid: int64(s.PID), RestartCount: s.RestartCount, LastError: s.LastError}
+	if s.Ownership.Validate() == nil {
+		out.Ownership = wireOwnership(s.Ownership)
+	}
 	if !s.StartedAt.IsZero() {
 		out.StartedAt = timestamppb.New(s.StartedAt)
 	}
@@ -578,6 +627,14 @@ func wireExecution(s supervisor.Snapshot) *le0xv1.Execution {
 		out.ExitCode = int32(*s.ExitCode)
 	}
 	return out
+}
+
+func wireOwnership(ownership model.WorkloadOwnership) *le0xv1.WorkloadOwnership {
+	devices := make([]string, len(ownership.DeviceIDs))
+	for i, deviceID := range ownership.DeviceIDs {
+		devices[i] = deviceID.String()
+	}
+	return &le0xv1.WorkloadOwnership{WorkloadId: ownership.WorkloadID.String(), DesiredGeneration: ownership.DesiredGeneration, ResolvedHash: ownership.ResolvedHash, HostId: ownership.HostID.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: ownership.CPU, DeviceIds: devices}}
 }
 
 func wireObservation(observation minerruntime.Observation) *le0xv1.Execution {

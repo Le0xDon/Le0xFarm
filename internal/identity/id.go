@@ -340,6 +340,32 @@ func (id PackageID) MarshalText() ([]byte, error) {
 	return []byte(id.value), nil
 }
 
+// WorkloadID identifies persistent desired workload intent. It is distinct
+// from ExecutionID, which identifies one concrete runtime execution.
+type WorkloadID struct{ value string }
+
+func NewWorkloadID() (WorkloadID, error) {
+	value, err := generate("workload")
+	return WorkloadID{value: value}, err
+}
+
+func ParseWorkloadID(value string) (WorkloadID, error) {
+	if err := validate(value, "workload"); err != nil {
+		return WorkloadID{}, err
+	}
+	return WorkloadID{value: value}, nil
+}
+
+func (id WorkloadID) String() string  { return id.value }
+func (id WorkloadID) Validate() error { return validate(id.value, "workload") }
+
+func (id WorkloadID) MarshalText() ([]byte, error) {
+	if err := id.Validate(); err != nil {
+		return nil, err
+	}
+	return []byte(id.value), nil
+}
+
 // UnmarshalText replaces the ID only after successful validation.
 func (id *FarmID) UnmarshalText(text []byte) error {
 	parsed, err := ParseFarmID(string(text))
@@ -453,6 +479,16 @@ func (id *PoolID) UnmarshalText(text []byte) error {
 // UnmarshalText replaces the ID only after successful validation.
 func (id *PackageID) UnmarshalText(text []byte) error {
 	parsed, err := ParsePackageID(string(text))
+	if err != nil {
+		return err
+	}
+	*id = parsed
+	return nil
+}
+
+// UnmarshalText replaces the ID only after successful validation.
+func (id *WorkloadID) UnmarshalText(text []byte) error {
+	parsed, err := ParseWorkloadID(string(text))
 	if err != nil {
 		return err
 	}

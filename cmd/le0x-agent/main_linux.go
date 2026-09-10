@@ -41,6 +41,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	asJSON := flags.Bool("json", false, "Print local identity and inventory as JSON")
 	controller := flags.String("controller", "", "Controller host:port (enables persistent network mode)")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
+	allowRawExecution := flags.Bool("allow-raw-execution", false, "Allow raw executable plans in insecure development mode only")
 	pair := flags.String("pair", "", "Controller enrollment token (development only)")
 	pairStdin := flags.Bool("pair-stdin", false, "Read one secure enrollment token from stdin")
 	tlsFingerprint := flags.String("tls-fingerprint", "", "Controller certificate SHA-256 fingerprint")
@@ -59,6 +60,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if *pair != "" && !*insecureDev {
 		return fail(stderr, false, errors.New("--pair is allowed only with --insecure-dev; use --pair-stdin for secure enrollment"))
+	}
+	if *allowRawExecution && (!*insecureDev || *controller == "") {
+		return fail(stderr, false, errors.New("--allow-raw-execution requires --insecure-dev and --controller"))
 	}
 	if *pairStdin && (*controller == "" || *insecureDev) {
 		return fail(stderr, false, errors.New("--pair-stdin requires secure --controller mode"))
@@ -111,7 +115,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			defer cancel()
 			_ = minerRuntime.Shutdown(shutdownCtx)
 		}()
-		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Supervisor: runtimeSupervisor, MinerRuntime: minerRuntime, Output: log.New(stdout, "", 0)})
+		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, AllowRawExecution: *allowRawExecution, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Supervisor: runtimeSupervisor, MinerRuntime: minerRuntime, Output: log.New(stdout, "", 0)})
 		if err != nil {
 			return fail(stderr, false, err)
 		}

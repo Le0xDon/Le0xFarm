@@ -5,5 +5,5 @@ type ProtocolVersion uint32
 type SchemaVersion uint32
 
 // Foundation versions, explicitly carried by the v1 protocol hello messages.
-const CurrentProtocolVersion ProtocolVersion = 2
+const CurrentProtocolVersion ProtocolVersion = 3
 const CurrentSchemaVersion SchemaVersion = 1

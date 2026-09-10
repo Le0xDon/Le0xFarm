@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -125,6 +127,58 @@ func TestLookupRejectsSymlinkReplacement(t *testing.T) {
 	}
 	if _, err := store.Lookup(m.PackageID, m.Version); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
 		t.Fatalf("symlink replacement error=%v", err)
+	}
+}
+
+func TestLookupRequiresCompleteExecutableVerificationMetadata(t *testing.T) {
+	path, hash := archive(t, tarEntry{name: "bin", body: []byte("verified"), mode: 0755}, tarEntry{name: "other", body: []byte("other"), mode: 0644})
+	m := manifest(t, hash)
+	m.ExecutableRelativePath = "bin"
+
+	tests := []struct {
+		name   string
+		mutate func(*Installed)
+	}{
+		{"empty hash map", func(value *Installed) { value.FileSHA256 = map[string]string{} }},
+		{"missing executable hash", func(value *Installed) { delete(value.FileSHA256, "bin") }},
+		{"wrong executable hash", func(value *Installed) { value.FileSHA256["bin"] = strings.Repeat("0", 64) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := New(t.TempDir())
+			installed, err := store.Install(context.Background(), path, m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadataPath := filepath.Join(filepath.Dir(installed.ExecutablePath), metadataFile)
+			data, err := os.ReadFile(metadataPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record Installed
+			if err := json.Unmarshal(data, &record); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&record)
+			data, err = json.Marshal(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(metadataPath, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Lookup(m.PackageID, m.Version); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
+				t.Fatalf("incomplete record accepted: %v", err)
+			}
+		})
+	}
+
+	store := New(t.TempDir())
+	if _, err := store.Install(context.Background(), path, m); err != nil {
+		t.Fatalf("valid complete package rejected: %v", err)
+	}
+	if _, err := store.Lookup(m.PackageID, m.Version); err != nil {
+		t.Fatalf("valid complete lookup rejected: %v", err)
 	}
 }
 

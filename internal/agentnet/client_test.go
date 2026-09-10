@@ -33,20 +33,73 @@ import (
 
 func TestParseGenericMinerPlanValidatesTypedReferences(t *testing.T) {
 	id := "execution_0123456789abcdef0123456789abcdef"
-	base := &le0xv1.ExecutionPlan{ExecutionId: id, Miner: &le0xv1.MinerSpec{AdapterId: "xmrig", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "6.26.0", WalletId: "wallet_0123456789abcdef0123456789abcdef", PoolId: "pool_0123456789abcdef0123456789abcdef", Mode: "MINING", Endpoint: &le0xv1.MiningEndpoint{Address: "pool.example:443", Tls: true, User: "public-login", Password: "secret", Worker: "worker-1"}}}
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	base := &le0xv1.ExecutionPlan{ExecutionId: id, Ownership: testWireOwnership(hostID), Miner: &le0xv1.MinerSpec{AdapterId: "xmrig", SpecVersion: 1, PackageId: "package_0123456789abcdef0123456789abcdef", PackageVersion: "6.26.0", Mode: "MINING", Endpoint: &le0xv1.MiningEndpoint{Address: "pool.example:443", Tls: true, User: "public-login", Password: "secret", Worker: "worker-1"}}}
 	plan, err := parsePlan(base)
-	if err != nil || plan.Miner == nil || plan.Miner.WalletID == nil || plan.Miner.PoolID == nil || plan.Miner.Endpoint == nil || !plan.Miner.Endpoint.TLS || plan.Miner.Endpoint.Password != "secret" || plan.Miner.Endpoint.Worker != "worker-1" {
+	if err != nil || plan.Miner == nil || plan.Miner.WalletID != nil || plan.Miner.PoolID != nil || plan.Miner.Endpoint == nil || !plan.Miner.Endpoint.TLS || plan.Miner.Endpoint.Password != "secret" || plan.Miner.Endpoint.Worker != "worker-1" || plan.Ownership.DesiredGeneration != 1 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
-	badWallet := proto.Clone(base).(*le0xv1.ExecutionPlan)
-	badWallet.Miner.WalletId = "agent_0123456789abcdef0123456789abcdef"
-	if _, err := parsePlan(badWallet); err == nil {
-		t.Fatal("wrong WalletID prefix accepted")
+	badHash := proto.Clone(base).(*le0xv1.ExecutionPlan)
+	badHash.Ownership.ResolvedHash = "sha256:ABC"
+	if _, err := parsePlan(badHash); err == nil {
+		t.Fatal("invalid ResolvedHash accepted")
 	}
-	badPool := proto.Clone(base).(*le0xv1.ExecutionPlan)
-	badPool.Miner.PoolId = "invalid"
-	if _, err := parsePlan(badPool); err == nil {
-		t.Fatal("invalid PoolID accepted")
+	wrongHost, _ := identity.NewHostID()
+	if _, err := parsePlanForHost(base, wrongHost); err == nil {
+		t.Fatal("wrong target HostID accepted")
+	}
+}
+
+func testWireOwnership(hostID identity.HostID) *le0xv1.WorkloadOwnership {
+	return &le0xv1.WorkloadOwnership{WorkloadId: "workload_0123456789abcdef0123456789abcdef", DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostId: hostID.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: true}}
+}
+
+func TestAgentRejectsMalformedOwnershipMetadata(t *testing.T) {
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	base := &le0xv1.ExecutionPlan{ExecutionId: "execution_0123456789abcdef0123456789abcdef", Executable: "/bin/sleep", Args: []string{"1"}, RestartPolicy: "NEVER", Ownership: testWireOwnership(hostID)}
+	cases := map[string]func(*le0xv1.ExecutionPlan){
+		"missing":       func(plan *le0xv1.ExecutionPlan) { plan.Ownership = nil },
+		"workload":      func(plan *le0xv1.ExecutionPlan) { plan.Ownership.WorkloadId = "bad" },
+		"generation":    func(plan *le0xv1.ExecutionPlan) { plan.Ownership.DesiredGeneration = 0 },
+		"hash":          func(plan *le0xv1.ExecutionPlan) { plan.Ownership.ResolvedHash = "sha256:" + strings.Repeat("A", 64) },
+		"host":          func(plan *le0xv1.ExecutionPlan) { plan.Ownership.HostId = "bad" },
+		"claim":         func(plan *le0xv1.ExecutionPlan) { plan.Ownership.ResourceClaim = &le0xv1.ResourceClaim{} },
+		"claim-missing": func(plan *le0xv1.ExecutionPlan) { plan.Ownership.ResourceClaim = nil },
+		"duplicate-gpus": func(plan *le0xv1.ExecutionPlan) {
+			plan.Ownership.ResourceClaim = &le0xv1.ResourceClaim{DeviceIds: []string{"device_0123456789abcdef0123456789abcdef", "device_0123456789abcdef0123456789abcdef"}}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			plan := proto.Clone(base).(*le0xv1.ExecutionPlan)
+			mutate(plan)
+			if _, err := parsePlanForHost(plan, hostID); err == nil {
+				t.Fatal("malformed ownership accepted")
+			}
+		})
+	}
+	wrongHost, _ := identity.NewHostID()
+	if _, err := parsePlanForHost(base, wrongHost); err == nil {
+		t.Fatal("mismatched target HostID accepted")
+	}
+}
+
+func TestAgentRetainsAndEchoesOwnershipMetadata(t *testing.T) {
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	wirePlan := &le0xv1.ExecutionPlan{ExecutionId: "execution_0123456789abcdef0123456789abcdef", Executable: "/bin/sleep", Args: []string{"10"}, RestartPolicy: "NEVER", Ownership: testWireOwnership(hostID)}
+	plan, err := parsePlanForHost(wirePlan, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := supervisor.New(supervisor.Config{StopGrace: 50 * time.Millisecond})
+	defer runtime.Shutdown(context.Background())
+	snapshot, _, err := runtime.Start(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoed := wireExecution(snapshot)
+	if echoed.GetOwnership().GetWorkloadId() != wirePlan.Ownership.WorkloadId || echoed.GetOwnership().GetDesiredGeneration() != 1 || echoed.GetOwnership().GetResolvedHash() != wirePlan.Ownership.ResolvedHash || echoed.GetOwnership().GetHostId() != hostID.String() || !echoed.GetOwnership().GetResourceClaim().GetCpu() {
+		t.Fatalf("ownership metadata was not retained: %+v", echoed.GetOwnership())
 	}
 }
 
@@ -86,7 +139,7 @@ func (s oldProtocolServer) Connect(stream le0xv1.AgentControl_ConnectServer) err
 	if _, err := stream.Recv(); err != nil {
 		return err
 	}
-	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: 1, SchemaVersion: uint32(protocol.CurrentSchemaVersion), ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
+	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: 2, SchemaVersion: uint32(protocol.CurrentSchemaVersion), ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
 		return err
 	}
 	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Command{Command: &le0xv1.CommandEnvelope{CommandId: "must-not-run", Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}}}); err != nil {
@@ -263,7 +316,7 @@ func TestCommandMappingPreservesNonce(t *testing.T) {
 	if !bytes.Equal(ping.GetPing().GetNonce(), nonce) {
 		t.Fatal("nonce changed")
 	}
-	if uint32(protocol.CurrentProtocolVersion) != 2 {
+	if uint32(protocol.CurrentProtocolVersion) != 3 {
 		t.Fatal("unexpected protocol test baseline")
 	}
 }
@@ -358,7 +411,7 @@ func TestAgentReconnectsAndUsesShorterBackoffAfterSuccess(t *testing.T) {
 	}
 }
 
-func TestSecureBootstrapThenMutualTLS(t *testing.T) {
+func TestSecureProductionAgentRejectsRawExecutionAfterMutualTLS(t *testing.T) {
 	controllerDir := t.TempDir()
 	controllerID, _ := identity.NewControllerID()
 	farmID, _ := identity.NewFarmID()
@@ -377,7 +430,7 @@ func TestSecureBootstrapThenMutualTLS(t *testing.T) {
 	agentID, _ := identity.NewAgentID()
 	hostID, _ := identity.NewHostID()
 	executionID, _ := identity.NewExecutionID()
-	runtimeCommand := &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: executionID.String(), Executable: "/bin/sleep", Args: []string{"60"}, RestartPolicy: string(model.RestartNever)}}}}
+	runtimeCommand := &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_StartExecution{StartExecution: &le0xv1.StartExecution{Plan: &le0xv1.ExecutionPlan{ExecutionId: executionID.String(), Executable: "/bin/sleep", Args: []string{"60"}, RestartPolicy: string(model.RestartNever), Ownership: testWireOwnership(hostID)}}}}
 	var controllerOutput lockedBuffer
 	server, err := controllernet.New(controllernet.Config{ControllerID: controllerID, FarmID: farmID, Trust: trust, Pairing: window, PKI: pki, RuntimeCommands: []*le0xv1.CommandEnvelope{runtimeCommand}, RuntimeTarget: agentID, Output: log.New(&controllerOutput, "", 0), ShutdownGracePeriod: 20 * time.Millisecond})
 	if err != nil {
@@ -416,50 +469,19 @@ func TestSecureBootstrapThenMutualTLS(t *testing.T) {
 		t.Fatal("Controller trust not persisted")
 	}
 	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if snapshot, ok := runtimeSupervisor.Get(executionID); ok && snapshot.State == model.ExecutionRunning {
-			break
-		}
+	for time.Now().Before(deadline) && !strings.Contains(controllerOutput.String(), string(farmerr.PERMISSION_DENIED)) {
 		time.Sleep(time.Millisecond)
 	}
-	snapshot, ok := runtimeSupervisor.Get(executionID)
-	if !ok || snapshot.State != model.ExecutionRunning || snapshot.PID <= 0 {
-		t.Fatalf("authenticated mTLS START not executed: %+v", snapshot)
+	if !strings.Contains(controllerOutput.String(), string(farmerr.PERMISSION_DENIED)) {
+		t.Fatalf("production raw START was not rejected: %s", controllerOutput.String())
 	}
-	originalPID := snapshot.PID
-	// Enrollment streams return immediately after issuing credentials and never
-	// carry commands; the START above was accepted only on the subsequent mTLS stream.
-	secondListener := bufconn.Listen(1024 * 1024)
-	var reconnectOutput lockedBuffer
-	getCommand := &le0xv1.CommandEnvelope{Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}
-	secondServer, err := controllernet.New(controllernet.Config{ControllerID: controllerID, FarmID: farmID, Trust: trust, PKI: pki, RuntimeCommands: []*le0xv1.CommandEnvelope{getCommand}, RuntimeTarget: agentID, Output: log.New(&reconnectOutput, "", 0), ShutdownGracePeriod: 20 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondCtx, stopSecond := context.WithCancel(context.Background())
-	defer stopSecond()
-	secondDone := make(chan error, 1)
-	go func() { secondDone <- secondServer.Serve(secondCtx, secondListener) }()
-	dialer.Set(secondListener)
-	stopServer()
-	if err := <-doneServer; err != nil {
-		t.Fatal(err)
-	}
-	if snapshot, _ := runtimeSupervisor.Get(executionID); snapshot.State != model.ExecutionRunning || snapshot.PID != originalPID {
-		t.Fatalf("Controller disconnect changed execution: %+v", snapshot)
-	}
-	deadline = time.Now().Add(2 * time.Second)
-	wantPID := fmt.Sprintf("pid=%d", originalPID)
-	for time.Now().Before(deadline) && (!strings.Contains(reconnectOutput.String(), executionID.String()) || !strings.Contains(reconnectOutput.String(), wantPID)) {
-		time.Sleep(time.Millisecond)
-	}
-	if !strings.Contains(reconnectOutput.String(), executionID.String()) || !strings.Contains(reconnectOutput.String(), wantPID) {
-		t.Fatalf("reconnect did not report same execution: %s", reconnectOutput.String())
+	if snapshot, ok := runtimeSupervisor.Get(executionID); ok {
+		t.Fatalf("production Agent executed raw plan: %+v", snapshot)
 	}
 	cancel()
 	<-done
-	stopSecond()
-	<-secondDone
+	stopServer()
+	<-doneServer
 }
 
 func TestSecureBootstrapRejectsWrongFingerprint(t *testing.T) {

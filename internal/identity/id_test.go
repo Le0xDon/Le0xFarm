@@ -112,6 +112,7 @@ func TestIDs(t *testing.T) {
 	t.Run("Profile", func(t *testing.T) { checkID(t, "profile", identity.NewProfileID, identity.ParseProfileID) })
 	t.Run("Execution", func(t *testing.T) { checkID(t, "execution", identity.NewExecutionID, identity.ParseExecutionID) })
 	t.Run("Service", func(t *testing.T) { checkID(t, "service", identity.NewServiceID, identity.ParseServiceID) })
+	t.Run("Workload", func(t *testing.T) { checkID(t, "workload", identity.NewWorkloadID, identity.ParseWorkloadID) })
 }
 
 func TestSameHostnameHasIndependentHostIDs(t *testing.T) {

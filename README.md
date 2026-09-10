@@ -8,12 +8,101 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Текущий этап — **M3 Generic Miner Runtime + XMRig adapter**. Существующий M1 transport использует
+Текущий этап — **M4.3 Desired Runtime Reconciliation**. Существующий M1 transport использует
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
 может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
 проверяемое локальное хранилище packages и первый adapter XMRig. Le0xNoda/Le0xBrain,
-DesiredState persistence, Controller-to-Agent package distribution и systemd не реализованы.
+Controller-to-Agent package distribution и systemd не реализованы.
+
+## M4.3 — Desired Runtime Reconciliation
+
+Controller применяет persistent `DesiredWorkload` через level-triggered reconciler: desired
+state остаётся авторитетным намерением, fresh Agent observation — фактом, а START/STOP — только
+средством сходимости. ProtocolVersion 3 передаёт adapter-neutral ownership tuple
+`ExecutionID`/`WorkloadID`/`DesiredGeneration`/`ResolvedHash`, target `HostID` и точный CPU/GPU
+`ResourceClaim`. Agent валидирует и возвращает эти поля без интерпретации profile/pool/wallet
+policy; Controller не определяет ownership по PID, hostname, command line или miner adapter.
+
+Каждое принятое соединение получает неперсистентный monotonic `ConnectionEpoch`. После hello
+session остаётся NOT READY до полного свежего `GET_EXECUTIONS`, inventory и status; до READY
+runtime commands запрещены. Disconnect сбрасывает ready/fresh и in-flight actions этого epoch.
+Результаты старого epoch не меняют текущий observed state, а stale generation может только
+обнаружить obsolete execution для последующего exact-ID STOP.
+
+Planner отделён от network coordinator и детерминированно выполняет не более одного Host action
+за проход. Текущий RUNNING/STARTING/BACKOFF или временно DEGRADED execution не перезапускается.
+Obsolete owned execution сначала получает exact-ID STOP; replacement START возможен только после
+подтверждённой остановки или fresh absence. Unmanaged execution никогда не останавливается и не
+adopt-ится; неизвестный или пересекающийся claim блокирует START, известный непересекающийся claim
+не мешает независимому workload. In-flight actions живут только в памяти и подавляют дубликаты.
+
+Terminal `FAILED` и definite non-transient START rejection блокируют только текущую generation в
+минимальной persistent runtime binding. Явный `RetryWorkload` увеличивает revision и generation,
+создаёт один новый ExecutionID из того же effective runtime snapshot и очищает latch. Historical
+STOPPED workload удаляется только после current-epoch fresh proof отсутствия owned execution;
+append-only snapshots сохраняются.
+
+## M4.2 — Desired Workloads and Resolution
+
+`DesiredWorkload` отвечает на вопрос, что должно выполняться на стабильном `HostID`.
+Он имеет отдельный opaque `WorkloadID`, ссылку на `MiningProfile`, явные `RUNNING`/`STOPPED`,
+worker, нормализованный `ResourceClaim` и system-owned `DesiredGeneration`. `AgentID`, hostname
+и IP в target не сохраняются. CPU является одним host resource; GPU claims используют
+отсортированные `DeviceID`. Одновременные RUNNING workloads не могут пересекаться по CPU
+или GPU на одном Host, при этом CPU и непересекающиеся GPU workloads могут сосуществовать.
+
+Controller resolver детерминированно объединяет DesiredWorkload, MiningProfile, Pool,
+WalletRef и read-only PackageCatalog. Login template поддерживает только `${wallet}` и
+`${worker}` с placement `NONE`, `IN_USER` или `SEPARATE`. Agent и adapter не формируют login
+по собственным правилам. `PUBLIC_LITERAL` может попасть в snapshot как явно объявленное
+пользователем несекретное plaintext значение; persistent secret credentials не поддерживаются.
+
+Каждый RUNNING effective generation получает ровно один persistent `ExecutionID` и одну
+immutable `ResolvedExecutionSnapshot`. Snapshot хранит source IDs/revisions, package family
+и version, resource claim, resolved generic `ExecutionPlan`, runtime `ResolvedHash` и время
+создания. SQLite triggers запрещают update/delete snapshots; история append-only. Для STOPPED
+generation сохраняется effective hash, но ExecutionID/snapshot не создаются.
+
+Object revision меняется при logical edit. DesiredGeneration меняется только при изменении
+runtime-effective `ResolvedHash`, включая RUNNING/STOPPED, target/resources/profile/worker,
+package/runtime settings или resolved endpoint. Display-only rename Pool, WalletRef, Profile
+или Workload меняет object revision, но не generation и не ExecutionID. Update referenced
+object, fan-out generations и новые snapshots выполняются одной SQLite transaction. Эти snapshots
+являются единственным источником runtime plans для M4.3; resolver не вызывается заново при START.
+
+## M4.1 — Persistent Farm Objects
+
+Controller хранит канонические reusable objects в `<controller-data-dir>/farm.db`: `Pool`,
+`WalletRef` и `MiningProfile`. SQLite включает foreign keys, WAL, full synchronous writes,
+busy timeout и отдельный ledger последовательных embedded migrations с checksum. Existing
+Controller identity, pairing trust и PKI остаются в своих security files и не дублируются
+в базе. Package catalog является read-only dependency; Agent package cache не становится
+Controller catalog или источником конфигурации.
+
+Каждый объект имеет opaque typed ID и `ObjectMeta`: object schema version 1, monotonic
+revision, deterministic SHA-256 content hash, origin и UTC timestamps. Hash вычисляется по
+собственному ограниченному deterministic JSON representation: fixed-schema object keys
+сортируются, допустимы valid UTF-8 strings, booleans, integers, null и arrays; floating-point
+values не поддерживаются. ID/revision/origin/time в logical content hash не входят.
+CRUD использует `expected_revision`; stale update/delete возвращает `REVISION_CONFLICT`.
+Идентичный update является no-op. Ссылки Profile на Pool/Wallet проверяются транзакционно,
+а referenced objects нельзя удалить (`REFERENCE_IN_USE`).
+
+`Pool` является reusable connection configuration и не содержит coin: coin и algorithm
+принадлежат `MiningProfile`. `WalletRef` хранит только публичную payout/reference строку,
+никогда seed, mnemonic или private key. Pool auth `PUBLIC_LITERAL` означает явное решение
+пользователя хранить значение plaintext в `farm.db`; оно не должно использоваться для
+credentials или secrets. M4 не пытается определить чувствительность автоматически.
+Будущие persistent credentials будут ссылаться на отдельный `SecretRef`.
+
+Login policy использует ограниченные placeholders `${wallet}` и `${worker}` с явным
+worker placement (`NONE`, `IN_USER`, `SEPARATE`), поэтому Agent и miner adapter не угадывают
+pool-specific login syntax. M4.2 resolver применяет эту policy к DesiredWorkload. Object ContentHash
+включает display name как logical object content, но resolved runtime hash исключает
+display-only metadata: rename не изменит DesiredGeneration и не заменит miner. Historical
+resolved snapshots в M4 будут append-only; retention/compaction остаётся будущей работой,
+поскольку snapshots нужны для распознавания owned obsolete executions.
 
 ## M3 — Generic Miner Runtime и XMRig 6.26.0
 
@@ -104,8 +193,10 @@ SIGTERM группе, ждёт 5 секунд и при необходимост
 `PROCESS_CRASHED`. Explicit STOP отменяет pending restart. `NEVER` оставляет неожиданно
 завершившийся execution в CRASHED.
 
-Для acceptance доступен явный development/test CLI Controller, который использует тот
-же mTLS stream и не создаёт дополнительного listener:
+Для acceptance доступен явный development/test CLI Controller, который не создаёт
+дополнительного listener. Raw executable plan принимается Agent только при одновременных
+`--insecure-dev --allow-raw-execution`; production/mTLS Agent отклоняет его. Перед
+примером Agent должен быть запущен в этом явно небезопасном development-only режиме:
 
 ```sh
 le0x-controller --listen 0.0.0.0:50051 \
@@ -115,8 +206,8 @@ le0x-controller --listen 0.0.0.0:50051 \
   --executable /bin/sleep --execution-arg 300
 ```
 
-Действия: `start`, `stop`, `restart`, `get`. Этот механизм нужен до появления
-persistent DesiredState/Controller API и не обходит authentication.
+Действия: `start`, `stop`, `restart`, `get`. Этот механизм development-only; canonical
+production path использует persistent DesiredState, verified Package и Miner Adapter.
 
 ## M1.3 — persistent Controller identity
 
@@ -370,13 +461,13 @@ go vet ./...
 
 ## M1.4 pairing foundation
 
-Development pairing uses a one-time 256-bit enrollment token held only in Controller memory. Start an initialized Controller with `--pairing` (optionally `--pairing-ttl 15m`), then connect a new Agent with `--controller HOST:PORT --insecure-dev --pair TOKEN`. The token travels over plaintext development transport and is not production security. After pairing, Controller trust is stored in `paired_agents.json` and Agent trust in `controller.json`; reconnects do not require the token. Production pairing will use mTLS/bootstrap security in a later stage.
+Development pairing uses a one-time 256-bit enrollment token held only in Controller memory. Start an initialized Controller with `--pairing --pairing-token-file /secure/path/enrollment.token` (optionally `--pairing-ttl 15m`), then connect a new Agent with `--controller HOST:PORT --insecure-dev --pair TOKEN`. The mode-0600 credential file is created exclusively and the token is never printed in Controller operational output. The token travels over plaintext development transport and is not production security. After pairing, Controller trust is stored in `paired_agents.json` and Agent trust in `controller.json`; reconnects do not require the token.
 
 ## M1.5 secure transport
 
 The default Agent–Controller transport is persistent gRPC over TLS 1.3 with mutual TLS. The Farm CA and Controller certificate use Ed25519 and live under the Controller data directory in `pki/`. Existing M1.4 Controllers initialize this PKI once with `--init-pki`; a fresh `--init` creates identity and PKI together. PKI is never regenerated automatically. `--insecure-dev` remains an explicit plaintext development mode and is never used as a fallback.
 
-Secure enrollment starts the Controller with `--pairing`. It prints a temporary token and the SHA-256 fingerprint of its current server certificate. The Agent reads the token from stdin and verifies the exact certificate fingerprint:
+Secure enrollment starts the Controller with `--pairing --pairing-token-file /secure/path/enrollment.token`. Controller operational output reports only that credential-file path and the SHA-256 fingerprint of its current server certificate; it never prints the token. The Agent reads the credential from stdin and verifies the exact certificate fingerprint:
 
 ```sh
 printf '%s\n' "$TOKEN" | le0x-agent --controller HOST:PORT --pair-stdin --tls-fingerprint SHA256:...

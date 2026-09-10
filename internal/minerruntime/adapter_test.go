@@ -15,9 +15,10 @@ import (
 )
 
 type fakeAdapter struct {
-	source  TelemetrySource
-	mu      sync.Mutex
-	cleaned bool
+	source        TelemetrySource
+	mu            sync.Mutex
+	cleaned       bool
+	dropOwnership bool
 }
 
 func (a *fakeAdapter) ID() string { return "test-no-http" }
@@ -32,6 +33,10 @@ func (a *fakeAdapter) Validate(spec model.MinerSpec, _ model.Inventory) ([]strin
 }
 func (a *fakeAdapter) Prepare(_ context.Context, request PrepareRequest) (Prepared, error) {
 	resolved := request.Plan
+	if a.dropOwnership {
+		resolved.Ownership = model.WorkloadOwnership{}
+		resolved.HostID = identity.HostID{}
+	}
 	resolved.Executable = "/bin/sleep"
 	resolved.Args = []string{"60"}
 	return Prepared{Plan: resolved, Telemetry: a.source, Cleanup: func() error {
@@ -40,6 +45,29 @@ func (a *fakeAdapter) Prepare(_ context.Context, request PrepareRequest) (Prepar
 		a.cleaned = true
 		return nil
 	}}, nil
+}
+
+func TestAdapterCannotDiscardOwnershipMetadata(t *testing.T) {
+	source := &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http"}}}}
+	registry := NewRegistry()
+	if err := registry.Register(&fakeAdapter{source: source, dropOwnership: true}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond})
+	manager := New(runtime, registry, t.TempDir(), nil, model.Inventory{}, Config{})
+	plan := testPlan(t, model.MinerModeStress)
+	workloadID, _ := identity.NewWorkloadID()
+	hostID, _ := identity.NewHostID()
+	plan.HostID = hostID
+	plan.Ownership = model.WorkloadOwnership{WorkloadID: workloadID, DesiredGeneration: 5, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostID: hostID, CPU: true}
+	observation, _, err := manager.Start(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Shutdown(context.Background())
+	if observation.Process.Ownership.WorkloadID != workloadID || observation.Process.Ownership.DesiredGeneration != 5 || observation.Process.Ownership.HostID != hostID {
+		t.Fatalf("adapter discarded ownership: %+v", observation.Process.Ownership)
+	}
 }
 
 type sequenceSource struct {

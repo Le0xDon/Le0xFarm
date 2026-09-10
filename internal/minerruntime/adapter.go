@@ -176,6 +176,13 @@ func (m *Manager) Start(ctx context.Context, plan model.ExecutionPlan) (Observat
 		}
 		return Observation{}, "", farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "miner adapter returned no telemetry source"}
 	}
+	// Adapter preparation may resolve executable details, but it cannot alter or
+	// discard Controller ownership identity and resource claims.
+	prepared.Plan.ExecutionID = plan.ExecutionID
+	prepared.Plan.Ownership = plan.Ownership
+	prepared.Plan.Ownership.DeviceIDs = append([]identity.DeviceID(nil), plan.Ownership.DeviceIDs...)
+	prepared.Plan.HostID = plan.HostID
+	prepared.Plan.DeviceIDs = append([]identity.DeviceID(nil), plan.DeviceIDs...)
 	snapshot, message, err := m.supervisor.Start(prepared.Plan)
 	if err != nil {
 		if prepared.Cleanup != nil {

@@ -1,4 +1,4 @@
-// Package controllernet contains the minimal development Controller gRPC runtime.
+// Package controllernet owns authenticated Agent sessions and their safe command boundary.
 package controllernet
 
 import (
@@ -15,11 +15,14 @@ import (
 	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/controllerpki"
+	"github.com/le0xdon/le0xfarm/internal/controllerstate"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
+	"github.com/le0xdon/le0xfarm/internal/wiremap"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -30,18 +33,19 @@ import (
 )
 
 type Config struct {
-	ControllerID        identity.ControllerID
-	FarmID              identity.FarmID
-	ListenAddress       string
-	InsecureDev         bool
-	ProtocolVersion     uint32
-	SchemaVersion       uint32
-	Inventory           inventory.Source
-	Output              *log.Logger
-	ShutdownGracePeriod time.Duration
-	Trust               *controllertrust.Store
-	Pairing             *PairingWindow
-	PKI                 *controllerpki.PKI
+	ControllerID         identity.ControllerID
+	FarmID               identity.FarmID
+	ListenAddress        string
+	InsecureDev          bool
+	ProtocolVersion      uint32
+	SchemaVersion        uint32
+	Inventory            inventory.Source
+	Output               *log.Logger
+	ShutdownGracePeriod  time.Duration
+	RuntimeActionTimeout time.Duration
+	Trust                *controllertrust.Store
+	Pairing              *PairingWindow
+	PKI                  *controllerpki.PKI
 	// RuntimeCommands are development/test commands sent through the authenticated
 	// AgentControl stream. Production desired-state control is a later milestone.
 	RuntimeCommands []*le0xv1.CommandEnvelope
@@ -50,17 +54,23 @@ type Config struct {
 
 type Server struct {
 	le0xv1.UnimplementedAgentControlServer
-	controllerID identity.ControllerID
-	farmID       identity.FarmID
-	config       Config
-	grpcServer   *grpc.Server
-	mu           sync.Mutex
-	connections  int
+	controllerID       identity.ControllerID
+	farmID             identity.FarmID
+	config             Config
+	grpcServer         *grpc.Server
+	mu                 sync.Mutex
+	sessionLifecycleMu sync.Mutex
+	connections        int
+	nextEpoch          controllerstate.ConnectionEpoch
+	sessions           map[identity.HostID]*liveSession
+	handler            SessionHandler
 }
 
 type pendingCommand struct {
-	kind  string
-	nonce []byte
+	kind            string
+	nonce           []byte
+	request         *RuntimeRequest
+	runtimeSequence uint64
 }
 
 func New(config Config) (*Server, error) {
@@ -79,6 +89,9 @@ func New(config Config) (*Server, error) {
 	if config.ShutdownGracePeriod <= 0 {
 		config.ShutdownGracePeriod = 3 * time.Second
 	}
+	if config.RuntimeActionTimeout <= 0 {
+		config.RuntimeActionTimeout = 10 * time.Second
+	}
 	if err := config.ControllerID.Validate(); err != nil {
 		return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "ControllerID is required", Details: map[string]string{"reason": err.Error()}}
 	}
@@ -93,7 +106,7 @@ func New(config Config) (*Server, error) {
 			return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "runtime commands require a target AgentID"}
 		}
 	}
-	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config}, nil
+	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config, sessions: make(map[identity.HostID]*liveSession)}, nil
 }
 
 func (s *Server) IDs() (identity.ControllerID, identity.FarmID) { return s.controllerID, s.farmID }
@@ -238,15 +251,61 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			}
 		}
 	}
+	s.sessionLifecycleMu.Lock()
+	s.mu.Lock()
+	previous := s.sessions[hostID]
+	s.mu.Unlock()
+	if previous != nil {
+		previous.revoke()
+		timer := time.NewTimer(s.config.RuntimeActionTimeout)
+		select {
+		case <-previous.finished:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			s.sessionLifecycleMu.Unlock()
+			return statusError(farmerr.SERVICE_NOT_READY, "previous Agent session did not close within the replacement bound")
+		case <-stream.Context().Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.sessionLifecycleMu.Unlock()
+			return stream.Context().Err()
+		}
+	}
 	s.mu.Lock()
 	s.connections++
+	s.nextEpoch++
+	live := &liveSession{info: SessionInfo{AgentID: agentID, HostID: hostID, ConnectionEpoch: s.nextEpoch, Authenticated: true}, stream: stream, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), finished: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	s.sessions[hostID] = live
+	handler := s.handler
 	s.mu.Unlock()
+	s.sessionLifecycleMu.Unlock()
+	if handler != nil {
+		handler.SessionConnected(live.info)
+	}
 	defer func() {
+		live.revoke()
 		s.mu.Lock()
 		if s.connections > 0 {
 			s.connections--
 		}
+		if s.sessions[hostID] == live {
+			delete(s.sessions, hostID)
+		}
+		handler := s.handler
 		s.mu.Unlock()
+		if handler != nil {
+			handler.SessionDisconnected(s.sessionInfo(live))
+		}
+		close(live.finished)
 	}()
 	s.log("Agent connected:")
 	s.log("AgentID: %s", agentID)
@@ -257,50 +316,107 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: s.config.ProtocolVersion, SchemaVersion: s.config.SchemaVersion, ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
 		return err
 	}
-	commands := []*le0xv1.CommandEnvelope{{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_Ping{Ping: &le0xv1.Ping{Nonce: nonce()}}}, {CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}, {CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}}}
-	for _, configured := range s.config.RuntimeCommands {
-		if agentID != s.config.RuntimeTarget {
-			break
-		}
-		if configured == nil {
-			continue
-		}
-		command := proto.Clone(configured).(*le0xv1.CommandEnvelope)
-		command.CommandId = commandID()
-		commands = append(commands, command)
-	}
-	pending := make(map[string]pendingCommand, len(commands))
-	for _, command := range commands {
+	queue := func(command *le0xv1.CommandEnvelope) error {
 		kind := commandKind(command)
-		pending[command.CommandId] = pendingCommand{kind: kind, nonce: append([]byte(nil), command.GetPing().GetNonce()...)}
-		if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Command{Command: command}}); err != nil {
-			return err
-		}
+		sendCtx, cancel := context.WithTimeout(stream.Context(), s.config.RuntimeActionTimeout)
+		defer cancel()
+		_, err := live.send(sendCtx, command, pendingCommand{kind: kind, nonce: append([]byte(nil), command.GetPing().GetNonce()...)})
+		return err
 	}
+	queueIfAbsent := func(command *le0xv1.CommandEnvelope) error {
+		kind := commandKind(command)
+		live.pendingMu.Lock()
+		for _, pending := range live.pending {
+			if pending.kind == kind {
+				live.pendingMu.Unlock()
+				return nil
+			}
+		}
+		live.pendingMu.Unlock()
+		return queue(command)
+	}
+	if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}); err != nil {
+		return err
+	}
+	type receivedMessage struct {
+		message *le0xv1.AgentMessage
+		err     error
+	}
+	received := make(chan receivedMessage, 1)
+	go func() {
+		for {
+			message, err := stream.Recv()
+			select {
+			case received <- receivedMessage{message: message, err: err}:
+			case <-live.revoked:
+				return
+			case <-stream.Context().Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	var gotExecutions, gotInventory, gotStatus, bootstrapRequested, devSent, ready bool
 	for {
-		message, err := stream.Recv()
+		var message *le0xv1.AgentMessage
+		var err error
+		select {
+		case item := <-received:
+			message, err = item.message, item.err
+		case <-live.revoked:
+			return statusError(farmerr.SERVICE_NOT_READY, "Agent session was replaced or closed")
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
 		if err != nil {
 			if err != io.EOF {
 				s.log("Agent disconnected: %v", err)
 			}
 			return err
 		}
+		if !s.sessionCurrent(live) {
+			return statusError(farmerr.SERVICE_NOT_READY, "Agent session was replaced")
+		}
 		if heartbeat := message.GetHeartbeat(); heartbeat != nil {
 			s.log("Heartbeat: %s", heartbeat.Timestamp.AsTime().Format(time.RFC3339))
+			// Runtime state can change locally after the bootstrap snapshot (for
+			// example, the bounded watchdog can reach terminal FAILED). Refresh
+			// executions and aggregate status on every normal heartbeat so the
+			// level-triggered Controller eventually observes that fact without a
+			// reconnect. At most one request of each kind may be pending.
+			if ready && s.sessionCurrent(live) {
+				if err := queueIfAbsent(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}); err != nil {
+					return err
+				}
+				if err := queueIfAbsent(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		result := message.GetCommandResult()
 		if result == nil {
 			continue
 		}
-		pendingResult, ok := pending[result.CommandId]
+		live.pendingMu.Lock()
+		pendingResult, ok := live.pending[result.CommandId]
 		if !ok {
+			live.pendingMu.Unlock()
 			s.log("CommandResult rejected: unknown command_id %q", result.CommandId)
 			continue
 		}
-		delete(pending, result.CommandId)
+		delete(live.pending, result.CommandId)
+		live.pendingMu.Unlock()
 		if result.GetError() != nil {
 			s.log("%s: ERROR %s", pendingResult.kind, result.GetError().Code)
+			if pendingResult.request != nil {
+				typed := &farmerr.Error{Code: farmerr.Code(result.GetError().Code), HumanMessage: result.GetError().HumanMessage, Details: result.GetError().Details, SuggestedFix: result.GetError().SuggestedFix, LogsRef: result.GetError().LogsRef}
+				if handler := s.handlerSnapshot(); handler != nil {
+					handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, typed)
+				}
+			}
 			continue
 		}
 		switch pendingResult.kind {
@@ -314,29 +430,101 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			if result.GetStatus() == nil {
 				s.log("STATUS: invalid result")
 			} else {
-				s.log("STATUS: %s", result.GetStatus().AgentState)
+				state := model.AgentState(result.GetStatus().AgentState)
+				if !validAgentState(state) {
+					s.log("STATUS: invalid result")
+					break
+				}
+				gotStatus = true
+				s.log("STATUS: %s", state)
+				if handler := s.handlerSnapshot(); handler != nil {
+					handler.StatusObserved(s.sessionInfo(live), state)
+				}
 			}
 		case "GetInventory":
 			if result.GetInventory() == nil {
 				s.log("INVENTORY: invalid result")
-			} else if err := validateInventoryWire(result.GetInventory(), hostID); err != nil {
+			} else if parsed, err := wiremap.ParseInventory(result.GetInventory(), hostID); err != nil {
 				s.log("INVENTORY: rejected result (%v)", err)
 			} else {
+				gotInventory = true
 				s.logInventory(result.GetInventory())
+				if handler := s.handlerSnapshot(); handler != nil {
+					handler.InventoryObserved(s.sessionInfo(live), parsed)
+				}
 			}
 		case "START_EXECUTION", "STOP_EXECUTION", "RESTART_EXECUTION":
 			if result.GetExecution() == nil || result.GetExecution().Execution == nil {
 				s.log("%s: invalid result", strings.ToUpper(pendingResult.kind))
+				if pendingResult.request != nil {
+					typed := farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "malformed runtime execution result"}
+					if handler := s.handlerSnapshot(); handler != nil {
+						handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, &typed)
+					}
+				}
 			} else {
 				s.logExecution(pendingResult.kind, result.GetExecution().Execution, result.GetExecution().Message)
+				if pendingResult.request != nil {
+					parsed, parseErr := wiremap.ParseExecution(result.GetExecution().Execution, hostID)
+					if handler := s.handlerSnapshot(); handler != nil {
+						if parseErr != nil {
+							typed := farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "invalid runtime execution result"}
+							handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, &typed)
+						} else {
+							handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, &parsed, nil)
+						}
+					}
+				}
 			}
 		case "GET_EXECUTIONS":
 			if result.GetExecutions() == nil {
 				s.log("GET_EXECUTIONS: invalid result")
+			} else if parsed, err := wiremap.ParseExecutions(result.GetExecutions(), hostID); err != nil {
+				s.log("GET_EXECUTIONS: rejected result (%v)", err)
 			} else {
+				gotExecutions = true
 				s.log("EXECUTIONS: %d", len(result.GetExecutions().Executions))
 				for _, execution := range result.GetExecutions().Executions {
 					s.logExecution("Execution", execution, "")
+				}
+				if handler := s.handlerSnapshot(); handler != nil {
+					handler.ExecutionsObserved(s.sessionInfo(live), parsed, pendingResult.runtimeSequence)
+				}
+				if !bootstrapRequested {
+					bootstrapRequested = true
+					if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}); err != nil {
+						return err
+					}
+					if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}}); err != nil {
+						return err
+					}
+					if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_Ping{Ping: &le0xv1.Ping{Nonce: nonce()}}}); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if gotExecutions && gotInventory && gotStatus && !ready && s.sessionCurrent(live) {
+			s.mu.Lock()
+			if s.sessions[hostID] == live {
+				live.info.Ready = true
+				ready = true
+			}
+			s.mu.Unlock()
+			if handler := s.handlerSnapshot(); handler != nil {
+				handler.SessionReady(s.sessionInfo(live))
+			}
+		}
+		if ready && !devSent && agentID == s.config.RuntimeTarget {
+			devSent = true
+			for _, configured := range s.config.RuntimeCommands {
+				if configured == nil {
+					continue
+				}
+				command := proto.Clone(configured).(*le0xv1.CommandEnvelope)
+				command.CommandId = commandID()
+				if err := queue(command); err != nil {
+					return err
 				}
 			}
 		}
@@ -385,6 +573,15 @@ func validateInventoryWire(in *le0xv1.Inventory, expectedHost identity.HostID) e
 		}
 	}
 	return nil
+}
+
+func validAgentState(state model.AgentState) bool {
+	switch state {
+	case model.AgentStateIdle, model.AgentStateStarting, model.AgentStateMining, model.AgentStateDegraded, model.AgentStateError:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) logInventory(in *le0xv1.Inventory) {

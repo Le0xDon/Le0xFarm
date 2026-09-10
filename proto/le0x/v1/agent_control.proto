@@ -51,6 +51,18 @@ message ExecutionPlan {
   string working_directory = 5;
   string restart_policy = 6;
   MinerSpec miner = 7;
+  WorkloadOwnership ownership = 8;
+}
+message ResourceClaim {
+  bool cpu = 1;
+  repeated string device_ids = 2;
+}
+message WorkloadOwnership {
+  string workload_id = 1;
+  uint64 desired_generation = 2;
+  string resolved_hash = 3;
+  string host_id = 4;
+  ResourceClaim resource_claim = 5;
 }
 message MinerSpec {
   string adapter_id = 1;
@@ -60,14 +72,12 @@ message MinerSpec {
   string mode = 5;
   string coin = 6;
   string algorithm = 7;
-  reserved 8, 9, 10;
+  reserved 8, 9, 10, 16, 17;
   optional uint32 cpu_threads = 11;
   repeated string gpu_device_ids = 12;
   optional bool huge_pages = 13;
   optional bool msr = 14;
   map<string, string> options = 15;
-  string wallet_id = 16;
-  string pool_id = 17;
   MiningEndpoint endpoint = 18;
 }
 // Resolved transient pool connection data. Password is potentially sensitive
@@ -94,6 +104,7 @@ message Execution {
   string last_error = 8;
   MinerTelemetry miner_telemetry = 9;
   repeated string warnings = 10;
+  WorkloadOwnership ownership = 11;
 }
 message DeviceHashrate { string device_id = 1; double hashrate_hps = 2; }
 message MinerTelemetry {

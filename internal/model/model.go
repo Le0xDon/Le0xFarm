@@ -2,6 +2,9 @@
 package model
 
 import (
+	"encoding/hex"
+	"errors"
+	"strings"
 	"time"
 
 	farmerr "github.com/le0xdon/le0xfarm/internal/farmerr"
@@ -161,6 +164,7 @@ type ObservedState struct {
 
 type ExecutionObservation struct {
 	ExecutionID    identity.ExecutionID
+	Ownership      *WorkloadOwnership
 	Status         ExecutionStatus
 	Error          *farmerr.Error
 	PID            int
@@ -171,9 +175,59 @@ type ExecutionObservation struct {
 	MinerTelemetry *MinerTelemetry
 }
 
+// WorkloadOwnership is the adapter-neutral Controller snapshot identity that
+// an Agent retains verbatim for the lifetime of an execution. A nil ownership
+// on an observation means that the execution is unmanaged by this Controller.
+type WorkloadOwnership struct {
+	WorkloadID        identity.WorkloadID
+	DesiredGeneration uint64
+	ResolvedHash      string
+	HostID            identity.HostID
+	CPU               bool
+	DeviceIDs         []identity.DeviceID
+}
+
+func (ownership WorkloadOwnership) Validate() error {
+	if err := ownership.WorkloadID.Validate(); err != nil {
+		return errors.New("invalid WorkloadID")
+	}
+	if ownership.DesiredGeneration < 1 {
+		return errors.New("DesiredGeneration must be at least 1")
+	}
+	if err := ownership.HostID.Validate(); err != nil {
+		return errors.New("invalid HostID")
+	}
+	const prefix = "sha256:"
+	if !strings.HasPrefix(ownership.ResolvedHash, prefix) || len(ownership.ResolvedHash) != len(prefix)+64 {
+		return errors.New("invalid ResolvedHash")
+	}
+	rawHash := strings.TrimPrefix(ownership.ResolvedHash, prefix)
+	if rawHash != strings.ToLower(rawHash) {
+		return errors.New("invalid ResolvedHash")
+	}
+	if _, err := hex.DecodeString(rawHash); err != nil {
+		return errors.New("invalid ResolvedHash")
+	}
+	if !ownership.CPU && len(ownership.DeviceIDs) == 0 {
+		return errors.New("ResourceClaim must include CPU or at least one DeviceID")
+	}
+	seen := make(map[identity.DeviceID]struct{}, len(ownership.DeviceIDs))
+	for _, deviceID := range ownership.DeviceIDs {
+		if err := deviceID.Validate(); err != nil {
+			return errors.New("invalid ResourceClaim DeviceID")
+		}
+		if _, exists := seen[deviceID]; exists {
+			return errors.New("duplicate ResourceClaim DeviceID")
+		}
+		seen[deviceID] = struct{}{}
+	}
+	return nil
+}
+
 type ExecutionPlan struct {
 	SchemaVersion    protocol.SchemaVersion
 	ExecutionID      identity.ExecutionID
+	Ownership        WorkloadOwnership
 	HostID           identity.HostID
 	ProfileID        identity.ProfileID
 	DeviceIDs        []identity.DeviceID

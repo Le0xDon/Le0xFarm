@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +33,7 @@ type Config struct {
 }
 type Snapshot struct {
 	ExecutionID  identity.ExecutionID
+	Ownership    model.WorkloadOwnership
 	State        model.ExecutionStatus
 	PID          int
 	StartedAt    time.Time
@@ -142,9 +142,17 @@ func validate(p model.ExecutionPlan) error {
 			return typed(farmerr.CONFIG_CONFLICT, "argument contains NUL", nil)
 		}
 	}
+	if len(p.Environment) > 64 {
+		return typed(farmerr.CONFIG_CONFLICT, "environment has too many entries", nil)
+	}
+	totalEnvironmentBytes := 0
 	for k, v := range p.Environment {
-		if k == "" || bytes.IndexByte([]byte(k), 0) >= 0 || bytes.IndexByte([]byte(k), '=') >= 0 || bytes.IndexByte([]byte(v), 0) >= 0 {
+		if k == "" || len(k) > 128 || len(v) > 8192 || bytes.IndexByte([]byte(k), 0) >= 0 || bytes.IndexByte([]byte(k), '=') >= 0 || bytes.IndexByte([]byte(v), 0) >= 0 {
 			return typed(farmerr.CONFIG_CONFLICT, "environment entry is invalid", nil)
+		}
+		totalEnvironmentBytes += len(k) + len(v) + 1
+		if totalEnvironmentBytes > 32*1024 {
+			return typed(farmerr.CONFIG_CONFLICT, "environment is too large", nil)
 		}
 	}
 	if p.RestartPolicy != "" && p.RestartPolicy != model.RestartNever && p.RestartPolicy != model.RestartOnFailure {
@@ -227,9 +235,11 @@ func (s *Supervisor) startExisting(e *execution, gen uint64, msg string) (Snapsh
 }
 func environment(extra map[string]string) []string {
 	values := make(map[string]string)
-	for _, item := range os.Environ() {
-		key, value, ok := strings.Cut(item, "=")
-		if ok {
+	// Child processes inherit only this explicit, non-secret baseline. Adapters
+	// may add bounded entries through the typed prepared plan; arbitrary parent
+	// process credentials are not copied into miners.
+	for _, key := range []string{"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "TZ"} {
+		if value, ok := os.LookupEnv(key); ok {
 			values[key] = value
 		}
 	}
@@ -430,7 +440,12 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 	return nil
 }
 func snapshot(e *execution) Snapshot {
-	return Snapshot{ExecutionID: e.plan.ExecutionID, State: e.state, PID: e.pid, StartedAt: e.started, ExitCode: e.exitCode, RestartCount: e.restarts, LastError: e.lastErr, Stdout: e.stdout.String(), Stderr: e.stderr.String()}
+	return Snapshot{ExecutionID: e.plan.ExecutionID, Ownership: cloneOwnership(e.plan.Ownership), State: e.state, PID: e.pid, StartedAt: e.started, ExitCode: e.exitCode, RestartCount: e.restarts, LastError: e.lastErr, Stdout: e.stdout.String(), Stderr: e.stderr.String()}
+}
+
+func cloneOwnership(value model.WorkloadOwnership) model.WorkloadOwnership {
+	value.DeviceIDs = append([]identity.DeviceID(nil), value.DeviceIDs...)
+	return value
 }
 
 func cancelBackoff(e *execution) {

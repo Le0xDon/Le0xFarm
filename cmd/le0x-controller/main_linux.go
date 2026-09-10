@@ -1,9 +1,10 @@
-// Le0xController M1.2 development-only gRPC runtime skeleton.
+// Le0xController owns persistent desired state and authenticated Agent reconciliation.
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,12 +18,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controllerdb"
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
 	"github.com/le0xdon/le0xfarm/internal/controllernet"
 	"github.com/le0xdon/le0xfarm/internal/controllerpki"
+	"github.com/le0xdon/le0xfarm/internal/controllerstate"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
+	"github.com/le0xdon/le0xfarm/internal/farmconfig"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/packagecatalog"
+	"github.com/le0xdon/le0xfarm/internal/reconcile"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 )
 
@@ -49,6 +55,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	initPKI := flags.Bool("init-pki", false, "Initialize PKI for an existing Controller identity")
 	pairing := flags.Bool("pairing", false, "Enable temporary development enrollment pairing")
 	pairingTTL := flags.Duration("pairing-ttl", 15*time.Minute, "Enrollment token lifetime")
+	pairingTokenFile := flags.String("pairing-token-file", "", "Create a mode-0600 file containing the one-time enrollment token")
 	runtimeAction := flags.String("dev-runtime-action", "", "Development/test runtime action: start, start-miner, stop, restart, or get")
 	runtimeTarget := flags.String("target-agent", "", "AgentID targeted by a development/test runtime action")
 	executionID := flags.String("execution-id", "", "ExecutionID for a development/test runtime action")
@@ -87,6 +94,14 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	})
 	if setTTL && !*pairing {
 		fmt.Fprintln(stderr, "--pairing-ttl requires --pairing")
+		return 2
+	}
+	if *pairing && *pairingTokenFile == "" {
+		fmt.Fprintln(stderr, "--pairing requires --pairing-token-file; credentials are never written to operational output")
+		return 2
+	}
+	if !*pairing && *pairingTokenFile != "" {
+		fmt.Fprintln(stderr, "--pairing-token-file requires --pairing")
 		return 2
 	}
 	if *initIdentity && *initPKI {
@@ -171,6 +186,34 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		printError(stderr, err)
 		return 1
 	}
+	if runtimeCommand != nil && runtimeCommand.GetStartExecution() != nil {
+		record, paired := trust.Find(targetAgent)
+		if !paired {
+			printError(stderr, farmerr.Error{Code: farmerr.PAIRING_REQUIRED, HumanMessage: "development START requires an already paired target Agent"})
+			return 1
+		}
+		if err := attachDevOwnership(runtimeCommand, record.HostID); err != nil {
+			printError(stderr, err)
+			return 1
+		}
+	}
+	farmDB, err := controllerdb.Open(context.Background(), dataDir)
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	defer farmDB.Close()
+	catalog, err := packagecatalog.NewStatic(nil)
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	farmService, err := farmconfig.New(farmDB, catalog, farmconfig.Options{})
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	observed := controllerstate.New()
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -186,7 +229,15 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	coordinator := reconcile.NewCoordinator(farmService, observed, server, log.New(stdout, "", 0))
+	server.SetSessionHandler(coordinator)
 	controllerID, farmID := server.IDs()
+	if *pairing {
+		if err := writeEnrollmentCredential(*pairingTokenFile, token); err != nil {
+			printError(stderr, err)
+			return 1
+		}
+	}
 	security := "TLS 1.3 MUTUAL TLS"
 	if *insecureDev {
 		security = "INSECURE DEVELOPMENT MODE"
@@ -194,18 +245,36 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	fmt.Fprintf(stdout, "Le0xController\nControllerID: %s\nFarmID: %s\nListening: %s\nSecurity: %s\n", controllerID, farmID, listener.Addr(), security)
 	if *pairing {
 		if *insecureDev {
-			fmt.Fprintf(stdout, "Pairing: ENABLED — DEVELOPMENT MODE\nEnrollment token: %s\nExpires: %s\n", token, expiry.Format(time.RFC3339))
+			fmt.Fprintf(stdout, "Pairing: ENABLED — DEVELOPMENT MODE\nEnrollment credential file: %s\nExpires: %s\n", *pairingTokenFile, expiry.Format(time.RFC3339))
 		} else {
-			fmt.Fprintf(stdout, "Pairing: ENABLED\nEnrollment token: %s\nTLS fingerprint: %s\nExpires: %s\n", token, pki.ServerFingerprint(), expiry.Format(time.RFC3339))
+			fmt.Fprintf(stdout, "Pairing: ENABLED\nEnrollment credential file: %s\nTLS fingerprint: %s\nExpires: %s\n", *pairingTokenFile, pki.ServerFingerprint(), expiry.Format(time.RFC3339))
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go coordinator.Run(ctx, time.Second)
 	if err := server.Serve(ctx, listener); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0
+}
+
+func writeEnrollmentCredential(path, token string) error {
+	if path == "" || token == "" || strings.ContainsAny(token, "\r\n") {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid enrollment credential output"}
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return farmerr.Error{Code: farmerr.PERMISSION_DENIED, HumanMessage: "cannot create enrollment credential file", Details: map[string]string{"reason": err.Error()}}
+	}
+	_, writeErr := fmt.Fprintln(file, token)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return farmerr.Error{Code: farmerr.PERMISSION_DENIED, HumanMessage: "cannot persist enrollment credential", Details: map[string]string{"reason": err.Error()}}
+	}
+	return nil
 }
 
 func buildRuntimeCommand(action, executionID, executable string, args []string, workingDirectory, restartPolicy string) (*le0xv1.CommandEnvelope, error) {
@@ -259,6 +328,20 @@ func endpointFromFlags(address string, tls bool, user, password, worker string) 
 		return nil
 	}
 	return &le0xv1.MiningEndpoint{Address: address, Tls: tls, User: user, Password: password, Worker: worker}
+}
+
+func attachDevOwnership(command *le0xv1.CommandEnvelope, hostID identity.HostID) error {
+	plan := command.GetStartExecution().GetPlan()
+	if plan == nil {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "development START requires an ExecutionPlan"}
+	}
+	workloadID, err := identity.NewWorkloadID()
+	if err != nil {
+		return farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "cannot generate development WorkloadID"}
+	}
+	sum := sha256.Sum256([]byte("le0xfarm-dev-runtime\x00" + plan.ExecutionId))
+	plan.Ownership = &le0xv1.WorkloadOwnership{WorkloadId: workloadID.String(), DesiredGeneration: 1, ResolvedHash: fmt.Sprintf("sha256:%x", sum[:]), HostId: hostID.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: true}}
+	return nil
 }
 
 func readOneLine(in io.Reader) (string, error) {

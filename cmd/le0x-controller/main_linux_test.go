@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
+	"github.com/le0xdon/le0xfarm/internal/identity"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 )
 
@@ -46,11 +48,65 @@ func TestControllerCLIInitializationFlag(t *testing.T) {
 	}
 }
 
+func TestControllerOpensFarmDatabase(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "controller")
+	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)
+	if _, err := controlleridentity.Initialize(dir); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	// An invalid listen address lets startup reach database initialization and exit.
+	if code := run([]string{"--listen", "invalid-address", "--insecure-dev"}, &out, &errOut); code != 1 {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	info, err := os.Stat(filepath.Join(dir, "farm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("farm.db permissions %o", info.Mode().Perm())
+	}
+}
+
 func TestPairingTTLRequiresPairing(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := run([]string{"--listen", "127.0.0.1:0", "--insecure-dev", "--pairing-ttl", "1m"}, &out, &errOut)
 	if code != 2 || !strings.Contains(errOut.String(), "--pairing-ttl requires --pairing") {
 		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+}
+
+func TestPairingRequiresDedicatedCredentialFile(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--listen", "127.0.0.1:0", "--insecure-dev", "--pairing"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "--pairing-token-file") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestEnrollmentCredentialFileIsExclusiveAndSecretSafe(t *testing.T) {
+	token := "synthetic-one-time-token"
+	path := filepath.Join(t.TempDir(), "enrollment.token")
+	if err := writeEnrollmentCredential(path, token); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != token+"\n" || info.Mode().Perm() != 0600 {
+		t.Fatalf("credential file mode=%o content=%q", info.Mode().Perm(), data)
+	}
+	if err := writeEnrollmentCredential(path, "replacement"); err == nil {
+		t.Fatal("credential file was overwritten")
+	}
+	var operational bytes.Buffer
+	fmt.Fprintf(&operational, "Pairing: ENABLED\nEnrollment credential file: %s\n", path)
+	if strings.Contains(operational.String(), token) {
+		t.Fatal("enrollment token entered operational output")
 	}
 }
 
@@ -72,6 +128,21 @@ func TestBuildRuntimeCommand(t *testing.T) {
 	}
 	if _, err := buildRuntimeCommand("", id, "", nil, "", "NEVER"); err == nil {
 		t.Fatal("execution option without development action accepted")
+	}
+}
+
+func TestDevelopmentStartGetsProtocolV3Ownership(t *testing.T) {
+	command, err := buildRuntimeCommand("start", "execution_0123456789abcdef0123456789abcdef", "/bin/sleep", []string{"1"}, "", "NEVER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	if err := attachDevOwnership(command, hostID); err != nil {
+		t.Fatal(err)
+	}
+	owner := command.GetStartExecution().GetPlan().GetOwnership()
+	if owner.GetHostId() != hostID.String() || owner.GetDesiredGeneration() != 1 || !owner.GetResourceClaim().GetCpu() || owner.GetWorkloadId() == "" || len(owner.GetResolvedHash()) != 71 {
+		t.Fatalf("invalid development ownership: %+v", owner)
 	}
 }
 

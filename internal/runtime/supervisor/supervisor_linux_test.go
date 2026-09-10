@@ -54,6 +54,8 @@ func TestHelperProcess(t *testing.T) {
 		}
 		fmt.Fprintf(os.Stdout, "child=%d\n", child.Process.Pid)
 		_ = child.Wait()
+	case "env":
+		fmt.Fprintf(os.Stdout, "explicit=%s inherited=%s", os.Getenv("LE0X_EXPLICIT"), os.Getenv("LE0X_PARENT_SECRET"))
 	default:
 		os.Exit(3)
 	}
@@ -162,6 +164,34 @@ func TestPlanValidationRejectsRelativePathsAndShells(t *testing.T) {
 	}
 	if _, _, err := s.Start(model.ExecutionPlan{ExecutionID: id, Executable: notExecutable}); code(err) != farmerr.PERMISSION_DENIED {
 		t.Fatalf("non-executable error=%v", err)
+	}
+}
+
+func TestChildEnvironmentIsBoundedAndDoesNotInheritParentSecrets(t *testing.T) {
+	t.Setenv("LE0X_PARENT_SECRET", "must-not-leak")
+	s := New(Config{})
+	defer s.Shutdown(context.Background())
+	plan := helperPlan(t, "env", model.RestartNever)
+	plan.Environment["LE0X_EXPLICIT"] = "allowed"
+	if _, _, err := s.Start(plan); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		snapshot, _ := s.Get(plan.ExecutionID)
+		return snapshot.State == model.ExecutionStopped || snapshot.State == model.ExecutionCrashed
+	})
+	snapshot, _ := s.Get(plan.ExecutionID)
+	if !strings.Contains(snapshot.Stdout, "explicit=allowed inherited=") || strings.Contains(snapshot.Stdout, "must-not-leak") {
+		t.Fatalf("unexpected child environment: %q", snapshot.Stdout)
+	}
+
+	tooMany := sleepPlan(t)
+	tooMany.Environment = make(map[string]string, 65)
+	for i := 0; i < 65; i++ {
+		tooMany.Environment[fmt.Sprintf("LE0X_%d", i)] = "x"
+	}
+	if _, _, err := s.Start(tooMany); code(err) != farmerr.CONFIG_CONFLICT {
+		t.Fatalf("oversized environment accepted: %v", err)
 	}
 }
 

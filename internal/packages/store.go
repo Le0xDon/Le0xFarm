@@ -169,9 +169,21 @@ func (s *Store) load(packageID identity.PackageID, version string) (Installed, e
 	if err := validateManifest(installed.Manifest); err != nil {
 		return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package manifest is invalid", err)
 	}
+	if len(installed.FileSHA256) == 0 {
+		return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package file verification metadata is empty", nil)
+	}
+	executableRelative := filepath.ToSlash(installed.Manifest.ExecutableRelativePath)
+	executableExpected, executableRecorded := installed.FileSHA256[executableRelative]
+	if !executableRecorded {
+		return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package executable has no verification hash", nil)
+	}
+	executableVerified := false
 	for relative, expected := range installed.FileSHA256 {
-		if !safeRelative(relative) || len(expected) != 64 {
+		if !safeRelative(relative) || len(expected) != 64 || expected != strings.ToLower(expected) {
 			return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package file manifest is invalid", nil)
+		}
+		if _, err := hex.DecodeString(expected); err != nil {
+			return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package file manifest is invalid", err)
 		}
 		path := filepath.Join(dir, filepath.FromSlash(relative))
 		info, err := os.Lstat(path)
@@ -182,6 +194,12 @@ func (s *Store) load(packageID identity.PackageID, version string) (Installed, e
 		if err != nil || got != expected {
 			return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package content verification failed", err)
 		}
+		if relative == executableRelative && expected == executableExpected {
+			executableVerified = true
+		}
+	}
+	if !executableVerified {
+		return Installed{}, typed(farmerr.PACKAGE_HASH_MISMATCH, "installed package executable was not verified", nil)
 	}
 	installed.ExecutablePath = filepath.Join(dir, filepath.FromSlash(installed.Manifest.ExecutableRelativePath))
 	info, err := os.Lstat(installed.ExecutablePath)

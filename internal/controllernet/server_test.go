@@ -2,6 +2,8 @@ package controllernet
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -13,10 +15,13 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
+	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestControllerRequiresExplicitDevelopmentMode(t *testing.T) {
@@ -257,7 +262,19 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 	if got := message.GetHello(); got == nil || got.ControllerId != controllerID.String() || got.FarmId != farmID.String() {
 		t.Fatalf("invalid controller hello: %v", message)
 	}
-	for i, expected := range []string{"Ping", "GetStatus", "GetInventory"} {
+	message, err = stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCommand := message.GetCommand()
+	if firstCommand == nil || firstCommand.GetGetExecutions() == nil {
+		t.Fatalf("first command after hello must be GET_EXECUTIONS: %v", message)
+	}
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: &le0xv1.CommandResult{CommandId: firstCommand.CommandId, Result: &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 3; i++ {
 		message, err = stream.Recv()
 		if err != nil {
 			t.Fatal(err)
@@ -267,17 +284,25 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 			t.Fatalf("command %d missing: %v", i, message)
 		}
 		var result *le0xv1.CommandResult
-		switch expected {
-		case "Ping":
+		switch {
+		case command.GetPing() != nil:
+			seen["Ping"] = true
 			result = &le0xv1.CommandResult{CommandId: command.CommandId, Result: &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: command.GetPing().Nonce}}}
-		case "GetStatus":
+		case command.GetGetStatus() != nil:
+			seen["GetStatus"] = true
 			result = &le0xv1.CommandResult{CommandId: command.CommandId, Result: &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "IDLE"}}}
-		case "GetInventory":
+		case command.GetGetInventory() != nil:
+			seen["GetInventory"] = true
 			result = &le0xv1.CommandResult{CommandId: command.CommandId, Result: &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: hostID}}}
+		default:
+			t.Fatalf("unexpected bootstrap command: %v", command)
 		}
 		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: result}}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if !seen["Ping"] || !seen["GetStatus"] || !seen["GetInventory"] {
+		t.Fatalf("bootstrap commands missing: %v", seen)
 	}
 	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Heartbeat{Heartbeat: &le0xv1.Heartbeat{ObservedStateRevision: 0}}}); err != nil {
 		t.Fatal(err)
@@ -289,6 +314,395 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 	if !strings.Contains(output.String(), "PING: OK") || !strings.Contains(output.String(), "STATUS: IDLE") {
 		t.Fatalf("controller output: %s", output.String())
 	}
+}
+
+type sessionRecorder struct {
+	connected    chan SessionInfo
+	disconnected chan SessionInfo
+	ready        chan SessionInfo
+	executions   chan []model.ExecutionObservation
+	statuses     chan model.AgentState
+	runtime      chan recordedRuntimeResult
+}
+
+type recordedRuntimeResult struct {
+	request RuntimeRequest
+	error   *farmerr.Error
+}
+
+func newSessionRecorder() *sessionRecorder {
+	return &sessionRecorder{connected: make(chan SessionInfo, 4), disconnected: make(chan SessionInfo, 4), ready: make(chan SessionInfo, 4), executions: make(chan []model.ExecutionObservation, 4), statuses: make(chan model.AgentState, 4), runtime: make(chan recordedRuntimeResult, 4)}
+}
+func (recorder *sessionRecorder) SessionConnected(info SessionInfo)    { recorder.connected <- info }
+func (recorder *sessionRecorder) SessionDisconnected(info SessionInfo) { recorder.disconnected <- info }
+func (recorder *sessionRecorder) ExecutionsObserved(_ SessionInfo, values []model.ExecutionObservation, _ uint64) {
+	recorder.executions <- values
+}
+func (recorder *sessionRecorder) InventoryObserved(SessionInfo, model.Inventory) {}
+func (recorder *sessionRecorder) StatusObserved(_ SessionInfo, state model.AgentState) {
+	recorder.statuses <- state
+}
+func (recorder *sessionRecorder) SessionReady(info SessionInfo) { recorder.ready <- info }
+func (recorder *sessionRecorder) RuntimeResult(_ SessionInfo, request RuntimeRequest, _ *model.ExecutionObservation, runtimeError *farmerr.Error) {
+	recorder.runtime <- recordedRuntimeResult{request: request, error: runtimeError}
+}
+
+func TestLiveSessionRequiresFreshExecutionsAndChangesEpoch(t *testing.T) {
+	server := newTestServer(t, Config{})
+	recorder := newSessionRecorder()
+	server.SetSessionHandler(recorder)
+	listener := bufconn.Listen(1024 * 1024)
+	gs := grpc.NewServer()
+	le0xv1.RegisterAgentControlServer(gs, server)
+	go gs.Serve(listener)
+	defer gs.Stop()
+	connect := func() (context.CancelFunc, le0xv1.AgentControl_ConnectClient, SessionInfo) {
+		ctx, cancel := context.WithCancel(context.Background())
+		conn, err := grpc.DialContext(ctx, "buf", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		stream, err := le0xv1.NewAgentControlClient(conn).Connect(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 3, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+			t.Fatal(err)
+		}
+		if hello, err := stream.Recv(); err != nil || hello.GetHello() == nil {
+			t.Fatalf("hello=%v err=%v", hello, err)
+		}
+		info := <-recorder.connected
+		first, err := stream.Recv()
+		if err != nil || first.GetCommand().GetGetExecutions() == nil {
+			t.Fatalf("first command before fresh observation=%v err=%v", first, err)
+		}
+		if session, ok := server.Session(info.HostID); !ok || session.Ready {
+			t.Fatalf("session ready before GET_EXECUTIONS result: %+v", session)
+		}
+		request := testRuntimeRequest(t, info.HostID)
+		if _, err := server.SendRuntime(context.Background(), info, request); codeOf(err) != farmerr.SERVICE_NOT_READY {
+			t.Fatalf("runtime action allowed before fresh observation: %v", err)
+		}
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: &le0xv1.CommandResult{CommandId: first.GetCommand().CommandId, Result: &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{}}}}}); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 3; i++ {
+			message, err := stream.Recv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := message.GetCommand()
+			result := &le0xv1.CommandResult{CommandId: command.CommandId}
+			switch {
+			case command.GetGetStatus() != nil:
+				result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "IDLE"}}
+			case command.GetGetInventory() != nil:
+				result.Result = &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: info.HostID.String()}}
+			case command.GetPing() != nil:
+				result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: command.GetPing().Nonce}}
+			default:
+				t.Fatalf("runtime command sent before session READY: %v", command)
+			}
+			if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: result}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ready := <-recorder.ready
+		if !ready.Ready || ready.ConnectionEpoch != info.ConnectionEpoch {
+			t.Fatalf("invalid ready session: %+v", ready)
+		}
+		return cancel, stream, ready
+	}
+	cancelFirst, firstStream, first := connect()
+	if _, err := server.SendRuntime(context.Background(), first, testRuntimeRequest(t, first.HostID)); err != nil {
+		t.Fatalf("fresh READY session rejected runtime action: %v", err)
+	}
+	if message, err := firstStream.Recv(); err != nil || message.GetCommand().GetStartExecution() == nil {
+		t.Fatalf("runtime START not delivered after READY: %v err=%v", message, err)
+	} else {
+		if err := firstStream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: &le0xv1.CommandResult{CommandId: message.GetCommand().CommandId}}}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case result := <-recorder.runtime:
+			if result.error == nil || result.error.Code != farmerr.INTERNAL_ERROR || result.request.DispatchSequence != 1 {
+				t.Fatalf("malformed runtime result was not surfaced as uncertain: %+v", result)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("malformed runtime result disappeared from pending lifecycle")
+		}
+	}
+	cancelFirst()
+	disconnected := <-recorder.disconnected
+	if disconnected.ConnectionEpoch != first.ConnectionEpoch {
+		t.Fatal("disconnect epoch changed")
+	}
+	cancelSecond, _, second := connect()
+	defer cancelSecond()
+	if second.ConnectionEpoch <= first.ConnectionEpoch {
+		t.Fatalf("connection epoch did not increase: %d -> %d", first.ConnectionEpoch, second.ConnectionEpoch)
+	}
+}
+
+type blockingConnectServer struct {
+	ctx       context.Context
+	sendCalls chan struct{}
+	release   chan struct{}
+}
+
+func (stream *blockingConnectServer) Send(*le0xv1.ControllerMessage) error {
+	stream.sendCalls <- struct{}{}
+	select {
+	case <-stream.release:
+		return nil
+	case <-stream.ctx.Done():
+		return stream.ctx.Err()
+	}
+}
+func (*blockingConnectServer) Recv() (*le0xv1.AgentMessage, error) { return nil, io.EOF }
+func (*blockingConnectServer) SetHeader(metadata.MD) error         { return nil }
+func (*blockingConnectServer) SendHeader(metadata.MD) error        { return nil }
+func (*blockingConnectServer) SetTrailer(metadata.MD)              {}
+func (stream *blockingConnectServer) Context() context.Context     { return stream.ctx }
+func (*blockingConnectServer) SendMsg(any) error                   { return nil }
+func (*blockingConnectServer) RecvMsg(any) error                   { return io.EOF }
+
+func TestRuntimeSendHonorsTimeoutAndRevokesSession(t *testing.T) {
+	server := newTestServer(t, Config{RuntimeActionTimeout: 20 * time.Millisecond})
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	agent, _ := identity.ParseAgentID("agent_0123456789abcdef0123456789abcdef")
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	stream := &blockingConnectServer{ctx: streamCtx, sendCalls: make(chan struct{}, 1), release: make(chan struct{})}
+	info := SessionInfo{AgentID: agent, HostID: host, ConnectionEpoch: 1, Authenticated: true, Ready: true}
+	live := &liveSession{info: info, stream: stream, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), finished: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	server.mu.Lock()
+	server.sessions[host] = live
+	server.mu.Unlock()
+
+	started := time.Now()
+	_, err := server.SendRuntime(context.Background(), info, testRuntimeRequest(t, host))
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > time.Second {
+		t.Fatalf("bounded send error=%v elapsed=%s", err, time.Since(started))
+	}
+	if _, ok := server.Session(host); ok {
+		t.Fatal("timed-out session retained dispatch authority")
+	}
+	select {
+	case <-stream.sendCalls:
+	default:
+		t.Fatal("test did not reach blocking stream Send")
+	}
+	cancelStream()
+}
+
+func TestRuntimeSendHonorsCallerCancellation(t *testing.T) {
+	server := newTestServer(t, Config{RuntimeActionTimeout: time.Second})
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	agent, _ := identity.ParseAgentID("agent_0123456789abcdef0123456789abcdef")
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	stream := &blockingConnectServer{ctx: streamCtx, sendCalls: make(chan struct{}, 1), release: make(chan struct{})}
+	info := SessionInfo{AgentID: agent, HostID: host, ConnectionEpoch: 1, Authenticated: true, Ready: true}
+	live := &liveSession{info: info, stream: stream, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), finished: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	server.mu.Lock()
+	server.sessions[host] = live
+	server.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	request := testRuntimeRequest(t, host)
+	go func() {
+		_, err := server.SendRuntime(ctx, info, request)
+		done <- err
+	}()
+	<-stream.sendCalls
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller cancellation error=%v", err)
+	}
+	if _, ok := server.Session(host); ok {
+		t.Fatal("canceled session retained dispatch authority")
+	}
+}
+
+func TestMissingRuntimeResultExpiresAsUncertain(t *testing.T) {
+	server := newTestServer(t, Config{RuntimeActionTimeout: 20 * time.Millisecond})
+	recorder := newSessionRecorder()
+	server.SetSessionHandler(recorder)
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	agent, _ := identity.ParseAgentID("agent_0123456789abcdef0123456789abcdef")
+	release := make(chan struct{})
+	close(release)
+	stream := &blockingConnectServer{ctx: context.Background(), sendCalls: make(chan struct{}, 1), release: release}
+	info := SessionInfo{AgentID: agent, HostID: host, ConnectionEpoch: 1, Authenticated: true, Ready: true}
+	live := &liveSession{info: info, stream: stream, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), finished: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	server.mu.Lock()
+	server.sessions[host] = live
+	server.mu.Unlock()
+	sequence, err := server.SendRuntime(context.Background(), info, testRuntimeRequest(t, host))
+	if err != nil || sequence != 1 {
+		t.Fatalf("dispatch sequence=%d err=%v", sequence, err)
+	}
+	select {
+	case result := <-recorder.runtime:
+		if result.error == nil || result.error.Code != farmerr.INTERNAL_ERROR || result.request.DispatchSequence != sequence {
+			t.Fatalf("missing result lifecycle=%+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing runtime result did not expire")
+	}
+	live.pendingMu.Lock()
+	pending := len(live.pending)
+	live.pendingMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("expired runtime request remained pending: %d", pending)
+	}
+}
+
+func TestReplacedSessionCannotDispatch(t *testing.T) {
+	server := newTestServer(t, Config{})
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	agent, _ := identity.ParseAgentID("agent_0123456789abcdef0123456789abcdef")
+	oldInfo := SessionInfo{AgentID: agent, HostID: host, ConnectionEpoch: 1, Authenticated: true, Ready: true}
+	old := &liveSession{info: oldInfo, stream: &blockingConnectServer{ctx: context.Background(), sendCalls: make(chan struct{}, 1), release: make(chan struct{})}, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), finished: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	newInfo := oldInfo
+	newInfo.ConnectionEpoch = 2
+	newLive := &liveSession{info: newInfo, stream: old.stream, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), finished: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	server.mu.Lock()
+	server.sessions[host] = old
+	old.revoke()
+	server.sessions[host] = newLive
+	server.mu.Unlock()
+	if _, err := server.SendRuntime(context.Background(), oldInfo, testRuntimeRequest(t, host)); codeOf(err) != farmerr.SERVICE_NOT_READY {
+		t.Fatalf("obsolete session dispatched: %v", err)
+	}
+}
+
+func TestRevokedLiveSessionCannotEnterTransportSend(t *testing.T) {
+	stream := &blockingConnectServer{ctx: context.Background(), sendCalls: make(chan struct{}, 1), release: make(chan struct{})}
+	live := &liveSession{stream: stream, sendGate: make(chan struct{}, 1), revoked: make(chan struct{}), pending: make(map[string]pendingCommand)}
+	live.revoke()
+	command := &le0xv1.CommandEnvelope{CommandId: "revoked", Command: &le0xv1.CommandEnvelope_GetExecutions{GetExecutions: &le0xv1.GetExecutions{}}}
+	if _, err := live.send(context.Background(), command, pendingCommand{kind: "GET_EXECUTIONS"}); codeOf(err) != farmerr.SERVICE_NOT_READY {
+		t.Fatalf("revoked session error=%v", err)
+	}
+	select {
+	case <-stream.sendCalls:
+		t.Fatal("revoked session entered transport Send")
+	default:
+	}
+}
+
+func TestReadySessionRefreshesExecutionsAndStatusOnHeartbeat(t *testing.T) {
+	server := newTestServer(t, Config{})
+	recorder := newSessionRecorder()
+	server.SetSessionHandler(recorder)
+	listener := bufconn.Listen(1024 * 1024)
+	gs := grpc.NewServer()
+	le0xv1.RegisterAgentControlServer(gs, server)
+	go gs.Serve(listener)
+	defer gs.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, "buf", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stream, err := le0xv1.NewAgentControlClient(conn).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "host_0123456789abcdef0123456789abcdef"
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 3, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
+		t.Fatal(err)
+	}
+	if message, err := stream.Recv(); err != nil || message.GetHello() == nil {
+		t.Fatalf("hello=%v err=%v", message, err)
+	}
+	<-recorder.connected
+	bootstrap, err := stream.Recv()
+	if err != nil || bootstrap.GetCommand().GetGetExecutions() == nil {
+		t.Fatalf("bootstrap=%v err=%v", bootstrap, err)
+	}
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: &le0xv1.CommandResult{CommandId: bootstrap.GetCommand().CommandId, Result: &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		message, err := stream.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		command := message.GetCommand()
+		result := &le0xv1.CommandResult{CommandId: command.CommandId}
+		switch {
+		case command.GetGetStatus() != nil:
+			result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "IDLE"}}
+		case command.GetGetInventory() != nil:
+			result.Result = &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: host}}
+		case command.GetPing() != nil:
+			result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: command.GetPing().Nonce}}
+		default:
+			t.Fatalf("unexpected bootstrap command: %v", command)
+		}
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: result}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-recorder.ready
+	<-recorder.executions
+	<-recorder.statuses
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Heartbeat{Heartbeat: &le0xv1.Heartbeat{Timestamp: timestamppb.Now()}}}); err != nil {
+		t.Fatal(err)
+	}
+	seenExecutions, seenStatus := false, false
+	for i := 0; i < 2; i++ {
+		message, err := stream.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		command := message.GetCommand()
+		result := &le0xv1.CommandResult{CommandId: command.CommandId}
+		switch {
+		case command.GetGetExecutions() != nil:
+			seenExecutions = true
+			result.Result = &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{}}
+		case command.GetGetStatus() != nil:
+			seenStatus = true
+			result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "ERROR"}}
+		default:
+			t.Fatalf("unexpected refresh command: %v", command)
+		}
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: result}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !seenExecutions || !seenStatus {
+		t.Fatalf("refresh commands executions=%t status=%t", seenExecutions, seenStatus)
+	}
+	select {
+	case <-recorder.executions:
+	case <-time.After(time.Second):
+		t.Fatal("refreshed execution observation was not delivered")
+	}
+	select {
+	case state := <-recorder.statuses:
+		if state != model.AgentStateError {
+			t.Fatalf("refreshed status=%s", state)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refreshed Agent status was not delivered")
+	}
+}
+
+func testRuntimeRequest(t *testing.T, hostID identity.HostID) RuntimeRequest {
+	t.Helper()
+	workloadID, _ := identity.ParseWorkloadID("workload_0123456789abcdef0123456789abcdef")
+	executionID, _ := identity.ParseExecutionID("execution_0123456789abcdef0123456789abcdef")
+	ownership := model.WorkloadOwnership{WorkloadID: workloadID, DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostID: hostID, CPU: true}
+	return RuntimeRequest{Kind: RuntimeStart, WorkloadID: workloadID, DesiredGeneration: 1, ExecutionID: executionID, ResolvedHash: ownership.ResolvedHash, Plan: model.ExecutionPlan{ExecutionID: executionID, Ownership: ownership, HostID: hostID, Executable: "/bin/sleep", Args: []string{"1"}, RestartPolicy: model.RestartNever}}
 }
 
 func TestControllerConnectionCounterLifecycle(t *testing.T) {
@@ -416,7 +830,7 @@ func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 	}{
 		{"agent", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "bad", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.CONFIG_CONFLICT},
 		{"host", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "bad"}, farmerr.CONFIG_CONFLICT},
-		{"old-protocol", &le0xv1.AgentHello{ProtocolVersion: 1, SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.PROTOCOL_VERSION_MISMATCH},
+		{"v2-agent-v3-controller", &le0xv1.AgentHello{ProtocolVersion: 2, SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.PROTOCOL_VERSION_MISMATCH},
 		{"schema", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: 999, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.SCHEMA_VERSION_MISMATCH},
 	}
 	for _, tc := range cases {
