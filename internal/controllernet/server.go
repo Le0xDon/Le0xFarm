@@ -383,7 +383,7 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			s.log("Heartbeat: %s", heartbeat.Timestamp.AsTime().Format(time.RFC3339))
 			// Runtime state can change locally after the bootstrap snapshot (for
 			// example, the bounded watchdog can reach terminal FAILED). Refresh
-			// executions and aggregate status on every normal heartbeat so the
+			// executions, inventory, and aggregate status on every normal heartbeat so the
 			// level-triggered Controller eventually observes that fact without a
 			// reconnect. At most one request of each kind may be pending.
 			if ready && s.sessionCurrent(live) {
@@ -391,6 +391,9 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 					return err
 				}
 				if err := queueIfAbsent(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetStatus{GetStatus: &le0xv1.GetStatus{}}}); err != nil {
+					return err
+				}
+				if err := queueIfAbsent(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}}); err != nil {
 					return err
 				}
 			}

@@ -32,7 +32,7 @@ func TestObservationFreshReadyDisconnectAndEpochSafety(t *testing.T) {
 		t.Fatal("complete bootstrap did not allow READY")
 	}
 	got, _ := store.Get(hostID)
-	if !got.Ready || !got.Fresh || got.ConnectionEpoch != 1 || len(got.Executions) != 1 {
+	if !got.Ready || !got.Fresh || !got.InventoryFresh || got.ConnectionEpoch != 1 || len(got.Executions) != 1 {
 		t.Fatalf("session did not become ready: %+v", got)
 	}
 	if !store.Connect(agentID, hostID, 2) {
@@ -55,6 +55,32 @@ func TestObservationFreshReadyDisconnectAndEpochSafety(t *testing.T) {
 	got, _ = store.Get(hostID)
 	if got.Connected || got.Ready || got.Fresh {
 		t.Fatalf("disconnect did not invalidate observation: %+v", got)
+	}
+}
+
+func TestInventoryFreshnessExpiresIndependentlyAndRefreshes(t *testing.T) {
+	now := time.Unix(3_000, 0).UTC()
+	store := NewWithOptions(StoreOptions{Now: func() time.Time { return now }, FreshnessTimeout: 45 * time.Second})
+	hostID, _ := identity.NewHostID()
+	agentID, _ := identity.NewAgentID()
+	store.Connect(agentID, hostID, 1)
+	store.SetExecutions(hostID, 1, nil, now, 0)
+	store.SetInventory(hostID, 1, model.Inventory{Host: model.Host{HostID: hostID}, CPU: model.CPU{Threads: 16}})
+	store.SetAgentState(hostID, 1, model.AgentStateIdle)
+	if !store.MarkReady(hostID, 1) {
+		t.Fatal("bootstrap did not become READY")
+	}
+	now = now.Add(40 * time.Second)
+	store.SetExecutions(hostID, 1, nil, now, 0)
+	now = now.Add(6 * time.Second)
+	got, _ := store.Get(hostID)
+	if !got.Fresh || got.InventoryFresh || !got.Ready {
+		t.Fatalf("inventory did not expire independently: %+v", got)
+	}
+	store.SetInventory(hostID, 1, model.Inventory{Host: model.Host{HostID: hostID}, CPU: model.CPU{Threads: 8}})
+	got, _ = store.Get(hostID)
+	if !got.InventoryFresh || got.Inventory.CPU.Threads != 8 {
+		t.Fatalf("inventory refresh did not recover: %+v", got)
 	}
 }
 

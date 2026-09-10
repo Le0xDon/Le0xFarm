@@ -13,28 +13,30 @@ import (
 type ConnectionEpoch uint64
 
 // DefaultFreshnessTimeout allows several missed normal 10-second Agent
-// heartbeats before current-epoch execution facts become unusable for
-// reconciliation. It is intentionally conservative to avoid flapping on a
-// short scheduling or network delay.
+// heartbeats before current-epoch execution or inventory facts become
+// unusable for reconciliation. It is intentionally conservative to avoid
+// flapping on a short scheduling or network delay.
 const DefaultFreshnessTimeout = 45 * time.Second
 
 type HostObservation struct {
-	HostID          identity.HostID
-	AgentID         identity.AgentID
-	ConnectionEpoch ConnectionEpoch
-	Connected       bool
-	Ready           bool
-	Fresh           bool
-	RefreshedAt     time.Time
-	Inventory       model.Inventory
-	AgentState      model.AgentState
-	Executions      []model.ExecutionObservation
+	HostID               identity.HostID
+	AgentID              identity.AgentID
+	ConnectionEpoch      ConnectionEpoch
+	Connected            bool
+	Ready                bool
+	Fresh                bool
+	RefreshedAt          time.Time
+	InventoryFresh       bool
+	InventoryRefreshedAt time.Time
+	Inventory            model.Inventory
+	AgentState           model.AgentState
+	Executions           []model.ExecutionObservation
 	// RuntimeSequence is the greatest accepted current-epoch runtime action
 	// watermark represented by Executions.
 	RuntimeSequence uint64
-	// Revision changes whenever current-epoch reconciliation facts change.
-	// Coordinators use it to reject a plan whose observation changed between
-	// planning and network dispatch.
+	// Revision is a diagnostic watermark that changes whenever current-epoch
+	// reconciliation facts are refreshed. Coordinators compare the relevant
+	// facts themselves so an equivalent heartbeat refresh cannot starve work.
 	Revision uint64
 }
 
@@ -43,6 +45,7 @@ type entry struct {
 	inventoryCurrent bool
 	statusCurrent    bool
 	freshAt          time.Time
+	inventoryFreshAt time.Time
 	runtimeSequence  uint64
 }
 
@@ -106,6 +109,10 @@ func (store *Store) SetInventory(hostID identity.HostID, epoch ConnectionEpoch, 
 	}
 	item.observation.Inventory = cloneInventory(inventory)
 	item.inventoryCurrent = true
+	item.observation.InventoryFresh = true
+	now := store.now()
+	item.observation.InventoryRefreshedAt = now.UTC()
+	item.inventoryFreshAt = now
 	item.observation.Revision++
 	return true
 }
@@ -176,6 +183,8 @@ func (store *Store) Disconnect(hostID identity.HostID, epoch ConnectionEpoch) bo
 	item.observation.Fresh = false
 	item.freshAt = time.Time{}
 	item.inventoryCurrent = false
+	item.inventoryFreshAt = time.Time{}
+	item.observation.InventoryFresh = false
 	item.statusCurrent = false
 	item.observation.Revision++
 	return true
@@ -190,6 +199,10 @@ func (store *Store) Get(hostID identity.HostID) (HostObservation, bool) {
 	}
 	if item.observation.Fresh && (item.freshAt.IsZero() || store.now().Sub(item.freshAt) > store.freshnessTimeout) {
 		item.observation.Fresh = false
+		item.observation.Revision++
+	}
+	if item.observation.InventoryFresh && (item.inventoryFreshAt.IsZero() || store.now().Sub(item.inventoryFreshAt) > store.freshnessTimeout) {
+		item.observation.InventoryFresh = false
 		item.observation.Revision++
 	}
 	return cloneObservation(item.observation), true

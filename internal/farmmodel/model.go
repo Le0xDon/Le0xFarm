@@ -118,6 +118,23 @@ type MiningProfile struct {
 	MiningProfileContent
 }
 
+// HostProfileSettingsContent contains only explicit Host+Profile tuning
+// overrides. Nil means inherit the MiningProfile default.
+type HostProfileSettingsContent struct {
+	CPUThreads *uint32
+	HugePages  *bool
+	MSR        *bool
+}
+
+// HostProfileSettings is keyed by the immutable HostID+ProfileID pair. It is
+// Controller-owned configuration, never observed hardware state.
+type HostProfileSettings struct {
+	HostID    identity.HostID
+	ProfileID identity.ProfileID
+	Meta      ObjectMeta
+	HostProfileSettingsContent
+}
+
 func ValidatePool(content PoolContent) error {
 	if err := validateName(content.Name); err != nil {
 		return invalid("invalid Pool name", err)
@@ -235,6 +252,35 @@ func ValidateMiningProfile(content MiningProfileContent) error {
 	return nil
 }
 
+func ValidateHostProfileSettings(hostID identity.HostID, profileID identity.ProfileID, content HostProfileSettingsContent) error {
+	if err := hostID.Validate(); err != nil {
+		return invalid("invalid HostProfileSettings HostID", err)
+	}
+	if err := profileID.Validate(); err != nil {
+		return invalid("invalid HostProfileSettings ProfileID", err)
+	}
+	if content.CPUThreads != nil && *content.CPUThreads == 0 {
+		return invalid("HostProfileSettings CPU threads must be at least one when set", nil)
+	}
+	if content.CPUThreads == nil && content.HugePages == nil && content.MSR == nil {
+		return invalid("HostProfileSettings must contain at least one explicit override", nil)
+	}
+	return nil
+}
+
+func ValidateTuningCapabilities(cpuThreads *uint32, hugePages, msr *bool, capabilities TuningCapabilities) error {
+	if cpuThreads != nil && !capabilities.CPUThreads {
+		return invalid("package/adapter does not support CPUThreads", nil)
+	}
+	if hugePages != nil && !capabilities.HugePages {
+		return invalid("package/adapter does not support HugePages", nil)
+	}
+	if msr != nil && !capabilities.MSR {
+		return invalid("package/adapter does not support MSR", nil)
+	}
+	return nil
+}
+
 func validateName(value string) error {
 	if strings.TrimSpace(value) == "" || len(value) > 256 || strings.ContainsRune(value, 0) || !utf8.ValidString(value) {
 		return fmt.Errorf("name must be non-empty valid UTF-8 and at most 256 bytes")
@@ -265,4 +311,14 @@ type PackageCatalog interface {
 type PackageRelease struct {
 	Ref        PackageRef
 	AdapterIDs []string
+	Tuning     TuningCapabilities
+}
+
+// TuningCapabilities are Controller-side declarations for the narrow typed
+// settings that may be placed into a resolved plan. They do not grant any
+// executable or privileged behavior.
+type TuningCapabilities struct {
+	CPUThreads bool
+	HugePages  bool
+	MSR        bool
 }

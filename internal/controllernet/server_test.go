@@ -595,7 +595,7 @@ func TestRevokedLiveSessionCannotEnterTransportSend(t *testing.T) {
 	}
 }
 
-func TestReadySessionRefreshesExecutionsAndStatusOnHeartbeat(t *testing.T) {
+func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing.T) {
 	server := newTestServer(t, Config{})
 	recorder := newSessionRecorder()
 	server.SetSessionHandler(recorder)
@@ -657,8 +657,8 @@ func TestReadySessionRefreshesExecutionsAndStatusOnHeartbeat(t *testing.T) {
 	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Heartbeat{Heartbeat: &le0xv1.Heartbeat{Timestamp: timestamppb.Now()}}}); err != nil {
 		t.Fatal(err)
 	}
-	seenExecutions, seenStatus := false, false
-	for i := 0; i < 2; i++ {
+	seenExecutions, seenInventory, seenStatus := false, false, false
+	for i := 0; i < 3; i++ {
 		message, err := stream.Recv()
 		if err != nil {
 			t.Fatal(err)
@@ -672,6 +672,9 @@ func TestReadySessionRefreshesExecutionsAndStatusOnHeartbeat(t *testing.T) {
 		case command.GetGetStatus() != nil:
 			seenStatus = true
 			result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: "ERROR"}}
+		case command.GetGetInventory() != nil:
+			seenInventory = true
+			result.Result = &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: host}}
 		default:
 			t.Fatalf("unexpected refresh command: %v", command)
 		}
@@ -679,8 +682,8 @@ func TestReadySessionRefreshesExecutionsAndStatusOnHeartbeat(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if !seenExecutions || !seenStatus {
-		t.Fatalf("refresh commands executions=%t status=%t", seenExecutions, seenStatus)
+	if !seenExecutions || !seenInventory || !seenStatus {
+		t.Fatalf("refresh commands executions=%t inventory=%t status=%t", seenExecutions, seenInventory, seenStatus)
 	}
 	select {
 	case <-recorder.executions:

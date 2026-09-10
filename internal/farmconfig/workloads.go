@@ -19,7 +19,7 @@ import (
 )
 
 const workloadSelect = `SELECT workload_id,object_schema_version,revision,content_hash,origin,created_at_ns,updated_at_ns,name,host_id,profile_id,desired_run_state,worker,claim_cpu,desired_generation,effective_hash FROM desired_workloads`
-const snapshotSelect = `SELECT workload_id,desired_generation,execution_id,host_id,profile_id,profile_revision,pool_id,pool_revision,wallet_id,wallet_revision,package_id,package_version,claim_cpu,plan_json,resolved_hash,created_at_ns FROM resolved_execution_snapshots`
+const snapshotSelect = `SELECT workload_id,desired_generation,execution_id,host_id,profile_id,profile_revision,host_profile_settings_revision,pool_id,pool_revision,wallet_id,wallet_revision,package_id,package_version,claim_cpu,plan_json,resolved_hash,created_at_ns FROM resolved_execution_snapshots`
 
 func (service *Service) CreateDesiredWorkload(ctx context.Context, content farmmodel.DesiredWorkloadContent) (farmmodel.DesiredWorkload, error) {
 	content.Resources = farmmodel.NormalizeResourceClaim(content.Resources)
@@ -364,6 +364,40 @@ func (service *Service) GetCurrentResolvedSnapshot(ctx context.Context, id ident
 	return service.getSnapshot(ctx, service.db, id, workload.DesiredGeneration)
 }
 
+// ValidateResolvedSnapshotForStart re-resolves current persistent intent with
+// current HostProfileSettings and validates it against fresh observed hardware.
+// It never mutates the immutable snapshot.
+func (service *Service) ValidateResolvedSnapshotForStart(ctx context.Context, candidate farmmodel.ResolvedExecutionSnapshot, inventory model.Inventory) error {
+	return service.writeTx(ctx, func(tx *sql.Tx) error {
+		workload, err := service.loadWorkloadTx(ctx, tx, candidate.WorkloadID)
+		if err != nil {
+			return err
+		}
+		if workload.RunState != farmmodel.DesiredRunning || workload.DesiredGeneration != candidate.DesiredGeneration || workload.HostID != candidate.HostID {
+			return typed(farmerr.CONFIG_CONFLICT, "resolved snapshot is no longer current desired intent", nil)
+		}
+		current, err := service.getSnapshot(ctx, tx, workload.WorkloadID, workload.DesiredGeneration)
+		if err != nil {
+			return err
+		}
+		if current.ExecutionID != candidate.ExecutionID || current.ResolvedHash != candidate.ResolvedHash {
+			return typed(farmerr.CONFIG_CONFLICT, "resolved snapshot identity is no longer current", nil)
+		}
+		inputs, _, err := service.resolveWorkload(ctx, tx, workload)
+		if err != nil {
+			return err
+		}
+		resolved, err := service.resolver.ResolveAndValidate(ctx, inputs, inventory)
+		if err != nil {
+			return err
+		}
+		if resolved.Hash != candidate.ResolvedHash {
+			return typed(farmerr.CONFIG_CONFLICT, "freshly resolved runtime plan does not match immutable snapshot", nil)
+		}
+		return nil
+	})
+}
+
 func (service *Service) ListResolvedSnapshots(ctx context.Context, id identity.WorkloadID) ([]farmmodel.ResolvedExecutionSnapshot, error) {
 	if err := id.Validate(); err != nil {
 		return nil, typed(farmerr.CONFIG_CONFLICT, "invalid WorkloadID", err)
@@ -442,7 +476,14 @@ func (service *Service) resolveWorkload(ctx context.Context, tx *sql.Tx, workloa
 	if err != nil {
 		return farmresolve.Inputs{}, farmresolve.Result{}, typed(farmerr.INVALID_REFERENCE, "MiningProfile references an unavailable WalletRef", err)
 	}
-	inputs := farmresolve.Inputs{Workload: workload, Profile: profile, Pool: pool, Wallet: wallet}
+	settings, err := scanHostProfileSettings(tx.QueryRowContext(ctx, hostProfileSettingsSelect+" WHERE host_id=? AND profile_id=?", workload.HostID.String(), profile.ProfileID.String()))
+	var settingsPtr *farmmodel.HostProfileSettings
+	if err == nil {
+		settingsPtr = &settings
+	} else if code, _ := farmerr.CodeOf(err); code != farmerr.NOT_FOUND {
+		return farmresolve.Inputs{}, farmresolve.Result{}, err
+	}
+	inputs := farmresolve.Inputs{Workload: workload, Profile: profile, Settings: settingsPtr, Pool: pool, Wallet: wallet}
 	resolved, err := service.resolver.Resolve(ctx, inputs)
 	return inputs, resolved, err
 }
@@ -474,7 +515,7 @@ func insertResolvedSnapshot(ctx context.Context, tx *sql.Tx, snapshot farmmodel.
 	if err != nil {
 		return typed(farmerr.INTERNAL_ERROR, "cannot encode immutable ExecutionPlan", err)
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO resolved_execution_snapshots(workload_id,desired_generation,execution_id,host_id,profile_id,profile_revision,pool_id,pool_revision,wallet_id,wallet_revision,package_id,package_version,claim_cpu,plan_json,resolved_hash,created_at_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, snapshot.WorkloadID.String(), snapshot.DesiredGeneration, snapshot.ExecutionID.String(), snapshot.HostID.String(), snapshot.ProfileID.String(), snapshot.ProfileRevision, snapshot.PoolID.String(), snapshot.PoolRevision, snapshot.WalletID.String(), snapshot.WalletRevision, snapshot.Package.PackageID.String(), snapshot.Package.Version, snapshot.Resources.CPU, planJSON, snapshot.ResolvedHash, snapshot.CreatedAt.UnixNano())
+	_, err = tx.ExecContext(ctx, `INSERT INTO resolved_execution_snapshots(workload_id,desired_generation,execution_id,host_id,profile_id,profile_revision,host_profile_settings_revision,pool_id,pool_revision,wallet_id,wallet_revision,package_id,package_version,claim_cpu,plan_json,resolved_hash,created_at_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, snapshot.WorkloadID.String(), snapshot.DesiredGeneration, snapshot.ExecutionID.String(), snapshot.HostID.String(), snapshot.ProfileID.String(), snapshot.ProfileRevision, snapshot.HostProfileSettingsRevision, snapshot.PoolID.String(), snapshot.PoolRevision, snapshot.WalletID.String(), snapshot.WalletRevision, snapshot.Package.PackageID.String(), snapshot.Package.Version, snapshot.Resources.CPU, planJSON, snapshot.ResolvedHash, snapshot.CreatedAt.UnixNano())
 	if err != nil {
 		return err
 	}
@@ -531,6 +572,35 @@ func (service *Service) propagateProfileWorkloads(ctx context.Context, tx *sql.T
 			return err
 		}
 	}
+	return service.propagateWorkloadIDs(ctx, tx, workloads)
+}
+
+func (service *Service) propagateHostProfileWorkloads(ctx context.Context, tx *sql.Tx, hostID identity.HostID, profileID identity.ProfileID) error {
+	rows, err := tx.QueryContext(ctx, "SELECT workload_id FROM desired_workloads WHERE host_id=? AND profile_id=? ORDER BY workload_id", hostID.String(), profileID.String())
+	if err != nil {
+		return err
+	}
+	var workloads []identity.WorkloadID
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			rows.Close()
+			return err
+		}
+		id, err := identity.ParseWorkloadID(raw)
+		if err != nil {
+			rows.Close()
+			return corrupt("stored WorkloadID is invalid", err)
+		}
+		workloads = append(workloads, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return service.propagateWorkloadIDs(ctx, tx, workloads)
+}
+
+func (service *Service) propagateWorkloadIDs(ctx context.Context, tx *sql.Tx, workloads []identity.WorkloadID) error {
 	for _, id := range workloads {
 		workload, err := service.loadWorkloadTx(ctx, tx, id)
 		if err != nil {
@@ -721,7 +791,7 @@ func scanSnapshot(row scanner) (farmmodel.ResolvedExecutionSnapshot, error) {
 	var cpu int
 	var planJSON []byte
 	var created int64
-	err := row.Scan(&workload, &s.DesiredGeneration, &execution, &host, &profile, &s.ProfileRevision, &pool, &s.PoolRevision, &wallet, &s.WalletRevision, &packageID, &s.Package.Version, &cpu, &planJSON, &s.ResolvedHash, &created)
+	err := row.Scan(&workload, &s.DesiredGeneration, &execution, &host, &profile, &s.ProfileRevision, &s.HostProfileSettingsRevision, &pool, &s.PoolRevision, &wallet, &s.WalletRevision, &packageID, &s.Package.Version, &cpu, &planJSON, &s.ResolvedHash, &created)
 	if err != nil {
 		return s, scanError("ResolvedExecutionSnapshot", err)
 	}

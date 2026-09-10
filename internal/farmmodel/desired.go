@@ -76,15 +76,17 @@ type ResolvedExecutionSnapshot struct {
 	HostID            identity.HostID
 	ProfileID         identity.ProfileID
 	ProfileRevision   uint64
-	PoolID            identity.PoolID
-	PoolRevision      uint64
-	WalletID          identity.WalletID
-	WalletRevision    uint64
-	Package           PackageRef
-	Resources         ResourceClaim
-	Plan              model.ExecutionPlan
-	ResolvedHash      string
-	CreatedAt         time.Time
+	// HostProfileSettingsRevision is zero when no Host+Profile override existed.
+	HostProfileSettingsRevision uint64
+	PoolID                      identity.PoolID
+	PoolRevision                uint64
+	WalletID                    identity.WalletID
+	WalletRevision              uint64
+	Package                     PackageRef
+	Resources                   ResourceClaim
+	Plan                        model.ExecutionPlan
+	ResolvedHash                string
+	CreatedAt                   time.Time
 }
 
 func ValidateResourceClaim(claim ResourceClaim) error {

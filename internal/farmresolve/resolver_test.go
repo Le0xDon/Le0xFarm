@@ -8,6 +8,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/packagecatalog"
 )
 
@@ -102,6 +103,73 @@ func TestResolvedHashRuntimeDimensions(t *testing.T) {
 	}
 }
 
+func TestHostProfileSettingsPrecedenceAndHash(t *testing.T) {
+	inputs, resolver := fixture(t)
+	inherited, err := resolver.Resolve(context.Background(), inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	threads := uint32(7)
+	hugePages := false
+	inputs.Settings = &farmmodel.HostProfileSettings{
+		HostID: inputs.Workload.HostID, ProfileID: inputs.Profile.ProfileID, Meta: inputs.Profile.Meta,
+		HostProfileSettingsContent: farmmodel.HostProfileSettingsContent{CPUThreads: &threads, HugePages: &hugePages},
+	}
+	overridden, err := resolver.Resolve(context.Background(), inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overridden.Content.CPUThreads == nil || *overridden.Content.CPUThreads != 7 || overridden.Content.HugePages == nil || *overridden.Content.HugePages {
+		t.Fatalf("override precedence failed: %+v", overridden.Content)
+	}
+	if overridden.Content.MSR != nil || inherited.Hash == overridden.Hash {
+		t.Fatal("override did not change only effective runtime settings/hash")
+	}
+	threads = *inputs.Profile.CPUThreads
+	sameEffective, err := resolver.Resolve(context.Background(), inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameEffective.Hash == inherited.Hash { // HugePages still explicitly false and profile default is nil.
+		t.Fatal("remaining effective override was omitted from hash")
+	}
+	inputs.Settings.HugePages = nil
+	sameEffective, err = resolver.Resolve(context.Background(), inputs)
+	if err != nil || sameEffective.Hash != inherited.Hash {
+		t.Fatalf("override equal to default changed runtime: hash=%s inherited=%s err=%v", sameEffective.Hash, inherited.Hash, err)
+	}
+}
+
+func TestFreshHardwareValidationFailsClosedWithoutClamping(t *testing.T) {
+	inputs, resolver := fixture(t)
+	inventory := model.Inventory{Host: model.Host{HostID: inputs.Workload.HostID}, CPU: model.CPU{Threads: 4}}
+	result, err := resolver.ResolveAndValidate(context.Background(), inputs, inventory)
+	if err != nil || result.Content.CPUThreads == nil || *result.Content.CPUThreads != 2 {
+		t.Fatalf("compatible resolution=%+v err=%v", result, err)
+	}
+	threads := uint32(30)
+	inputs.Settings = &farmmodel.HostProfileSettings{
+		HostID: inputs.Workload.HostID, ProfileID: inputs.Profile.ProfileID, Meta: inputs.Profile.Meta,
+		HostProfileSettingsContent: farmmodel.HostProfileSettingsContent{CPUThreads: &threads},
+	}
+	_, err = resolver.ResolveAndValidate(context.Background(), inputs, inventory)
+	assertCode(t, err, farmerr.INCOMPATIBLE_HARDWARE)
+	resolved, resolveErr := resolver.Resolve(context.Background(), inputs)
+	if resolveErr != nil || resolved.Content.CPUThreads == nil || *resolved.Content.CPUThreads != 30 {
+		t.Fatalf("impossible value was clamped: %+v err=%v", resolved.Content.CPUThreads, resolveErr)
+	}
+	inventory.CPU.Threads = 0
+	_, err = resolver.ResolveAndValidate(context.Background(), inputs, inventory)
+	assertCode(t, err, farmerr.INCOMPATIBLE_HARDWARE)
+}
+
+func TestUnsupportedTypedTuningFailsClosed(t *testing.T) {
+	inputs, resolver := fixture(t)
+	resolver.Catalog, _ = packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: inputs.Profile.Package, AdapterIDs: []string{inputs.Profile.AdapterID}}})
+	_, err := resolver.Resolve(context.Background(), inputs)
+	assertCode(t, err, farmerr.CONFIG_CONFLICT)
+}
+
 func fixture(t *testing.T) (Inputs, Resolver) {
 	t.Helper()
 	packageID := mustPackage(t, "package_11111111111111111111111111111111")
@@ -118,7 +186,7 @@ func fixture(t *testing.T) (Inputs, Resolver) {
 
 func catalog(t *testing.T, ref farmmodel.PackageRef) farmmodel.PackageCatalog {
 	t.Helper()
-	value, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: ref, AdapterIDs: []string{"miner"}}})
+	value, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: ref, AdapterIDs: []string{"miner"}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}

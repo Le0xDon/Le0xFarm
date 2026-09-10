@@ -62,6 +62,13 @@ func MiningProfileHash(content MiningProfileContent) (string, error) {
 	})
 }
 
+func HostProfileSettingsHash(content HostProfileSettingsContent) (string, error) {
+	return ContentHash(map[string]any{
+		"cpu_threads": optionalUint32(content.CPUThreads),
+		"huge_pages":  optionalBool(content.HugePages), "msr": optionalBool(content.MSR),
+	})
+}
+
 func DesiredWorkloadHash(content DesiredWorkloadContent) (string, error) {
 	claim := NormalizeResourceClaim(content.Resources)
 	return ContentHash(map[string]any{

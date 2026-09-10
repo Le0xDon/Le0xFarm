@@ -426,6 +426,12 @@ func (service *Service) DeleteMiningProfile(ctx context.Context, id identity.Pro
 		if used != 0 {
 			return typed(farmerr.REFERENCE_IN_USE, "MiningProfile is referenced by a DesiredWorkload", nil)
 		}
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM host_profile_settings WHERE profile_id=?)", id.String()).Scan(&used); err != nil {
+			return err
+		}
+		if used != 0 {
+			return typed(farmerr.REFERENCE_IN_USE, "MiningProfile is referenced by HostProfileSettings", nil)
+		}
 		_, err = tx.ExecContext(ctx, "DELETE FROM mining_profiles WHERE profile_id=?", id.String())
 		return err
 	})
@@ -443,7 +449,7 @@ func (service *Service) validateProfile(ctx context.Context, content farmmodel.M
 	if !slices.Contains(release.AdapterIDs, content.AdapterID) {
 		return typed(farmerr.INVALID_REFERENCE, "MiningProfile adapter is not supported by the package release", nil)
 	}
-	return nil
+	return farmmodel.ValidateTuningCapabilities(content.CPUThreads, content.HugePages, content.MSR, release.Tuning)
 }
 
 func requireReferences(ctx context.Context, tx *sql.Tx, poolID identity.PoolID, walletID identity.WalletID) error {

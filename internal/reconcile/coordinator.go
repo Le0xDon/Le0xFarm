@@ -2,7 +2,9 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"log"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ type WorkloadStore interface {
 	BlockDesiredGeneration(context.Context, identity.WorkloadID, uint64, farmerr.Code, string) error
 	GetWorkloadRuntimeBinding(context.Context, identity.WorkloadID) (farmmodel.WorkloadRuntimeBinding, bool, error)
 	RetryWorkload(context.Context, identity.WorkloadID, uint64) (farmmodel.DesiredWorkload, error)
+	ValidateResolvedSnapshotForStart(context.Context, farmmodel.ResolvedExecutionSnapshot, model.Inventory) error
 }
 
 type Commander interface {
@@ -196,6 +199,21 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 			}
 			continue
 		}
+		if action.Key.Action == ActionStart {
+			if !observed.InventoryFresh {
+				return preparedDispatch{}, false
+			}
+			if err := coordinator.store.ValidateResolvedSnapshotForStart(ctx, action.Snapshot, observed.Inventory); err != nil {
+				code, _ := farmerr.CodeOf(err)
+				message := "fresh Host validation failed"
+				var typedError farmerr.Error
+				if errors.As(err, &typedError) && typedError.HumanMessage != "" {
+					message = typedError.HumanMessage
+				}
+				coordinator.output.Printf("RECONCILE: WorkloadID %s START blocked by fresh Host validation code=%s reason=%q", action.Key.WorkloadID, code, message)
+				continue
+			}
+		}
 		if !coordinator.actionStillCurrent(ctx, action, observed) {
 			return preparedDispatch{}, false
 		}
@@ -223,15 +241,30 @@ func (coordinator *Coordinator) actionStillCurrent(ctx context.Context, action A
 		return false
 	}
 	currentObserved, ok := coordinator.observed.Get(action.Key.HostID)
-	if !ok || !currentObserved.Connected || !currentObserved.Ready || !currentObserved.Fresh || currentObserved.ConnectionEpoch != observed.ConnectionEpoch || currentObserved.Revision != observed.Revision {
+	if !ok || !currentObserved.Connected || !currentObserved.Ready || !currentObserved.Fresh || currentObserved.ConnectionEpoch != observed.ConnectionEpoch || !sameExecutionFacts(currentObserved.Executions, observed.Executions) {
 		return false
 	}
 	if action.Key.Action == ActionStart {
+		if !currentObserved.InventoryFresh || !observed.InventoryFresh || !reflect.DeepEqual(currentObserved.Inventory, observed.Inventory) {
+			return false
+		}
 		if latest.RunState != farmmodel.DesiredRunning || latest.DesiredGeneration != action.Key.DesiredGeneration {
 			return false
 		}
 		snapshot, err := coordinator.store.GetCurrentResolvedSnapshot(ctx, latest.WorkloadID)
 		return err == nil && snapshot.ExecutionID == action.Key.ExecutionID && snapshot.ResolvedHash == action.Snapshot.ResolvedHash
+	}
+	return true
+}
+
+func sameExecutionFacts(left, right []model.ExecutionObservation) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].ExecutionID != right[i].ExecutionID || left[i].Status != right[i].Status || !reflect.DeepEqual(left[i].Ownership, right[i].Ownership) {
+			return false
+		}
 	}
 	return true
 }

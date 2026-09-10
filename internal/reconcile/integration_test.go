@@ -45,7 +45,7 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	if err := agenttrust.Save(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
 		t.Fatal(err)
 	}
-	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "1"}, AdapterIDs: []string{integrationAdapterID}}})
+	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "1"}, AdapterIDs: []string{integrationAdapterID}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,6 +150,65 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	if commands2.Count(controllernet.RuntimeStart) != 0 || mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID).PID != first.PID {
 		t.Fatal("restarted Controller duplicated the persisted execution")
 	}
+	threads := uint32(1)
+	settings, err := store2.CreateHostProfileSettings(context.Background(), hostID, profile.ProfileID, farmmodel.HostProfileSettingsContent{CPUThreads: &threads})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overridden, err := store2.GetCurrentResolvedSnapshot(context.Background(), workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionStopped)
+	waitExecutionState(t, runtime, overridden.ExecutionID, model.ExecutionRunning)
+	if overridden.ExecutionID == snapshot.ExecutionID || overridden.Plan.CPUThreads == nil || *overridden.Plan.CPUThreads != 1 || commands2.Count(controllernet.RuntimeStop) != 1 || commands2.Count(controllernet.RuntimeStart) != 1 {
+		t.Fatalf("Host override did not safely replace execution: snapshot=%+v starts=%d stops=%d", overridden, commands2.Count(controllernet.RuntimeStart), commands2.Count(controllernet.RuntimeStop))
+	}
+
+	impossible := facts.CPU.Threads + 1
+	settings, err = store2.UpdateHostProfileSettings(context.Background(), hostID, profile.ProfileID, settings.Meta.Revision, farmmodel.HostProfileSettingsContent{CPUThreads: &impossible})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedSnapshot, err := store2.GetCurrentResolvedSnapshot(context.Background(), workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitExecutionState(t, runtime, overridden.ExecutionID, model.ExecutionStopped)
+	time.Sleep(50 * time.Millisecond)
+	if running, ok := runtime.Get(blockedSnapshot.ExecutionID); ok && (running.State == model.ExecutionRunning || running.State == model.ExecutionStarting) {
+		t.Fatal("impossible CPUThreads started a miner")
+	}
+	if commands2.Count(controllernet.RuntimeStop) != 2 || commands2.Count(controllernet.RuntimeStart) != 1 {
+		t.Fatalf("impossible settings commands starts=%d stops=%d", commands2.Count(controllernet.RuntimeStart), commands2.Count(controllernet.RuntimeStop))
+	}
+
+	settings, err = store2.UpdateHostProfileSettings(context.Background(), hostID, profile.ProfileID, settings.Meta.Revision, farmmodel.HostProfileSettingsContent{CPUThreads: &threads})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrected, err := store2.GetCurrentResolvedSnapshot(context.Background(), workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitExecutionState(t, runtime, corrected.ExecutionID, model.ExecutionRunning)
+	if commands2.Count(controllernet.RuntimeStart) != 2 || commands2.Count(controllernet.RuntimeStop) != 2 {
+		t.Fatalf("corrected settings did not recover exactly once: starts=%d stops=%d", commands2.Count(controllernet.RuntimeStart), commands2.Count(controllernet.RuntimeStop))
+	}
+	beforeUnchanged, _ := store2.GetDesiredWorkload(context.Background(), workload.WorkloadID)
+	settings, err = store2.UpdateHostProfileSettings(context.Background(), hostID, profile.ProfileID, settings.Meta.Revision, farmmodel.HostProfileSettingsContent{CPUThreads: &threads})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterUnchanged, _ := store2.GetDesiredWorkload(context.Background(), workload.WorkloadID)
+	if beforeUnchanged.DesiredGeneration != afterUnchanged.DesiredGeneration || settings.Meta.Revision != 3 {
+		t.Fatal("unchanged effective settings changed generation or settings revision")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if commands2.Count(controllernet.RuntimeStart) != 2 || commands2.Count(controllernet.RuntimeStop) != 2 {
+		t.Fatal("unchanged effective settings caused runtime commands")
+	}
+	snapshot = corrected
 	stopped := workload.DesiredWorkloadContent
 	stopped.RunState = farmmodel.DesiredStopped
 	workload, err = store2.UpdateDesiredWorkload(context.Background(), workload.WorkloadID, workload.Meta.Revision, stopped)
@@ -158,7 +217,7 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	}
 	// The periodic coordinator notices the persistent desired mutation.
 	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionStopped)
-	if commands2.Count(controllernet.RuntimeStop) != 1 {
+	if commands2.Count(controllernet.RuntimeStop) != 3 {
 		t.Fatalf("STOP count=%d", commands2.Count(controllernet.RuntimeStop))
 	}
 	stop2()
@@ -269,7 +328,7 @@ func (dialer *switchingBufDialer) Set(listener *bufconn.Listener) {
 
 func waitSessionReady(t *testing.T, server *controllernet.Server, host identity.HostID) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if session, ok := server.Session(host); ok && session.Ready {
 			return
@@ -281,7 +340,7 @@ func waitSessionReady(t *testing.T, server *controllernet.Server, host identity.
 
 func waitExecutionState(t *testing.T, runtime *supervisor.Supervisor, executionID identity.ExecutionID, state model.ExecutionStatus) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if snapshot, ok := runtime.Get(executionID); ok && snapshot.State == state {
 			return

@@ -35,6 +35,14 @@ type MiningProfiles interface {
 	DeleteMiningProfile(context.Context, identity.ProfileID, uint64) error
 }
 
+type HostProfileSettings interface {
+	CreateHostProfileSettings(context.Context, identity.HostID, identity.ProfileID, farmmodel.HostProfileSettingsContent) (farmmodel.HostProfileSettings, error)
+	GetHostProfileSettings(context.Context, identity.HostID, identity.ProfileID) (farmmodel.HostProfileSettings, error)
+	ListHostProfileSettings(context.Context) ([]farmmodel.HostProfileSettings, error)
+	UpdateHostProfileSettings(context.Context, identity.HostID, identity.ProfileID, uint64, farmmodel.HostProfileSettingsContent) (farmmodel.HostProfileSettings, error)
+	DeleteHostProfileSettings(context.Context, identity.HostID, identity.ProfileID, uint64) error
+}
+
 type DesiredWorkloads interface {
 	CreateDesiredWorkload(context.Context, farmmodel.DesiredWorkloadContent) (farmmodel.DesiredWorkload, error)
 	GetDesiredWorkload(context.Context, identity.WorkloadID) (farmmodel.DesiredWorkload, error)
@@ -53,5 +61,6 @@ var _ interface {
 	Pools
 	WalletRefs
 	MiningProfiles
+	HostProfileSettings
 	DesiredWorkloads
 } = (*Service)(nil)

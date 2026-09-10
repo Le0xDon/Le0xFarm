@@ -7,11 +7,23 @@ import (
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
+	"github.com/le0xdon/le0xfarm/internal/miners/xmrig"
 )
 
 type Static struct {
 	mu       sync.RWMutex
 	releases map[string]farmmodel.PackageRelease
+}
+
+// Builtin returns Controller-known, pinned production Package/Adapter pairs.
+// Agent installation and executable verification remain separate concerns.
+func Builtin() (*Static, error) {
+	manifest := xmrig.Manifest()
+	return NewStatic([]farmmodel.PackageRelease{{
+		Ref:        farmmodel.PackageRef{PackageID: manifest.PackageID, Version: manifest.Version},
+		AdapterIDs: []string{xmrig.AdapterID},
+		Tuning:     farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true},
+	}})
 }
 
 func NewStatic(releases []farmmodel.PackageRelease) (*Static, error) {

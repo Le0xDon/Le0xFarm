@@ -248,6 +248,47 @@ func TestChangedObservationInvalidatesActionBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestChangedInventoryInvalidatesStartBeforeDispatch(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	observed := controllerstate.New()
+	base := newFakeCommander(host, 1)
+	commander := &mutatingSessionCommander{fakeCommander: base, mutate: func() {
+		observed.SetInventory(host, base.info.ConnectionEpoch, model.Inventory{
+			Host: model.Host{HostID: host},
+			CPU:  model.CPU{Threads: 8},
+		})
+	}}
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, base.info, nil)
+	coordinator.ReconcileHost(context.Background(), host)
+	if requests := base.requestsCopy(); len(requests) != 0 {
+		t.Fatalf("START dispatched after validated inventory changed: %+v", requests)
+	}
+}
+
+func TestEquivalentObservationRefreshDoesNotStarveDispatch(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	observed := controllerstate.New()
+	base := newFakeCommander(host, 1)
+	commander := &mutatingSessionCommander{fakeCommander: base, mutate: func() {
+		observed.SetExecutions(host, base.info.ConnectionEpoch, nil, time.Now(), 0)
+		observed.SetInventory(host, base.info.ConnectionEpoch, model.Inventory{Host: model.Host{HostID: host}})
+		observed.SetAgentState(host, base.info.ConnectionEpoch, model.AgentStateIdle)
+	}}
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, base.info, nil)
+	coordinator.ReconcileHost(context.Background(), host)
+	if requests := base.requestsCopy(); len(requests) != 1 || requests[0].Kind != controllernet.RuntimeStart {
+		t.Fatalf("equivalent refresh starved dispatch: %+v", requests)
+	}
+}
+
 func TestCoordinatorLostStopResultProceedsOnlyAfterFreshAbsence(t *testing.T) {
 	host := testHost(1)
 	workloadID := testWorkload(1)
@@ -270,6 +311,125 @@ func TestCoordinatorLostStopResultProceedsOnlyAfterFreshAbsence(t *testing.T) {
 	requests = commander.requestsCopy()
 	if len(requests) != 2 || requests[1].Kind != controllernet.RuntimeStart || requests[1].ExecutionID != current.ExecutionID {
 		t.Fatalf("fresh absence did not start replacement: %+v", requests)
+	}
+}
+
+func TestHostSettingsReplacementStopsOldBeforeStartingNew(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	old := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	current := testSnapshot(workloadID, host, 2, testExecution(2), farmmodel.ResourceClaim{CPU: true})
+	oldThreads, newThreads := uint32(30), uint32(28)
+	old.Plan.CPUThreads = &oldThreads
+	current.Plan.CPUThreads = &newThreads
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 2, current.Resources), old, current)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, []model.ExecutionObservation{observedExecution(old, model.ExecutionRunning)})
+	coordinator.ReconcileHost(context.Background(), host)
+	requests := commander.requestsCopy()
+	if len(requests) != 1 || requests[0].Kind != controllernet.RuntimeStop || requests[0].ExecutionID != old.ExecutionID {
+		t.Fatalf("settings replacement did not STOP old exactly: %+v", requests)
+	}
+	for range 20 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if len(commander.requestsCopy()) != 1 {
+		t.Fatal("new execution overlapped unresolved old STOP")
+	}
+	stopped := observedExecution(old, model.ExecutionStopped)
+	coordinator.RuntimeResult(commander.info, requests[0], &stopped, nil)
+	coordinator.ExecutionsObserved(commander.info, nil, requests[0].DispatchSequence)
+	waitRequests(t, commander, 2)
+	requests = commander.requestsCopy()
+	if requests[1].Kind != controllernet.RuntimeStart || requests[1].ExecutionID != current.ExecutionID {
+		t.Fatalf("confirmed absence did not START new exactly: %+v", requests)
+	}
+}
+
+func TestFreshHostValidationBlocksAndCanRecover(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	store.validationErr = farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "requested 30, supported 16"}
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, nil)
+	for range 20 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if len(commander.requestsCopy()) != 0 || store.isBlocked(workloadID, 1) {
+		t.Fatal("incompatible hardware dispatched or became terminally latched")
+	}
+	store.mu.Lock()
+	store.validationErr = nil
+	store.mu.Unlock()
+	coordinator.ReconcileHost(context.Background(), host)
+	if requests := commander.requestsCopy(); len(requests) != 1 || requests[0].Kind != controllernet.RuntimeStart {
+		t.Fatalf("corrected validation did not recover: %+v", requests)
+	}
+}
+
+func TestFreshExecutionsButStaleInventoryCannotStart(t *testing.T) {
+	now := time.Unix(4_000, 0).UTC()
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	observed := controllerstate.NewWithOptions(controllerstate.StoreOptions{Now: func() time.Time { return now }, FreshnessTimeout: 45 * time.Second})
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	observed.Connect(commander.info.AgentID, host, 1)
+	observed.SetExecutions(host, 1, nil, now, 0)
+	observed.SetInventory(host, 1, model.Inventory{Host: model.Host{HostID: host}, CPU: model.CPU{Threads: 32}})
+	observed.SetAgentState(host, 1, model.AgentStateIdle)
+	observed.MarkReady(host, 1)
+	now = now.Add(40 * time.Second)
+	observed.SetExecutions(host, 1, nil, now, 0)
+	now = now.Add(6 * time.Second)
+	coordinator.ReconcileHost(context.Background(), host)
+	if len(commander.requestsCopy()) != 0 {
+		t.Fatal("START used stale inventory")
+	}
+	observed.SetInventory(host, 1, model.Inventory{Host: model.Host{HostID: host}, CPU: model.CPU{Threads: 16}})
+	coordinator.ReconcileHost(context.Background(), host)
+	if requests := commander.requestsCopy(); len(requests) != 1 || requests[0].Kind != controllernet.RuntimeStart {
+		t.Fatalf("fresh inventory did not restore reconciliation: %+v", requests)
+	}
+}
+
+func TestReconnectWithChangedHardwareRevalidatesBeforeStart(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	requested := uint32(30)
+	snapshot.Plan.CPUThreads = &requested
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	store.validationFunc = func(inventory model.Inventory) error {
+		if inventory.CPU.Threads < requested {
+			return farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "fresh CPU capacity changed"}
+		}
+		return nil
+	}
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStoreWithInventory(observed, commander.info, nil, model.Inventory{Host: model.Host{HostID: host}, CPU: model.CPU{Threads: 32}})
+	coordinator.ReconcileHost(context.Background(), host)
+	if requests := commander.requestsCopy(); len(requests) != 1 {
+		t.Fatalf("initial compatible START=%+v", requests)
+	}
+	coordinator.SessionDisconnected(commander.info)
+	commander.setEpoch(2)
+	readyStoreWithInventory(observed, commander.info, nil, model.Inventory{Host: model.Host{HostID: host}, CPU: model.CPU{Threads: 16}})
+	for range 20 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if requests := commander.requestsCopy(); len(requests) != 1 {
+		t.Fatalf("changed reconnect hardware allowed START: %+v", requests)
 	}
 }
 
@@ -477,9 +637,13 @@ func TestUnknownExecutionIsReportedButNeverAdoptedOrStopped(t *testing.T) {
 }
 
 func readyStore(store *controllerstate.Store, info controllernet.SessionInfo, executions []model.ExecutionObservation) {
+	readyStoreWithInventory(store, info, executions, model.Inventory{Host: model.Host{HostID: info.HostID}})
+}
+
+func readyStoreWithInventory(store *controllerstate.Store, info controllernet.SessionInfo, executions []model.ExecutionObservation, inventory model.Inventory) {
 	store.Connect(info.AgentID, info.HostID, info.ConnectionEpoch)
 	store.SetExecutions(info.HostID, info.ConnectionEpoch, executions, time.Now(), 0)
-	store.SetInventory(info.HostID, info.ConnectionEpoch, model.Inventory{Host: model.Host{HostID: info.HostID}})
+	store.SetInventory(info.HostID, info.ConnectionEpoch, inventory)
 	store.SetAgentState(info.HostID, info.ConnectionEpoch, model.AgentStateIdle)
 	store.MarkReady(info.HostID, info.ConnectionEpoch)
 }
@@ -558,12 +722,14 @@ func (commander *fakeCommander) requestsCopy() []controllernet.RuntimeRequest {
 }
 
 type fakeStore struct {
-	mu           sync.Mutex
-	workloads    map[identity.WorkloadID]farmmodel.DesiredWorkload
-	snapshots    []farmmodel.ResolvedExecutionSnapshot
-	bindings     map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding
-	blockEntered chan struct{}
-	blockRelease chan struct{}
+	mu             sync.Mutex
+	workloads      map[identity.WorkloadID]farmmodel.DesiredWorkload
+	snapshots      []farmmodel.ResolvedExecutionSnapshot
+	bindings       map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding
+	blockEntered   chan struct{}
+	blockRelease   chan struct{}
+	validationErr  error
+	validationFunc func(model.Inventory) error
 }
 
 func newFakeStore(workload farmmodel.DesiredWorkload, snapshots ...farmmodel.ResolvedExecutionSnapshot) *fakeStore {
@@ -652,6 +818,14 @@ func (store *fakeStore) GetWorkloadRuntimeBinding(_ context.Context, id identity
 }
 func (store *fakeStore) RetryWorkload(context.Context, identity.WorkloadID, uint64) (farmmodel.DesiredWorkload, error) {
 	return farmmodel.DesiredWorkload{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT}
+}
+func (store *fakeStore) ValidateResolvedSnapshotForStart(_ context.Context, _ farmmodel.ResolvedExecutionSnapshot, inventory model.Inventory) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.validationFunc != nil {
+		return store.validationFunc(inventory)
+	}
+	return store.validationErr
 }
 func (store *fakeStore) isBlocked(id identity.WorkloadID, generation uint64) bool {
 	store.mu.Lock()

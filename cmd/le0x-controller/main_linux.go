@@ -203,7 +203,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return 1
 	}
 	defer farmDB.Close()
-	catalog, err := packagecatalog.NewStatic(nil)
+	catalog, err := packagecatalog.Builtin()
 	if err != nil {
 		printError(stderr, err)
 		return 1

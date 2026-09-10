@@ -262,8 +262,8 @@ func newService(t *testing.T, dir string, options Options) (*controllerdb.DB, *S
 		t.Fatal(err)
 	}
 	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{
-		{Ref: farmmodel.PackageRef{PackageID: testPackageID, Version: "1.0"}, AdapterIDs: []string{"generic-miner"}},
-		{Ref: farmmodel.PackageRef{PackageID: testPackageID, Version: "2.0"}, AdapterIDs: []string{"generic-miner"}},
+		{Ref: farmmodel.PackageRef{PackageID: testPackageID, Version: "1.0"}, AdapterIDs: []string{"generic-miner"}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}},
+		{Ref: farmmodel.PackageRef{PackageID: testPackageID, Version: "2.0"}, AdapterIDs: []string{"generic-miner"}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}},
 	})
 	if err != nil {
 		t.Fatal(err)

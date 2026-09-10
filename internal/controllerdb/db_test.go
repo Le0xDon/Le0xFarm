@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	_ "modernc.org/sqlite"
@@ -45,7 +46,7 @@ func TestOpenMigratesSecuresAndReopens(t *testing.T) {
 	if err := db.SQL().QueryRow("SELECT count(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
+	if count != 4 {
 		t.Fatalf("migration count %d", count)
 	}
 }
@@ -85,7 +86,7 @@ func TestOpenRejectsNewerMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = raw.Exec("INSERT INTO schema_migrations VALUES(4,'future','hash',0)")
+	_, err = raw.Exec("INSERT INTO schema_migrations VALUES(5,'future','hash',0)")
 	raw.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +117,45 @@ func TestOpenRejectsMigrationLedgerGap(t *testing.T) {
 	_, err = Open(context.Background(), dir)
 	if code, _ := farmerr.CodeOf(err); code != farmerr.CONFIG_CONFLICT {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestExistingM4DatabaseMigratesForward(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, FileName)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at_ns INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil || len(migrations) != 4 {
+		t.Fatalf("migrations=%d err=%v", len(migrations), err)
+	}
+	for _, migration := range migrations[:3] {
+		if _, err := raw.Exec(migration.sql); err != nil {
+			t.Fatalf("apply M4 migration %d: %v", migration.version, err)
+		}
+		if _, err := raw.Exec("INSERT INTO schema_migrations VALUES(?,?,?,?)", migration.version, migration.name, migration.hash, time.Now().UnixNano()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.SQL().QueryRow("SELECT count(*) FROM schema_migrations").Scan(&count); err != nil || count != 4 {
+		t.Fatalf("migration count=%d err=%v", count, err)
+	}
+	if _, err := db.SQL().Exec("SELECT host_profile_settings_revision FROM resolved_execution_snapshots LIMIT 0"); err != nil {
+		t.Fatalf("M5 snapshot provenance column unavailable: %v", err)
 	}
 }
 
