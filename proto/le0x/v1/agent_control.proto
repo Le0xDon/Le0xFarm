@@ -118,8 +118,33 @@ message Execution {
   MinerTelemetry miner_telemetry = 9;
   repeated string warnings = 10;
   WorkloadOwnership ownership = 11;
+  UsefulWorkEvidence useful_work = 12;
 }
 message DeviceHashrate { string device_id = 1; double hashrate_hps = 2; }
+message WorkMetric {
+  string kind = 1;
+  string unit = 2;
+  double value = 3;
+}
+message UsefulWorkEvidence {
+  string provider = 1;
+  string availability = 2;
+  optional bool runtime_healthy = 3;
+  optional bool job_present = 4;
+  string useful_work = 5;
+  optional uint64 accepted_work = 6;
+  optional uint64 rejected_work = 7;
+  optional uint64 stale_work = 8;
+  google.protobuf.Timestamp last_useful_work_at = 9;
+  string upstream = 10;
+  optional bool endpoint_visible = 11;
+  repeated WorkMetric metrics = 12;
+  string confidence = 13;
+  google.protobuf.Timestamp collected_at = 14;
+  uint64 age_milliseconds = 15;
+  string reason_code = 16;
+  uint64 fresh_for_milliseconds = 17;
+}
 message MinerTelemetry {
   string adapter_id = 1;
   string miner_version = 2;

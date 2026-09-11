@@ -158,9 +158,9 @@ func TestGenericMinerContractRoundTrip(t *testing.T) {
 	if decoded.GetMiner().GetAdapterId() != "test-no-http" || decoded.GetMiner().GetCpuThreads() != 2 || !decoded.GetMiner().GetEndpoint().GetTls() || decoded.GetMiner().GetEndpoint().GetPassword() != "transient-credential" || decoded.GetMiner().GetEndpoint().GetWorker() != "worker-1" || decoded.GetOwnership().GetDesiredGeneration() != 7 || !decoded.GetOwnership().GetResourceClaim().GetCpu() {
 		t.Fatalf("miner spec lost: %+v", decoded.GetMiner())
 	}
-	execution := &le0xv1.Execution{ExecutionId: message.ExecutionId, State: "RUNNING", Ownership: ownership, Warnings: []string{"adapter-specific source has no HTTP API"}, MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test-no-http", MinerVersion: "1.0", HashrateShortHps: &hashrate, PoolConnected: &connected, Health: "HEALTHY"}}
+	execution := &le0xv1.Execution{ExecutionId: message.ExecutionId, State: "RUNNING", Ownership: ownership, Warnings: []string{"adapter-specific source has no HTTP API"}, MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test-no-http", MinerVersion: "1.0", HashrateShortHps: &hashrate, PoolConnected: &connected, Health: "MINING"}, UsefulWork: &le0xv1.UsefulWorkEvidence{Provider: "test-no-http", Availability: "AVAILABLE", UsefulWork: "CONFIRMED", Upstream: "CONNECTED", Confidence: "ADAPTER_REPORTED", Metrics: []*le0xv1.WorkMetric{{Kind: "CUSTOM_RATE", Unit: "UNIT/S", Value: 123.5}}}}
 	observed := roundTrip(t, execution).(*le0xv1.Execution)
-	if observed.GetMinerTelemetry().GetHashrateShortHps() != hashrate || !observed.GetMinerTelemetry().GetPoolConnected() || len(observed.GetWarnings()) != 1 || observed.GetOwnership().GetResolvedHash() != ownership.ResolvedHash {
+	if observed.GetMinerTelemetry().GetHashrateShortHps() != hashrate || !observed.GetMinerTelemetry().GetPoolConnected() || observed.GetUsefulWork().GetUsefulWork() != "CONFIRMED" || observed.GetUsefulWork().GetMetrics()[0].GetKind() != "CUSTOM_RATE" || len(observed.GetWarnings()) != 1 || observed.GetOwnership().GetResolvedHash() != ownership.ResolvedHash {
 		t.Fatalf("generic telemetry lost: %+v", observed.GetMinerTelemetry())
 	}
 }

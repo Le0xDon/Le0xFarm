@@ -184,7 +184,9 @@ type ExecutionObservation struct {
 	ExitCode       *int
 	RestartCount   uint32
 	LastError      string
+	Warnings       []string
 	MinerTelemetry *MinerTelemetry
+	UsefulWork     *UsefulWorkEvidence
 }
 
 type ProcessResourceAttribution string
@@ -347,6 +349,73 @@ type DeviceHashrate struct {
 	HashrateHPS float64
 }
 
+// TelemetryAvailability distinguishes a valid sample from missing provider
+// data and from a formerly valid sample whose freshness bound has expired.
+type TelemetryAvailability string
+
+const (
+	TelemetryUnknown     TelemetryAvailability = "UNKNOWN"
+	TelemetryAvailable   TelemetryAvailability = "AVAILABLE"
+	TelemetryUnavailable TelemetryAvailability = "UNAVAILABLE"
+	TelemetryStale       TelemetryAvailability = "STALE"
+)
+
+// UsefulWorkState is workload-neutral. The adapter/provider, not the generic
+// runtime, decides which workload-specific facts are sufficient to confirm it.
+type UsefulWorkState string
+
+const (
+	UsefulWorkUnknown      UsefulWorkState = "UNKNOWN"
+	UsefulWorkConfirmed    UsefulWorkState = "CONFIRMED"
+	UsefulWorkNotConfirmed UsefulWorkState = "NOT_CONFIRMED"
+)
+
+type UpstreamState string
+
+const (
+	UpstreamUnknown      UpstreamState = "UNKNOWN"
+	UpstreamConnected    UpstreamState = "CONNECTED"
+	UpstreamDisconnected UpstreamState = "DISCONNECTED"
+)
+
+type EvidenceConfidence string
+
+const (
+	EvidenceConfidenceUnknown          EvidenceConfidence = "UNKNOWN"
+	EvidenceConfidenceAdapterReported  EvidenceConfidence = "ADAPTER_REPORTED"
+	EvidenceConfidenceUpstreamVerified EvidenceConfidence = "UPSTREAM_VERIFIED"
+)
+
+// WorkMetric carries an optional workload-specific measurement without making
+// hashrate (or any other unit) mandatory for every useful-work provider.
+type WorkMetric struct {
+	Kind  string
+	Unit  string
+	Value float64
+}
+
+// UsefulWorkEvidence is normalized, bounded evidence. It intentionally has no
+// command line, environment, credential, wallet, or arbitrary metadata fields.
+type UsefulWorkEvidence struct {
+	Provider         string
+	Availability     TelemetryAvailability
+	RuntimeHealthy   *bool
+	JobPresent       *bool
+	UsefulWork       UsefulWorkState
+	AcceptedWork     *uint64
+	RejectedWork     *uint64
+	StaleWork        *uint64
+	LastUsefulWorkAt *time.Time
+	Upstream         UpstreamState
+	EndpointVisible  *bool
+	Metrics          []WorkMetric
+	Confidence       EvidenceConfidence
+	CollectedAt      time.Time
+	Age              time.Duration
+	FreshFor         time.Duration
+	ReasonCode       farmerr.Code
+}
+
 type MinerTelemetry struct {
 	AdapterID          string
 	MinerVersion       string
@@ -371,6 +440,9 @@ type MinerTelemetry struct {
 	Health             MinerHealth
 	ErrorCode          farmerr.Code
 	Message            string
+	// UsefulWork is the adapter's normalized assessment. Agent runtime lifts it
+	// into ExecutionObservation.UsefulWork for platform/workload-neutral wire use.
+	UsefulWork *UsefulWorkEvidence
 }
 
 type RestartPolicy string

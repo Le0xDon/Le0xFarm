@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/le0xdon/le0xfarm/internal/controllerpki"
 	"github.com/le0xdon/le0xfarm/internal/controllerstate"
@@ -496,17 +498,17 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 						handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, &typed)
 					}
 				}
-			} else {
-				s.logExecution(pendingResult.kind, result.GetExecution().Execution, result.GetExecution().Message)
+			} else if parsed, parseErr := s.validateAndLogRuntimeExecution(pendingResult.kind, result.GetExecution(), hostID); parseErr != nil {
 				if pendingResult.request != nil {
-					parsed, parseErr := wiremap.ParseExecution(result.GetExecution().Execution, hostID)
+					typed := farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "invalid runtime execution result"}
 					if handler := s.handlerSnapshot(); handler != nil {
-						if parseErr != nil {
-							typed := farmerr.Error{Code: farmerr.INTERNAL_ERROR, HumanMessage: "invalid runtime execution result"}
-							handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, &typed)
-						} else {
-							handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, &parsed, nil)
-						}
+						handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, &typed)
+					}
+				}
+			} else {
+				if pendingResult.request != nil {
+					if handler := s.handlerSnapshot(); handler != nil {
+						handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, &parsed, nil)
 					}
 				}
 			}
@@ -518,7 +520,7 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			} else {
 				gotExecutions = true
 				s.log("EXECUTIONS: %d", len(result.GetExecutions().Executions))
-				for _, execution := range result.GetExecutions().Executions {
+				for _, execution := range parsed {
 					s.logExecution("Execution", execution, "")
 				}
 				if handler := s.handlerSnapshot(); handler != nil {
@@ -590,24 +592,56 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 	}
 }
 
-func (s *Server) logExecution(kind string, execution *le0xv1.Execution, message string) {
-	s.log("%s: %s state=%s pid=%d restart_count=%d message=%q last_error=%q", strings.ToUpper(kind), execution.ExecutionId, execution.State, execution.Pid, execution.RestartCount, message, execution.LastError)
+func parseRuntimeExecution(result *le0xv1.ExecutionResult, expectedHost identity.HostID) (model.ExecutionObservation, error) {
+	if result == nil || result.Execution == nil || !safeRuntimeDiagnostic(result.Message, 512) {
+		return model.ExecutionObservation{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid runtime execution result"}
+	}
+	return wiremap.ParseExecution(result.Execution, expectedHost)
+}
+
+func (s *Server) validateAndLogRuntimeExecution(kind string, result *le0xv1.ExecutionResult, expectedHost identity.HostID) (model.ExecutionObservation, error) {
+	parsed, err := parseRuntimeExecution(result, expectedHost)
+	if err != nil {
+		s.log("%s: invalid runtime execution result", strings.ToUpper(kind))
+		return model.ExecutionObservation{}, err
+	}
+	s.logExecution(kind, parsed, result.Message)
+	return parsed, nil
+}
+
+func safeRuntimeDiagnostic(value string, limit int) bool {
+	if len(value) > limit || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) logExecution(kind string, execution model.ExecutionObservation, message string) {
+	s.log("%s: %s state=%s pid=%d restart_count=%d message=%q last_error=%q", strings.ToUpper(kind), execution.ExecutionID, execution.Status, execution.PID, execution.RestartCount, message, execution.LastError)
 	for _, warning := range execution.Warnings {
 		s.log("EXECUTION WARNING: %s", warning)
 	}
-	if telemetry := execution.GetMinerTelemetry(); telemetry != nil {
+	if telemetry := execution.MinerTelemetry; telemetry != nil {
 		hashrate := "unavailable"
-		if telemetry.HashrateShortHps != nil {
-			hashrate = fmt.Sprintf("%.3f H/s", telemetry.GetHashrateShortHps())
+		if telemetry.HashrateShortHPS != nil {
+			hashrate = fmt.Sprintf("%.3f H/s", *telemetry.HashrateShortHPS)
 		}
 		hugePages, msr := "unreported", "unreported"
 		if telemetry.HugePagesPercent != nil {
-			hugePages = fmt.Sprintf("%.1f%%", telemetry.GetHugePagesPercent())
+			hugePages = fmt.Sprintf("%.1f%%", *telemetry.HugePagesPercent)
 		}
-		if telemetry.MsrAvailable != nil {
-			msr = fmt.Sprintf("%t", telemetry.GetMsrAvailable())
+		if telemetry.MSRAvailable != nil {
+			msr = fmt.Sprintf("%t", *telemetry.MSRAvailable)
 		}
-		s.log("MINER: adapter=%s version=%s algorithm=%s health=%s hashrate=%s age=%dms huge_pages=%s msr_available=%s error=%s", telemetry.AdapterId, telemetry.MinerVersion, telemetry.Algorithm, telemetry.Health, hashrate, telemetry.AgeMilliseconds, hugePages, msr, telemetry.ErrorCode)
+		s.log("MINER: adapter=%s version=%s algorithm=%s health=%s hashrate=%s age=%dms huge_pages=%s msr_available=%s error=%s", telemetry.AdapterID, telemetry.MinerVersion, telemetry.Algorithm, telemetry.Health, hashrate, telemetry.Age.Milliseconds(), hugePages, msr, telemetry.ErrorCode)
+	}
+	if evidence := execution.UsefulWork; evidence != nil {
+		s.log("USEFUL_WORK: provider=%s availability=%s state=%s upstream=%s confidence=%s age=%dms accepted_known=%t error=%s", evidence.Provider, evidence.Availability, evidence.UsefulWork, evidence.Upstream, evidence.Confidence, evidence.Age.Milliseconds(), evidence.AcceptedWork != nil, evidence.ReasonCode)
 	}
 }
 

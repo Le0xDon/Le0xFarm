@@ -2,6 +2,7 @@ package xmrig
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -162,11 +163,55 @@ func TestParseSummaryFixture(t *testing.T) {
 	if got.AcceptedShares == nil || *got.AcceptedShares != 0 || got.RejectedShares == nil || *got.RejectedShares != 0 || got.TotalResults == nil || *got.TotalResults != 0 || got.PoolLatencyMS == nil || *got.PoolLatencyMS != 0 || got.HugePagesPercent == nil || *got.HugePagesPercent != 0 {
 		t.Fatalf("result parse=%+v", got)
 	}
+	if got.UsefulWork == nil || got.UsefulWork.Provider != AdapterID || got.UsefulWork.Availability != model.TelemetryAvailable || got.UsefulWork.UsefulWork != model.UsefulWorkConfirmed || got.UsefulWork.Upstream != model.UpstreamConnected || got.UsefulWork.AcceptedWork == nil || len(got.UsefulWork.Metrics) != 1 || got.UsefulWork.Metrics[0].Kind != "HASHRATE_CURRENT" {
+		t.Fatalf("useful-work evidence=%+v", got.UsefulWork)
+	}
 	if _, err := ParseSummary([]byte("{")); err == nil {
 		t.Fatal("malformed JSON accepted")
 	}
 	if got, err := ParseSummary([]byte(`{"version":"6.26.0","future":true}`)); err != nil || got.MinerVersion != Version {
 		t.Fatalf("missing/unknown fields: %+v %v", got, err)
+	}
+	if _, err := ParseSummary([]byte(`{"hashrate":{"total":[-1]}}`)); err == nil {
+		t.Fatal("negative hashrate accepted")
+	}
+	if _, err := ParseSummary([]byte(`{"results":{"shares_good":2,"shares_total":1}}`)); err == nil {
+		t.Fatal("inconsistent share counters accepted")
+	}
+}
+
+func TestParseSummaryDistinguishesZeroUnknownUnavailableAndProviderHealth(t *testing.T) {
+	zero, err := ParseSummary([]byte(`{"version":"6.26.0","hashrate":{"total":[0]},"results":{"shares_good":0,"shares_total":0},"connection":{"pool":"pool.example:443"}}`))
+	if err != nil || zero.HashrateShortHPS == nil || *zero.HashrateShortHPS != 0 || zero.UsefulWork.UsefulWork != model.UsefulWorkNotConfirmed || zero.UsefulWork.ReasonCode != farmerr.ZERO_HASHRATE {
+		t.Fatalf("explicit zero=%+v err=%v", zero, err)
+	}
+	unknown, err := ParseSummary([]byte(`{"version":"6.26.0","hashrate":{"total":[]},"results":{},"connection":{"pool":"pool.example:443"}}`))
+	if err != nil || unknown.HashrateShortHPS != nil || unknown.UsefulWork.UsefulWork != model.UsefulWorkUnknown || unknown.UsefulWork.ReasonCode != "" {
+		t.Fatalf("unknown hashrate=%+v err=%v", unknown, err)
+	}
+	disconnected, err := ParseSummary([]byte(`{"version":"6.26.0","hashrate":{"total":[10]},"results":{},"connection":{"pool":""}}`))
+	if err != nil || disconnected.UsefulWork.Upstream != model.UpstreamDisconnected || disconnected.UsefulWork.ReasonCode != farmerr.POOL_UNREACHABLE {
+		t.Fatalf("disconnected=%+v err=%v", disconnected, err)
+	}
+	rejects, err := ParseSummary([]byte(`{"version":"6.26.0","hashrate":{"total":[10]},"results":{"shares_good":7,"shares_total":10},"connection":{"pool":"pool.example:443"}}`))
+	if err != nil || rejects.UsefulWork.ReasonCode != farmerr.TOO_MANY_REJECTS || rejects.UsefulWork.UsefulWork != model.UsefulWorkNotConfirmed {
+		t.Fatalf("reject evidence=%+v err=%v", rejects, err)
+	}
+}
+
+func TestSourceTracksAcceptedWorkWithoutLeakingEndpoint(t *testing.T) {
+	now := time.Unix(10_000, 0).UTC()
+	payload := []byte(`{"version":"6.26.0","hashrate":{"total":[10]},"results":{"shares_good":1,"shares_total":1},"connection":{"pool":"secret-user:secret-password@private.pool.example:443"}}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(payload) }))
+	defer server.Close()
+	source := &Source{URL: server.URL, Client: localHTTPClient(time.Second), MSRAvailable: func() bool { return false }, Now: func() time.Time { return now }}
+	got, err := source.Poll(context.Background())
+	if err != nil || got.UsefulWork.LastUsefulWorkAt == nil || !got.UsefulWork.LastUsefulWorkAt.Equal(now) || !got.UsefulWork.CollectedAt.Equal(now) {
+		t.Fatalf("accepted work timestamp=%+v err=%v", got, err)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil || strings.Contains(string(encoded), "secret-user") || strings.Contains(string(encoded), "secret-password") || strings.Contains(string(encoded), "private.pool.example") {
+		t.Fatalf("endpoint leaked in normalized telemetry: %s err=%v", encoded, err)
 	}
 }
 

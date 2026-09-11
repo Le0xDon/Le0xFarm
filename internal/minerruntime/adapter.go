@@ -139,6 +139,7 @@ type Manager struct {
 	inventory      model.Inventory
 	config         Config
 	executions     map[identity.ExecutionID]*minerExecution
+	telemetryEpoch uint64
 }
 
 type minerExecution struct {
@@ -538,6 +539,18 @@ func (m *Manager) OverallStatus() model.AgentState {
 	return aggregateOverallStatus(items)
 }
 
+// RequireFreshTelemetry drops pre-session evidence without affecting the
+// process or watchdog. A new Controller epoch must observe a new adapter poll
+// before it can report useful work as confirmed.
+func (m *Manager) RequireFreshTelemetry() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.telemetryEpoch++
+	for _, entry := range m.executions {
+		entry.telemetry = nil
+	}
+}
+
 type overallStatusItem struct {
 	mode      model.MinerMode
 	process   supervisor.Snapshot
@@ -608,25 +621,45 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 
 func (m *Manager) poll(ctx context.Context, id identity.ExecutionID, entry *minerExecution) {
 	poll := func() {
+		m.mu.Lock()
+		pollEpoch := m.telemetryEpoch
+		m.mu.Unlock()
+		processBefore, existsBefore := m.supervisor.Get(id)
 		telemetry, err := entry.prepared.Telemetry.Poll(ctx)
+		processAfter, existsAfter := m.supervisor.Get(id)
 		now := m.config.Now().UTC()
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if m.executions[id] != entry {
+		if m.executions[id] != entry || m.telemetryEpoch != pollEpoch || !existsBefore || !existsAfter || processAfter.State != model.ExecutionRunning || processBefore.PID <= 0 || processBefore.PID != processAfter.PID || processBefore.StartedAt.IsZero() || !processBefore.StartedAt.Equal(processAfter.StartedAt) || processBefore.ProcessInstance == "" || processBefore.ProcessInstance != processAfter.ProcessInstance {
 			return
 		}
 		if err != nil {
 			message := telemetryErrorMessage(err)
 			if entry.telemetry == nil {
-				entry.telemetry = &model.MinerTelemetry{AdapterID: entry.plan.Miner.AdapterID, Health: model.MinerHealthStarting, Message: message}
+				entry.telemetry = &model.MinerTelemetry{AdapterID: entry.plan.Miner.AdapterID, Health: model.MinerHealthStarting, Message: message, UsefulWork: &model.UsefulWorkEvidence{Provider: entry.plan.Miner.AdapterID, Availability: model.TelemetryUnavailable, UsefulWork: model.UsefulWorkUnknown, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceUnknown, ReasonCode: farmerr.TELEMETRY_UNAVAILABLE}}
 			} else {
 				entry.telemetry.Age = now.Sub(entry.telemetry.CollectedAt)
 				entry.telemetry.Message = message
+				if entry.telemetry.UsefulWork == nil {
+					entry.telemetry.UsefulWork = &model.UsefulWorkEvidence{Provider: entry.plan.Miner.AdapterID, UsefulWork: model.UsefulWorkUnknown, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceUnknown}
+				}
+				entry.telemetry.UsefulWork.Availability = model.TelemetryUnavailable
+				entry.telemetry.UsefulWork.Age = entry.telemetry.Age
+				entry.telemetry.UsefulWork.ReasonCode = farmerr.TELEMETRY_UNAVAILABLE
 			}
+			return
+		}
+		if telemetry == nil {
+			entry.telemetry = &model.MinerTelemetry{AdapterID: entry.plan.Miner.AdapterID, Health: model.MinerHealthStarting, Message: "miner telemetry unavailable", UsefulWork: &model.UsefulWorkEvidence{Provider: entry.plan.Miner.AdapterID, Availability: model.TelemetryUnavailable, UsefulWork: model.UsefulWorkUnknown, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceUnknown, ReasonCode: farmerr.TELEMETRY_UNAVAILABLE}}
 			return
 		}
 		telemetry.CollectedAt = now
 		telemetry.Age = 0
+		if telemetry.UsefulWork != nil {
+			telemetry.UsefulWork.CollectedAt = now
+			telemetry.UsefulWork.Age = 0
+			telemetry.UsefulWork.FreshFor = m.config.StaleAfter
+		}
 		entry.telemetry = telemetry
 	}
 	poll()
@@ -659,11 +692,14 @@ func (m *Manager) observationLocked(entry *minerExecution, process supervisor.Sn
 	}
 	var telemetry *model.MinerTelemetry
 	if entry.telemetry != nil {
-		copy := *entry.telemetry
+		copy := cloneTelemetry(entry.telemetry)
 		if !copy.CollectedAt.IsZero() {
 			copy.Age = m.config.Now().UTC().Sub(copy.CollectedAt)
 		}
-		telemetry = &copy
+		if copy.UsefulWork != nil && !copy.UsefulWork.CollectedAt.IsZero() {
+			copy.UsefulWork.Age = m.config.Now().UTC().Sub(copy.UsefulWork.CollectedAt)
+		}
+		telemetry = copy
 	}
 	telemetry = Evaluate(entry.plan.Miner.Mode, process, telemetry, m.config.Now().UTC(), m.config.StartupGrace, m.config.StaleAfter)
 	return Observation{Process: process, Telemetry: telemetry, Warnings: append([]string(nil), entry.warnings...)}
@@ -686,48 +722,130 @@ func Evaluate(mode model.MinerMode, process supervisor.Snapshot, telemetry *mode
 		return telemetry
 	}
 	withinGrace := !process.StartedAt.IsZero() && now.Sub(process.StartedAt) < startupGrace
-	if telemetry.CollectedAt.IsZero() || telemetry.Age > staleAfter {
+	if telemetry.CollectedAt.IsZero() || telemetry.UsefulWork == nil {
 		if withinGrace {
 			telemetry.Health = model.MinerHealthStarting
 		} else {
-			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.RPC_UNREACHABLE
+			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.TELEMETRY_UNAVAILABLE
 		}
 		return telemetry
 	}
-	hashrate := float64(0)
-	if telemetry.HashrateShortHPS != nil {
-		hashrate = *telemetry.HashrateShortHPS
+	if !process.StartedAt.IsZero() && telemetry.CollectedAt.Before(process.StartedAt) {
+		telemetry.UsefulWork.Availability = model.TelemetryUnavailable
+		telemetry.UsefulWork.ReasonCode = farmerr.TELEMETRY_UNAVAILABLE
+		if withinGrace {
+			telemetry.Health = model.MinerHealthStarting
+		} else {
+			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.TELEMETRY_UNAVAILABLE
+		}
+		return telemetry
+	}
+	if telemetry.Age > staleAfter {
+		telemetry.UsefulWork.Availability = model.TelemetryStale
+		telemetry.UsefulWork.Age = telemetry.Age
+		telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.TELEMETRY_STALE
+		return telemetry
+	}
+	if telemetry.UsefulWork.Availability != model.TelemetryAvailable {
+		if withinGrace {
+			telemetry.Health = model.MinerHealthStarting
+		} else {
+			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.TELEMETRY_UNAVAILABLE
+		}
+		return telemetry
+	}
+	if telemetry.UsefulWork.RuntimeHealthy != nil && !*telemetry.UsefulWork.RuntimeHealthy {
+		telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, telemetry.UsefulWork.ReasonCode
+		if telemetry.ErrorCode == "" {
+			telemetry.ErrorCode = farmerr.USEFUL_WORK_NOT_CONFIRMED
+		}
+		return telemetry
 	}
 	if mode == model.MinerModeMining {
-		if excessiveRejects(telemetry) {
-			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.TOO_MANY_REJECTS
-		} else if hashrate > 0 && telemetry.PoolConnected != nil && *telemetry.PoolConnected {
+		if telemetry.UsefulWork.UsefulWork == model.UsefulWorkConfirmed {
 			telemetry.Health, telemetry.ErrorCode = model.MinerHealthMining, ""
 		} else if withinGrace {
 			telemetry.Health = model.MinerHealthStarting
-		} else if hashrate <= 0 {
-			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.ZERO_HASHRATE
 		} else {
-			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.POOL_UNREACHABLE
+			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, telemetry.UsefulWork.ReasonCode
+			if telemetry.ErrorCode == "" {
+				telemetry.ErrorCode = farmerr.USEFUL_WORK_NOT_CONFIRMED
+			}
 		}
 	} else {
 		telemetry.ErrorCode = ""
 		telemetry.Health = model.MinerHealthHealthy
-		if hashrate <= 0 && !withinGrace {
-			telemetry.Health, telemetry.ErrorCode = model.MinerHealthDegraded, farmerr.ZERO_HASHRATE
-		}
 	}
 	return telemetry
 }
 
-// excessiveRejects waits for a useful sample and then treats more than 20%
-// rejected shares as degraded. Adapters only provide normalized counters.
-func excessiveRejects(telemetry *model.MinerTelemetry) bool {
-	if telemetry.AcceptedShares == nil || telemetry.RejectedShares == nil {
-		return false
+func cloneTelemetry(value *model.MinerTelemetry) *model.MinerTelemetry {
+	if value == nil {
+		return nil
 	}
-	total := *telemetry.AcceptedShares + *telemetry.RejectedShares
-	return total >= 10 && float64(*telemetry.RejectedShares)/float64(total) > 0.20
+	copy := *value
+	copy.PerDevice = append([]model.DeviceHashrate(nil), value.PerDevice...)
+	copy.HashrateShortHPS = cloneFloat64(value.HashrateShortHPS)
+	copy.HashrateMediumHPS = cloneFloat64(value.HashrateMediumHPS)
+	copy.HashrateLongHPS = cloneFloat64(value.HashrateLongHPS)
+	copy.HighestHashrateHPS = cloneFloat64(value.HighestHashrateHPS)
+	copy.AcceptedShares = cloneUint64(value.AcceptedShares)
+	copy.RejectedShares = cloneUint64(value.RejectedShares)
+	copy.StaleShares = cloneUint64(value.StaleShares)
+	copy.TotalResults = cloneUint64(value.TotalResults)
+	copy.PoolConnected = cloneBool(value.PoolConnected)
+	copy.PoolLatencyMS = cloneUint32(value.PoolLatencyMS)
+	copy.HugePagesAvailable = cloneBool(value.HugePagesAvailable)
+	copy.HugePagesPercent = cloneFloat64(value.HugePagesPercent)
+	copy.MSRAvailable = cloneBool(value.MSRAvailable)
+	if value.UsefulWork != nil {
+		evidence := *value.UsefulWork
+		evidence.RuntimeHealthy = cloneBool(value.UsefulWork.RuntimeHealthy)
+		evidence.JobPresent = cloneBool(value.UsefulWork.JobPresent)
+		evidence.AcceptedWork = cloneUint64(value.UsefulWork.AcceptedWork)
+		evidence.RejectedWork = cloneUint64(value.UsefulWork.RejectedWork)
+		evidence.StaleWork = cloneUint64(value.UsefulWork.StaleWork)
+		evidence.EndpointVisible = cloneBool(value.UsefulWork.EndpointVisible)
+		evidence.Metrics = append([]model.WorkMetric(nil), value.UsefulWork.Metrics...)
+		if value.UsefulWork.LastUsefulWorkAt != nil {
+			last := *value.UsefulWork.LastUsefulWorkAt
+			evidence.LastUsefulWorkAt = &last
+		}
+		copy.UsefulWork = &evidence
+	}
+	return &copy
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneUint32(value *uint32) *uint32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneUint64(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneFloat64(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func plansEqual(a, b model.ExecutionPlan) bool { return reflect.DeepEqual(a, b) }

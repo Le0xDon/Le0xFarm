@@ -2,8 +2,12 @@ package wiremap
 
 import (
 	"maps"
+	"math"
 	"slices"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/gpuresource"
@@ -131,7 +135,16 @@ func ParseExecution(in *le0xv1.Execution, expectedHost identity.HostID) (model.E
 	if err != nil {
 		return model.ExecutionObservation{}, err
 	}
+	if in.Pid < 0 || !safeEvidenceText(in.LastError, 512) || len(in.Warnings) > 32 {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid observed process metadata")
+	}
 	result := model.ExecutionObservation{ExecutionID: id, Ownership: ownership, Status: state, PID: int(in.Pid), RestartCount: in.RestartCount, LastError: in.LastError}
+	for _, warning := range in.Warnings {
+		if !safeEvidenceText(warning, 512) {
+			return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid observed execution warning")
+		}
+		result.Warnings = append(result.Warnings, warning)
+	}
 	if in.StartedAt != nil {
 		if err := in.StartedAt.CheckValid(); err != nil {
 			return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid observed start timestamp")
@@ -143,6 +156,17 @@ func ParseExecution(in *le0xv1.Execution, expectedHost identity.HostID) (model.E
 		result.ExitCode = &value
 	}
 	if telemetry := in.MinerTelemetry; telemetry != nil {
+		if !safeEvidenceText(telemetry.AdapterId, 64) || !safeEvidenceText(telemetry.MinerVersion, 64) || !safeEvidenceText(telemetry.Algorithm, 64) || !safeEvidenceText(telemetry.Message, 512) || !validFarmErrorCode(farmerr.Code(telemetry.ErrorCode)) || len(telemetry.PerDevice) > 64 {
+			return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "miner telemetry exceeds bounds")
+		}
+		if telemetry.AgeMilliseconds > maxDurationMilliseconds {
+			return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "miner telemetry age exceeds bounds")
+		}
+		for _, value := range []*float64{telemetry.HashrateShortHps, telemetry.HashrateMediumHps, telemetry.HashrateLongHps, telemetry.HighestHashrateHps, telemetry.HugePagesPercent} {
+			if value != nil && (*value < 0 || math.IsNaN(*value) || math.IsInf(*value, 0)) {
+				return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid miner telemetry metric")
+			}
+		}
 		parsed := &model.MinerTelemetry{AdapterID: telemetry.AdapterId, MinerVersion: telemetry.MinerVersion, Algorithm: telemetry.Algorithm,
 			HashrateShortHPS: telemetry.HashrateShortHps, HashrateMediumHPS: telemetry.HashrateMediumHps, HashrateLongHPS: telemetry.HashrateLongHps, HighestHashrateHPS: telemetry.HighestHashrateHps,
 			AcceptedShares: telemetry.AcceptedShares, RejectedShares: telemetry.RejectedShares, StaleShares: telemetry.StaleShares, TotalResults: telemetry.TotalResults,
@@ -159,15 +183,145 @@ func ParseExecution(in *le0xv1.Execution, expectedHost identity.HostID) (model.E
 			if device == nil {
 				return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid per-device telemetry")
 			}
+			if device.HashrateHps < 0 || math.IsNaN(device.HashrateHps) || math.IsInf(device.HashrateHps, 0) {
+				return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid per-device hashrate")
+			}
 			deviceID, err := identity.ParseDeviceID(device.DeviceId)
 			if err != nil {
 				return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid telemetry DeviceID")
 			}
 			parsed.PerDevice = append(parsed.PerDevice, model.DeviceHashrate{DeviceID: deviceID, HashrateHPS: device.HashrateHps})
 		}
+		switch parsed.Health {
+		case model.MinerHealthStarting, model.MinerHealthHealthy, model.MinerHealthMining, model.MinerHealthDegraded, model.MinerHealthError:
+		default:
+			return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "invalid miner health")
+		}
 		result.MinerTelemetry = parsed
 	}
+	result.UsefulWork, err = parseUsefulWork(in.UsefulWork)
+	if err != nil {
+		return model.ExecutionObservation{}, err
+	}
+	if result.Status == model.ExecutionRunning && (result.PID <= 0 || result.StartedAt.IsZero()) {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "RUNNING lacks a live process identity")
+	}
+	if result.PID > 0 && result.StartedAt.IsZero() {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "observed PID lacks a process start timestamp")
+	}
+	activeConfirmed := result.UsefulWork != nil && result.UsefulWork.Availability == model.TelemetryAvailable && result.UsefulWork.UsefulWork == model.UsefulWorkConfirmed
+	if activeConfirmed && (result.Status != model.ExecutionRunning || result.PID <= 0 || result.StartedAt.IsZero() || result.Ownership == nil) {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "confirmed useful work lacks a running managed execution")
+	}
+	if result.MinerTelemetry != nil && result.MinerTelemetry.Health == model.MinerHealthMining && !activeConfirmed {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "MINING lacks confirmed useful-work evidence")
+	}
+	if result.MinerTelemetry != nil && result.MinerTelemetry.Health == model.MinerHealthMining && (result.Status != model.ExecutionRunning || result.PID <= 0 || result.StartedAt.IsZero() || result.Ownership == nil) {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "MINING lacks a running managed execution")
+	}
+	if result.MinerTelemetry != nil && result.UsefulWork != nil && !result.MinerTelemetry.CollectedAt.IsZero() && !result.UsefulWork.CollectedAt.IsZero() && !result.MinerTelemetry.CollectedAt.Equal(result.UsefulWork.CollectedAt) {
+		return model.ExecutionObservation{}, typed(farmerr.CONFIG_CONFLICT, "telemetry and useful-work sample timestamps differ")
+	}
 	return result, nil
+}
+
+func parseUsefulWork(in *le0xv1.UsefulWorkEvidence) (*model.UsefulWorkEvidence, error) {
+	if in == nil {
+		return nil, nil
+	}
+	if in.Provider == "" || !safeEvidenceText(in.Provider, 64) || strings.TrimSpace(in.Provider) != in.Provider || len(in.Metrics) > 32 || !safeEvidenceText(in.ReasonCode, 64) || !validFarmErrorCode(farmerr.Code(in.ReasonCode)) || in.AgeMilliseconds > maxDurationMilliseconds || in.FreshForMilliseconds > maxDurationMilliseconds {
+		return nil, typed(farmerr.CONFIG_CONFLICT, "invalid useful-work evidence metadata")
+	}
+	availability := model.TelemetryAvailability(in.Availability)
+	switch availability {
+	case model.TelemetryUnknown, model.TelemetryAvailable, model.TelemetryUnavailable, model.TelemetryStale:
+	default:
+		return nil, typed(farmerr.CONFIG_CONFLICT, "invalid telemetry availability")
+	}
+	useful := model.UsefulWorkState(in.UsefulWork)
+	switch useful {
+	case model.UsefulWorkUnknown, model.UsefulWorkConfirmed, model.UsefulWorkNotConfirmed:
+	default:
+		return nil, typed(farmerr.CONFIG_CONFLICT, "invalid useful-work state")
+	}
+	upstream := model.UpstreamState(in.Upstream)
+	switch upstream {
+	case model.UpstreamUnknown, model.UpstreamConnected, model.UpstreamDisconnected:
+	default:
+		return nil, typed(farmerr.CONFIG_CONFLICT, "invalid upstream state")
+	}
+	confidence := model.EvidenceConfidence(in.Confidence)
+	switch confidence {
+	case model.EvidenceConfidenceUnknown, model.EvidenceConfidenceAdapterReported, model.EvidenceConfidenceUpstreamVerified:
+	default:
+		return nil, typed(farmerr.CONFIG_CONFLICT, "invalid evidence confidence")
+	}
+	result := &model.UsefulWorkEvidence{Provider: in.Provider, Availability: availability, RuntimeHealthy: cloneBool(in.RuntimeHealthy), JobPresent: cloneBool(in.JobPresent), UsefulWork: useful, AcceptedWork: cloneUint64(in.AcceptedWork), RejectedWork: cloneUint64(in.RejectedWork), StaleWork: cloneUint64(in.StaleWork), Upstream: upstream, EndpointVisible: cloneBool(in.EndpointVisible), Confidence: confidence, Age: time.Duration(in.AgeMilliseconds) * time.Millisecond, FreshFor: time.Duration(in.FreshForMilliseconds) * time.Millisecond, ReasonCode: farmerr.Code(in.ReasonCode)}
+	if in.CollectedAt != nil {
+		if err := in.CollectedAt.CheckValid(); err != nil {
+			return nil, typed(farmerr.CONFIG_CONFLICT, "invalid useful-work collection timestamp")
+		}
+		result.CollectedAt = in.CollectedAt.AsTime().UTC()
+	}
+	if (availability == model.TelemetryAvailable || availability == model.TelemetryStale) && result.CollectedAt.IsZero() {
+		return nil, typed(farmerr.CONFIG_CONFLICT, "available useful-work evidence lacks collection timestamp")
+	}
+	if availability == model.TelemetryAvailable && result.FreshFor <= 0 {
+		return nil, typed(farmerr.CONFIG_CONFLICT, "available useful-work evidence lacks a freshness bound")
+	}
+	if useful == model.UsefulWorkConfirmed && availability == model.TelemetryAvailable && result.RuntimeHealthy != nil && !*result.RuntimeHealthy {
+		return nil, typed(farmerr.CONFIG_CONFLICT, "confirmed useful work contradicts runtime health")
+	}
+	if in.LastUsefulWorkAt != nil {
+		if err := in.LastUsefulWorkAt.CheckValid(); err != nil {
+			return nil, typed(farmerr.CONFIG_CONFLICT, "invalid last useful-work timestamp")
+		}
+		value := in.LastUsefulWorkAt.AsTime().UTC()
+		if !result.CollectedAt.IsZero() && value.After(result.CollectedAt) {
+			return nil, typed(farmerr.CONFIG_CONFLICT, "last useful-work timestamp is newer than its sample")
+		}
+		result.LastUsefulWorkAt = &value
+	}
+	for _, metric := range in.Metrics {
+		if metric == nil || metric.Kind == "" || metric.Unit == "" || !safeEvidenceText(metric.Kind, 64) || !safeEvidenceText(metric.Unit, 32) || metric.Value < 0 || math.IsNaN(metric.Value) || math.IsInf(metric.Value, 0) {
+			return nil, typed(farmerr.CONFIG_CONFLICT, "invalid useful-work metric")
+		}
+		result.Metrics = append(result.Metrics, model.WorkMetric{Kind: metric.Kind, Unit: metric.Unit, Value: metric.Value})
+	}
+	return result, nil
+}
+
+const maxDurationMilliseconds = uint64((1<<63 - 1) / int64(time.Millisecond))
+
+func safeEvidenceText(value string, limit int) bool {
+	if len(value) > limit || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validFarmErrorCode(code farmerr.Code) bool {
+	switch code {
+	case "", farmerr.MISSING_DEPENDENCY, farmerr.MISSING_COMMAND, farmerr.MISSING_WALLET, farmerr.MISSING_POOL,
+		farmerr.PACKAGE_NOT_INSTALLED, farmerr.PACKAGE_HASH_MISMATCH, farmerr.INCOMPATIBLE_HARDWARE, farmerr.INSUFFICIENT_DISK,
+		farmerr.SERVICE_NOT_READY, farmerr.RPC_UNREACHABLE, farmerr.TELEMETRY_UNAVAILABLE, farmerr.TELEMETRY_STALE,
+		farmerr.USEFUL_WORK_NOT_CONFIRMED, farmerr.POOL_UNREACHABLE, farmerr.STARTUP_TIMEOUT, farmerr.ZERO_HASHRATE,
+		farmerr.TOO_MANY_REJECTS, farmerr.PERMISSION_DENIED, farmerr.PORT_CONFLICT, farmerr.PROCESS_CRASHED,
+		farmerr.MAINTENANCE_HOLD, farmerr.UNMANAGED_PROCESS_CONFLICT, farmerr.UNMANAGED_OBSERVATION_FAILED,
+		farmerr.CONFIG_CONFLICT, farmerr.SIGNATURE_INVALID, farmerr.PROTOCOL_VERSION_MISMATCH, farmerr.SCHEMA_VERSION_MISMATCH,
+		farmerr.PAIRING_REQUIRED, farmerr.PAIRING_TOKEN_INVALID, farmerr.PAIRING_TOKEN_EXPIRED,
+		farmerr.CONTROLLER_IDENTITY_MISMATCH, farmerr.TLS_CREDENTIALS_REQUIRED, farmerr.TLS_FINGERPRINT_MISMATCH,
+		farmerr.TLS_IDENTITY_MISMATCH, farmerr.CERTIFICATE_EXPIRED, farmerr.NOT_FOUND, farmerr.ALREADY_EXISTS,
+		farmerr.REVISION_CONFLICT, farmerr.REFERENCE_IN_USE, farmerr.INVALID_REFERENCE, farmerr.INTERNAL_ERROR:
+		return true
+	default:
+		return false
+	}
 }
 
 func ParseInventory(in *le0xv1.Inventory, expectedHost identity.HostID) (model.Inventory, error) {
@@ -205,6 +359,14 @@ func Timestamp(value time.Time) *timestamppb.Timestamp {
 }
 
 func cloneUint32(value *uint32) *uint32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneUint64(value *uint64) *uint64 {
 	if value == nil {
 		return nil
 	}

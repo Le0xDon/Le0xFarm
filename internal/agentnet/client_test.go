@@ -106,7 +106,9 @@ func TestAgentRetainsAndEchoesOwnershipMetadata(t *testing.T) {
 func TestControllerFacingTelemetryIsAdapterNeutral(t *testing.T) {
 	executionID, _ := identity.NewExecutionID()
 	hashrate := 77.25
-	wire := wireObservation(minerruntime.Observation{Process: supervisor.Snapshot{ExecutionID: executionID, State: model.ExecutionRunning, PID: 42}, Telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", MinerVersion: "1.0", HashrateShortHPS: &hashrate, Health: model.MinerHealthHealthy}})
+	healthy := true
+	accepted := uint64(0)
+	wire := wireObservation(minerruntime.Observation{Process: supervisor.Snapshot{ExecutionID: executionID, State: model.ExecutionRunning, PID: 42}, Telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", MinerVersion: "1.0", HashrateShortHPS: &hashrate, Health: model.MinerHealthMining, UsefulWork: &model.UsefulWorkEvidence{Provider: "test-no-http", Availability: model.TelemetryAvailable, RuntimeHealthy: &healthy, UsefulWork: model.UsefulWorkConfirmed, AcceptedWork: &accepted, Upstream: model.UpstreamUnknown, Metrics: []model.WorkMetric{{Kind: "CUSTOM_THROUGHPUT", Unit: "UNIT/S", Value: 0}}, Confidence: model.EvidenceConfidenceAdapterReported}}})
 	encoded, err := proto.Marshal(wire)
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +117,7 @@ func TestControllerFacingTelemetryIsAdapterNeutral(t *testing.T) {
 	if err := proto.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.GetMinerTelemetry().GetAdapterId() != "test-no-http" || decoded.GetMinerTelemetry().GetHashrateShortHps() != hashrate {
+	if decoded.GetMinerTelemetry().GetAdapterId() != "test-no-http" || decoded.GetMinerTelemetry().GetHashrateShortHps() != hashrate || decoded.GetUsefulWork().GetUsefulWork() != "CONFIRMED" || decoded.GetUsefulWork().AcceptedWork == nil || decoded.GetUsefulWork().GetAcceptedWork() != 0 || decoded.GetUsefulWork().GetMetrics()[0].GetKind() != "CUSTOM_THROUGHPUT" {
 		t.Fatalf("generic adapter telemetry did not reach Controller-facing wire model: %+v", decoded.GetMinerTelemetry())
 	}
 }
@@ -316,7 +318,7 @@ func TestCommandMappingPreservesNonce(t *testing.T) {
 	if !bytes.Equal(ping.GetPing().GetNonce(), nonce) {
 		t.Fatal("nonce changed")
 	}
-	if uint32(protocol.CurrentProtocolVersion) != 5 {
+	if uint32(protocol.CurrentProtocolVersion) != 6 {
 		t.Fatal("unexpected protocol test baseline")
 	}
 }

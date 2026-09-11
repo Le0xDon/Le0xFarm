@@ -1211,6 +1211,7 @@ type Execution struct {
 	MinerTelemetry *MinerTelemetry        `protobuf:"bytes,9,opt,name=miner_telemetry,json=minerTelemetry,proto3" json:"miner_telemetry,omitempty"`
 	Warnings       []string               `protobuf:"bytes,10,rep,name=warnings,proto3" json:"warnings,omitempty"`
 	Ownership      *WorkloadOwnership     `protobuf:"bytes,11,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	UsefulWork     *UsefulWorkEvidence    `protobuf:"bytes,12,opt,name=useful_work,json=usefulWork,proto3" json:"useful_work,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1322,6 +1323,13 @@ func (x *Execution) GetOwnership() *WorkloadOwnership {
 	return nil
 }
 
+func (x *Execution) GetUsefulWork() *UsefulWorkEvidence {
+	if x != nil {
+		return x.UsefulWork
+	}
+	return nil
+}
+
 type DeviceHashrate struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	DeviceId      string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
@@ -1374,6 +1382,238 @@ func (x *DeviceHashrate) GetHashrateHps() float64 {
 	return 0
 }
 
+type WorkMetric struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Kind          string                 `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"`
+	Unit          string                 `protobuf:"bytes,2,opt,name=unit,proto3" json:"unit,omitempty"`
+	Value         float64                `protobuf:"fixed64,3,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkMetric) Reset() {
+	*x = WorkMetric{}
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkMetric) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkMetric) ProtoMessage() {}
+
+func (x *WorkMetric) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkMetric.ProtoReflect.Descriptor instead.
+func (*WorkMetric) Descriptor() ([]byte, []int) {
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *WorkMetric) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
+}
+
+func (x *WorkMetric) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
+func (x *WorkMetric) GetValue() float64 {
+	if x != nil {
+		return x.Value
+	}
+	return 0
+}
+
+type UsefulWorkEvidence struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Provider             string                 `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
+	Availability         string                 `protobuf:"bytes,2,opt,name=availability,proto3" json:"availability,omitempty"`
+	RuntimeHealthy       *bool                  `protobuf:"varint,3,opt,name=runtime_healthy,json=runtimeHealthy,proto3,oneof" json:"runtime_healthy,omitempty"`
+	JobPresent           *bool                  `protobuf:"varint,4,opt,name=job_present,json=jobPresent,proto3,oneof" json:"job_present,omitempty"`
+	UsefulWork           string                 `protobuf:"bytes,5,opt,name=useful_work,json=usefulWork,proto3" json:"useful_work,omitempty"`
+	AcceptedWork         *uint64                `protobuf:"varint,6,opt,name=accepted_work,json=acceptedWork,proto3,oneof" json:"accepted_work,omitempty"`
+	RejectedWork         *uint64                `protobuf:"varint,7,opt,name=rejected_work,json=rejectedWork,proto3,oneof" json:"rejected_work,omitempty"`
+	StaleWork            *uint64                `protobuf:"varint,8,opt,name=stale_work,json=staleWork,proto3,oneof" json:"stale_work,omitempty"`
+	LastUsefulWorkAt     *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=last_useful_work_at,json=lastUsefulWorkAt,proto3" json:"last_useful_work_at,omitempty"`
+	Upstream             string                 `protobuf:"bytes,10,opt,name=upstream,proto3" json:"upstream,omitempty"`
+	EndpointVisible      *bool                  `protobuf:"varint,11,opt,name=endpoint_visible,json=endpointVisible,proto3,oneof" json:"endpoint_visible,omitempty"`
+	Metrics              []*WorkMetric          `protobuf:"bytes,12,rep,name=metrics,proto3" json:"metrics,omitempty"`
+	Confidence           string                 `protobuf:"bytes,13,opt,name=confidence,proto3" json:"confidence,omitempty"`
+	CollectedAt          *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=collected_at,json=collectedAt,proto3" json:"collected_at,omitempty"`
+	AgeMilliseconds      uint64                 `protobuf:"varint,15,opt,name=age_milliseconds,json=ageMilliseconds,proto3" json:"age_milliseconds,omitempty"`
+	ReasonCode           string                 `protobuf:"bytes,16,opt,name=reason_code,json=reasonCode,proto3" json:"reason_code,omitempty"`
+	FreshForMilliseconds uint64                 `protobuf:"varint,17,opt,name=fresh_for_milliseconds,json=freshForMilliseconds,proto3" json:"fresh_for_milliseconds,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *UsefulWorkEvidence) Reset() {
+	*x = UsefulWorkEvidence{}
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UsefulWorkEvidence) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UsefulWorkEvidence) ProtoMessage() {}
+
+func (x *UsefulWorkEvidence) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UsefulWorkEvidence.ProtoReflect.Descriptor instead.
+func (*UsefulWorkEvidence) Descriptor() ([]byte, []int) {
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *UsefulWorkEvidence) GetProvider() string {
+	if x != nil {
+		return x.Provider
+	}
+	return ""
+}
+
+func (x *UsefulWorkEvidence) GetAvailability() string {
+	if x != nil {
+		return x.Availability
+	}
+	return ""
+}
+
+func (x *UsefulWorkEvidence) GetRuntimeHealthy() bool {
+	if x != nil && x.RuntimeHealthy != nil {
+		return *x.RuntimeHealthy
+	}
+	return false
+}
+
+func (x *UsefulWorkEvidence) GetJobPresent() bool {
+	if x != nil && x.JobPresent != nil {
+		return *x.JobPresent
+	}
+	return false
+}
+
+func (x *UsefulWorkEvidence) GetUsefulWork() string {
+	if x != nil {
+		return x.UsefulWork
+	}
+	return ""
+}
+
+func (x *UsefulWorkEvidence) GetAcceptedWork() uint64 {
+	if x != nil && x.AcceptedWork != nil {
+		return *x.AcceptedWork
+	}
+	return 0
+}
+
+func (x *UsefulWorkEvidence) GetRejectedWork() uint64 {
+	if x != nil && x.RejectedWork != nil {
+		return *x.RejectedWork
+	}
+	return 0
+}
+
+func (x *UsefulWorkEvidence) GetStaleWork() uint64 {
+	if x != nil && x.StaleWork != nil {
+		return *x.StaleWork
+	}
+	return 0
+}
+
+func (x *UsefulWorkEvidence) GetLastUsefulWorkAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastUsefulWorkAt
+	}
+	return nil
+}
+
+func (x *UsefulWorkEvidence) GetUpstream() string {
+	if x != nil {
+		return x.Upstream
+	}
+	return ""
+}
+
+func (x *UsefulWorkEvidence) GetEndpointVisible() bool {
+	if x != nil && x.EndpointVisible != nil {
+		return *x.EndpointVisible
+	}
+	return false
+}
+
+func (x *UsefulWorkEvidence) GetMetrics() []*WorkMetric {
+	if x != nil {
+		return x.Metrics
+	}
+	return nil
+}
+
+func (x *UsefulWorkEvidence) GetConfidence() string {
+	if x != nil {
+		return x.Confidence
+	}
+	return ""
+}
+
+func (x *UsefulWorkEvidence) GetCollectedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CollectedAt
+	}
+	return nil
+}
+
+func (x *UsefulWorkEvidence) GetAgeMilliseconds() uint64 {
+	if x != nil {
+		return x.AgeMilliseconds
+	}
+	return 0
+}
+
+func (x *UsefulWorkEvidence) GetReasonCode() string {
+	if x != nil {
+		return x.ReasonCode
+	}
+	return ""
+}
+
+func (x *UsefulWorkEvidence) GetFreshForMilliseconds() uint64 {
+	if x != nil {
+		return x.FreshForMilliseconds
+	}
+	return 0
+}
+
 type MinerTelemetry struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	AdapterId          string                 `protobuf:"bytes,1,opt,name=adapter_id,json=adapterId,proto3" json:"adapter_id,omitempty"`
@@ -1405,7 +1645,7 @@ type MinerTelemetry struct {
 
 func (x *MinerTelemetry) Reset() {
 	*x = MinerTelemetry{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1417,7 +1657,7 @@ func (x *MinerTelemetry) String() string {
 func (*MinerTelemetry) ProtoMessage() {}
 
 func (x *MinerTelemetry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[21]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1430,7 +1670,7 @@ func (x *MinerTelemetry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MinerTelemetry.ProtoReflect.Descriptor instead.
 func (*MinerTelemetry) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{21}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *MinerTelemetry) GetAdapterId() string {
@@ -1604,7 +1844,7 @@ type ExecutionResult struct {
 
 func (x *ExecutionResult) Reset() {
 	*x = ExecutionResult{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1616,7 +1856,7 @@ func (x *ExecutionResult) String() string {
 func (*ExecutionResult) ProtoMessage() {}
 
 func (x *ExecutionResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[22]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1629,7 +1869,7 @@ func (x *ExecutionResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionResult.ProtoReflect.Descriptor instead.
 func (*ExecutionResult) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{22}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ExecutionResult) GetExecution() *Execution {
@@ -1655,7 +1895,7 @@ type Executions struct {
 
 func (x *Executions) Reset() {
 	*x = Executions{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1667,7 +1907,7 @@ func (x *Executions) String() string {
 func (*Executions) ProtoMessage() {}
 
 func (x *Executions) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[23]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1680,7 +1920,7 @@ func (x *Executions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Executions.ProtoReflect.Descriptor instead.
 func (*Executions) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{23}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *Executions) GetExecutions() []*Execution {
@@ -1701,7 +1941,7 @@ type ProcessEvidence struct {
 
 func (x *ProcessEvidence) Reset() {
 	*x = ProcessEvidence{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1713,7 +1953,7 @@ func (x *ProcessEvidence) String() string {
 func (*ProcessEvidence) ProtoMessage() {}
 
 func (x *ProcessEvidence) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[24]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1726,7 +1966,7 @@ func (x *ProcessEvidence) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProcessEvidence.ProtoReflect.Descriptor instead.
 func (*ProcessEvidence) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{24}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ProcessEvidence) GetKind() string {
@@ -1768,7 +2008,7 @@ type UnmanagedProcess struct {
 
 func (x *UnmanagedProcess) Reset() {
 	*x = UnmanagedProcess{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1780,7 +2020,7 @@ func (x *UnmanagedProcess) String() string {
 func (*UnmanagedProcess) ProtoMessage() {}
 
 func (x *UnmanagedProcess) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[25]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1793,7 +2033,7 @@ func (x *UnmanagedProcess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnmanagedProcess.ProtoReflect.Descriptor instead.
 func (*UnmanagedProcess) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{25}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *UnmanagedProcess) GetPid() int64 {
@@ -1875,7 +2115,7 @@ type UnmanagedProcesses struct {
 
 func (x *UnmanagedProcesses) Reset() {
 	*x = UnmanagedProcesses{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[26]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1887,7 +2127,7 @@ func (x *UnmanagedProcesses) String() string {
 func (*UnmanagedProcesses) ProtoMessage() {}
 
 func (x *UnmanagedProcesses) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[26]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1900,7 +2140,7 @@ func (x *UnmanagedProcesses) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnmanagedProcesses.ProtoReflect.Descriptor instead.
 func (*UnmanagedProcesses) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{26}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *UnmanagedProcesses) GetProcesses() []*UnmanagedProcess {
@@ -1920,7 +2160,7 @@ type MaintenanceHoldState struct {
 
 func (x *MaintenanceHoldState) Reset() {
 	*x = MaintenanceHoldState{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[27]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1932,7 +2172,7 @@ func (x *MaintenanceHoldState) String() string {
 func (*MaintenanceHoldState) ProtoMessage() {}
 
 func (x *MaintenanceHoldState) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[27]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1945,7 +2185,7 @@ func (x *MaintenanceHoldState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MaintenanceHoldState.ProtoReflect.Descriptor instead.
 func (*MaintenanceHoldState) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{27}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *MaintenanceHoldState) GetActive() bool {
@@ -1973,7 +2213,7 @@ type Status struct {
 
 func (x *Status) Reset() {
 	*x = Status{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[28]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1985,7 +2225,7 @@ func (x *Status) String() string {
 func (*Status) ProtoMessage() {}
 
 func (x *Status) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[28]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1998,7 +2238,7 @@ func (x *Status) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Status.ProtoReflect.Descriptor instead.
 func (*Status) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{28}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *Status) GetAgentState() string {
@@ -2035,7 +2275,7 @@ type Inventory struct {
 
 func (x *Inventory) Reset() {
 	*x = Inventory{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[29]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2047,7 +2287,7 @@ func (x *Inventory) String() string {
 func (*Inventory) ProtoMessage() {}
 
 func (x *Inventory) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[29]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2060,7 +2300,7 @@ func (x *Inventory) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Inventory.ProtoReflect.Descriptor instead.
 func (*Inventory) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{29}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *Inventory) GetHostId() string {
@@ -2153,7 +2393,7 @@ type GPU struct {
 
 func (x *GPU) Reset() {
 	*x = GPU{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[30]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2165,7 +2405,7 @@ func (x *GPU) String() string {
 func (*GPU) ProtoMessage() {}
 
 func (x *GPU) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[30]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2178,7 +2418,7 @@ func (x *GPU) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GPU.ProtoReflect.Descriptor instead.
 func (*GPU) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{30}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *GPU) GetDeviceId() string {
@@ -2229,7 +2469,7 @@ type TypedError struct {
 
 func (x *TypedError) Reset() {
 	*x = TypedError{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[31]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2241,7 +2481,7 @@ func (x *TypedError) String() string {
 func (*TypedError) ProtoMessage() {}
 
 func (x *TypedError) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[31]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2254,7 +2494,7 @@ func (x *TypedError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TypedError.ProtoReflect.Descriptor instead.
 func (*TypedError) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{31}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *TypedError) GetCode() string {
@@ -2313,7 +2553,7 @@ type CommandEnvelope struct {
 
 func (x *CommandEnvelope) Reset() {
 	*x = CommandEnvelope{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[32]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2325,7 +2565,7 @@ func (x *CommandEnvelope) String() string {
 func (*CommandEnvelope) ProtoMessage() {}
 
 func (x *CommandEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[32]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2338,7 +2578,7 @@ func (x *CommandEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandEnvelope.ProtoReflect.Descriptor instead.
 func (*CommandEnvelope) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{32}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *CommandEnvelope) GetCommandId() string {
@@ -2514,7 +2754,7 @@ type CommandResult struct {
 
 func (x *CommandResult) Reset() {
 	*x = CommandResult{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[33]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2526,7 +2766,7 @@ func (x *CommandResult) String() string {
 func (*CommandResult) ProtoMessage() {}
 
 func (x *CommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[33]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2539,7 +2779,7 @@ func (x *CommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
 func (*CommandResult) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{33}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *CommandResult) GetCommandId() string {
@@ -2694,7 +2934,7 @@ type AgentMessage struct {
 
 func (x *AgentMessage) Reset() {
 	*x = AgentMessage{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[34]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2706,7 +2946,7 @@ func (x *AgentMessage) String() string {
 func (*AgentMessage) ProtoMessage() {}
 
 func (x *AgentMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[34]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2719,7 +2959,7 @@ func (x *AgentMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentMessage.ProtoReflect.Descriptor instead.
 func (*AgentMessage) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{34}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *AgentMessage) GetPayload() isAgentMessage_Payload {
@@ -2791,7 +3031,7 @@ type ControllerMessage struct {
 
 func (x *ControllerMessage) Reset() {
 	*x = ControllerMessage{}
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[35]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2803,7 +3043,7 @@ func (x *ControllerMessage) String() string {
 func (*ControllerMessage) ProtoMessage() {}
 
 func (x *ControllerMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[35]
+	mi := &file_proto_le0x_v1_agent_control_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2816,7 +3056,7 @@ func (x *ControllerMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControllerMessage.ProtoReflect.Descriptor instead.
 func (*ControllerMessage) Descriptor() ([]byte, []int) {
-	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{35}
+	return file_proto_le0x_v1_agent_control_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ControllerMessage) GetPayload() isControllerMessage_Payload {
@@ -2964,7 +3204,7 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\x15GetUnmanagedProcesses\"H\n" +
 	"\x12SetMaintenanceHold\x12\x16\n" +
 	"\x06active\x18\x01 \x01(\bR\x06active\x12\x1a\n" +
-	"\brevision\x18\x02 \x01(\x04R\brevision\"\xae\x03\n" +
+	"\brevision\x18\x02 \x01(\x04R\brevision\"\xec\x03\n" +
 	"\tExecution\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x10\n" +
@@ -2979,10 +3219,48 @@ const file_proto_le0x_v1_agent_control_proto_rawDesc = "" +
 	"\x0fminer_telemetry\x18\t \x01(\v2\x17.le0x.v1.MinerTelemetryR\x0eminerTelemetry\x12\x1a\n" +
 	"\bwarnings\x18\n" +
 	" \x03(\tR\bwarnings\x128\n" +
-	"\townership\x18\v \x01(\v2\x1a.le0x.v1.WorkloadOwnershipR\townership\"P\n" +
+	"\townership\x18\v \x01(\v2\x1a.le0x.v1.WorkloadOwnershipR\townership\x12<\n" +
+	"\vuseful_work\x18\f \x01(\v2\x1b.le0x.v1.UsefulWorkEvidenceR\n" +
+	"usefulWork\"P\n" +
 	"\x0eDeviceHashrate\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12!\n" +
-	"\fhashrate_hps\x18\x02 \x01(\x01R\vhashrateHps\"\x89\n" +
+	"\fhashrate_hps\x18\x02 \x01(\x01R\vhashrateHps\"J\n" +
+	"\n" +
+	"WorkMetric\x12\x12\n" +
+	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x12\n" +
+	"\x04unit\x18\x02 \x01(\tR\x04unit\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\x01R\x05value\"\xd4\x06\n" +
+	"\x12UsefulWorkEvidence\x12\x1a\n" +
+	"\bprovider\x18\x01 \x01(\tR\bprovider\x12\"\n" +
+	"\favailability\x18\x02 \x01(\tR\favailability\x12,\n" +
+	"\x0fruntime_healthy\x18\x03 \x01(\bH\x00R\x0eruntimeHealthy\x88\x01\x01\x12$\n" +
+	"\vjob_present\x18\x04 \x01(\bH\x01R\n" +
+	"jobPresent\x88\x01\x01\x12\x1f\n" +
+	"\vuseful_work\x18\x05 \x01(\tR\n" +
+	"usefulWork\x12(\n" +
+	"\raccepted_work\x18\x06 \x01(\x04H\x02R\facceptedWork\x88\x01\x01\x12(\n" +
+	"\rrejected_work\x18\a \x01(\x04H\x03R\frejectedWork\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"stale_work\x18\b \x01(\x04H\x04R\tstaleWork\x88\x01\x01\x12I\n" +
+	"\x13last_useful_work_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\x10lastUsefulWorkAt\x12\x1a\n" +
+	"\bupstream\x18\n" +
+	" \x01(\tR\bupstream\x12.\n" +
+	"\x10endpoint_visible\x18\v \x01(\bH\x05R\x0fendpointVisible\x88\x01\x01\x12-\n" +
+	"\ametrics\x18\f \x03(\v2\x13.le0x.v1.WorkMetricR\ametrics\x12\x1e\n" +
+	"\n" +
+	"confidence\x18\r \x01(\tR\n" +
+	"confidence\x12=\n" +
+	"\fcollected_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\vcollectedAt\x12)\n" +
+	"\x10age_milliseconds\x18\x0f \x01(\x04R\x0fageMilliseconds\x12\x1f\n" +
+	"\vreason_code\x18\x10 \x01(\tR\n" +
+	"reasonCode\x124\n" +
+	"\x16fresh_for_milliseconds\x18\x11 \x01(\x04R\x14freshForMillisecondsB\x12\n" +
+	"\x10_runtime_healthyB\x0e\n" +
+	"\f_job_presentB\x10\n" +
+	"\x0e_accepted_workB\x10\n" +
+	"\x0e_rejected_workB\r\n" +
+	"\v_stale_workB\x13\n" +
+	"\x11_endpoint_visible\"\x89\n" +
 	"\n" +
 	"\x0eMinerTelemetry\x12\x1d\n" +
 	"\n" +
@@ -3149,7 +3427,7 @@ func file_proto_le0x_v1_agent_control_proto_rawDescGZIP() []byte {
 	return file_proto_le0x_v1_agent_control_proto_rawDescData
 }
 
-var file_proto_le0x_v1_agent_control_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_proto_le0x_v1_agent_control_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
 var file_proto_le0x_v1_agent_control_proto_goTypes = []any{
 	(*AgentHello)(nil),            // 0: le0x.v1.AgentHello
 	(*ControllerHello)(nil),       // 1: le0x.v1.ControllerHello
@@ -3172,77 +3450,83 @@ var file_proto_le0x_v1_agent_control_proto_goTypes = []any{
 	(*SetMaintenanceHold)(nil),    // 18: le0x.v1.SetMaintenanceHold
 	(*Execution)(nil),             // 19: le0x.v1.Execution
 	(*DeviceHashrate)(nil),        // 20: le0x.v1.DeviceHashrate
-	(*MinerTelemetry)(nil),        // 21: le0x.v1.MinerTelemetry
-	(*ExecutionResult)(nil),       // 22: le0x.v1.ExecutionResult
-	(*Executions)(nil),            // 23: le0x.v1.Executions
-	(*ProcessEvidence)(nil),       // 24: le0x.v1.ProcessEvidence
-	(*UnmanagedProcess)(nil),      // 25: le0x.v1.UnmanagedProcess
-	(*UnmanagedProcesses)(nil),    // 26: le0x.v1.UnmanagedProcesses
-	(*MaintenanceHoldState)(nil),  // 27: le0x.v1.MaintenanceHoldState
-	(*Status)(nil),                // 28: le0x.v1.Status
-	(*Inventory)(nil),             // 29: le0x.v1.Inventory
-	(*GPU)(nil),                   // 30: le0x.v1.GPU
-	(*TypedError)(nil),            // 31: le0x.v1.TypedError
-	(*CommandEnvelope)(nil),       // 32: le0x.v1.CommandEnvelope
-	(*CommandResult)(nil),         // 33: le0x.v1.CommandResult
-	(*AgentMessage)(nil),          // 34: le0x.v1.AgentMessage
-	(*ControllerMessage)(nil),     // 35: le0x.v1.ControllerMessage
-	nil,                           // 36: le0x.v1.ExecutionPlan.EnvironmentEntry
-	nil,                           // 37: le0x.v1.MinerSpec.OptionsEntry
-	nil,                           // 38: le0x.v1.TypedError.DetailsEntry
-	(*timestamppb.Timestamp)(nil), // 39: google.protobuf.Timestamp
+	(*WorkMetric)(nil),            // 21: le0x.v1.WorkMetric
+	(*UsefulWorkEvidence)(nil),    // 22: le0x.v1.UsefulWorkEvidence
+	(*MinerTelemetry)(nil),        // 23: le0x.v1.MinerTelemetry
+	(*ExecutionResult)(nil),       // 24: le0x.v1.ExecutionResult
+	(*Executions)(nil),            // 25: le0x.v1.Executions
+	(*ProcessEvidence)(nil),       // 26: le0x.v1.ProcessEvidence
+	(*UnmanagedProcess)(nil),      // 27: le0x.v1.UnmanagedProcess
+	(*UnmanagedProcesses)(nil),    // 28: le0x.v1.UnmanagedProcesses
+	(*MaintenanceHoldState)(nil),  // 29: le0x.v1.MaintenanceHoldState
+	(*Status)(nil),                // 30: le0x.v1.Status
+	(*Inventory)(nil),             // 31: le0x.v1.Inventory
+	(*GPU)(nil),                   // 32: le0x.v1.GPU
+	(*TypedError)(nil),            // 33: le0x.v1.TypedError
+	(*CommandEnvelope)(nil),       // 34: le0x.v1.CommandEnvelope
+	(*CommandResult)(nil),         // 35: le0x.v1.CommandResult
+	(*AgentMessage)(nil),          // 36: le0x.v1.AgentMessage
+	(*ControllerMessage)(nil),     // 37: le0x.v1.ControllerMessage
+	nil,                           // 38: le0x.v1.ExecutionPlan.EnvironmentEntry
+	nil,                           // 39: le0x.v1.MinerSpec.OptionsEntry
+	nil,                           // 40: le0x.v1.TypedError.DetailsEntry
+	(*timestamppb.Timestamp)(nil), // 41: google.protobuf.Timestamp
 }
 var file_proto_le0x_v1_agent_control_proto_depIdxs = []int32{
-	39, // 0: le0x.v1.Heartbeat.timestamp:type_name -> google.protobuf.Timestamp
-	36, // 1: le0x.v1.ExecutionPlan.environment:type_name -> le0x.v1.ExecutionPlan.EnvironmentEntry
+	41, // 0: le0x.v1.Heartbeat.timestamp:type_name -> google.protobuf.Timestamp
+	38, // 1: le0x.v1.ExecutionPlan.environment:type_name -> le0x.v1.ExecutionPlan.EnvironmentEntry
 	10, // 2: le0x.v1.ExecutionPlan.miner:type_name -> le0x.v1.MinerSpec
 	9,  // 3: le0x.v1.ExecutionPlan.ownership:type_name -> le0x.v1.WorkloadOwnership
 	8,  // 4: le0x.v1.WorkloadOwnership.resource_claim:type_name -> le0x.v1.ResourceClaim
-	37, // 5: le0x.v1.MinerSpec.options:type_name -> le0x.v1.MinerSpec.OptionsEntry
+	39, // 5: le0x.v1.MinerSpec.options:type_name -> le0x.v1.MinerSpec.OptionsEntry
 	12, // 6: le0x.v1.MinerSpec.endpoint:type_name -> le0x.v1.MiningEndpoint
 	11, // 7: le0x.v1.MinerSpec.gpu_assignments:type_name -> le0x.v1.GPUAssignment
 	7,  // 8: le0x.v1.StartExecution.plan:type_name -> le0x.v1.ExecutionPlan
-	39, // 9: le0x.v1.Execution.started_at:type_name -> google.protobuf.Timestamp
-	21, // 10: le0x.v1.Execution.miner_telemetry:type_name -> le0x.v1.MinerTelemetry
+	41, // 9: le0x.v1.Execution.started_at:type_name -> google.protobuf.Timestamp
+	23, // 10: le0x.v1.Execution.miner_telemetry:type_name -> le0x.v1.MinerTelemetry
 	9,  // 11: le0x.v1.Execution.ownership:type_name -> le0x.v1.WorkloadOwnership
-	20, // 12: le0x.v1.MinerTelemetry.per_device:type_name -> le0x.v1.DeviceHashrate
-	39, // 13: le0x.v1.MinerTelemetry.collected_at:type_name -> google.protobuf.Timestamp
-	19, // 14: le0x.v1.ExecutionResult.execution:type_name -> le0x.v1.Execution
-	19, // 15: le0x.v1.Executions.executions:type_name -> le0x.v1.Execution
-	24, // 16: le0x.v1.UnmanagedProcess.evidence:type_name -> le0x.v1.ProcessEvidence
-	39, // 17: le0x.v1.UnmanagedProcess.observed_at:type_name -> google.protobuf.Timestamp
-	25, // 18: le0x.v1.UnmanagedProcesses.processes:type_name -> le0x.v1.UnmanagedProcess
-	30, // 19: le0x.v1.Inventory.gpus:type_name -> le0x.v1.GPU
-	38, // 20: le0x.v1.TypedError.details:type_name -> le0x.v1.TypedError.DetailsEntry
-	3,  // 21: le0x.v1.CommandEnvelope.ping:type_name -> le0x.v1.Ping
-	5,  // 22: le0x.v1.CommandEnvelope.get_status:type_name -> le0x.v1.GetStatus
-	6,  // 23: le0x.v1.CommandEnvelope.get_inventory:type_name -> le0x.v1.GetInventory
-	13, // 24: le0x.v1.CommandEnvelope.start_execution:type_name -> le0x.v1.StartExecution
-	14, // 25: le0x.v1.CommandEnvelope.stop_execution:type_name -> le0x.v1.StopExecution
-	15, // 26: le0x.v1.CommandEnvelope.restart_execution:type_name -> le0x.v1.RestartExecution
-	16, // 27: le0x.v1.CommandEnvelope.get_executions:type_name -> le0x.v1.GetExecutions
-	17, // 28: le0x.v1.CommandEnvelope.get_unmanaged_processes:type_name -> le0x.v1.GetUnmanagedProcesses
-	18, // 29: le0x.v1.CommandEnvelope.set_maintenance_hold:type_name -> le0x.v1.SetMaintenanceHold
-	4,  // 30: le0x.v1.CommandResult.pong:type_name -> le0x.v1.Pong
-	28, // 31: le0x.v1.CommandResult.status:type_name -> le0x.v1.Status
-	29, // 32: le0x.v1.CommandResult.inventory:type_name -> le0x.v1.Inventory
-	31, // 33: le0x.v1.CommandResult.error:type_name -> le0x.v1.TypedError
-	22, // 34: le0x.v1.CommandResult.execution:type_name -> le0x.v1.ExecutionResult
-	23, // 35: le0x.v1.CommandResult.executions:type_name -> le0x.v1.Executions
-	26, // 36: le0x.v1.CommandResult.unmanaged_processes:type_name -> le0x.v1.UnmanagedProcesses
-	27, // 37: le0x.v1.CommandResult.maintenance_hold:type_name -> le0x.v1.MaintenanceHoldState
-	0,  // 38: le0x.v1.AgentMessage.hello:type_name -> le0x.v1.AgentHello
-	2,  // 39: le0x.v1.AgentMessage.heartbeat:type_name -> le0x.v1.Heartbeat
-	33, // 40: le0x.v1.AgentMessage.command_result:type_name -> le0x.v1.CommandResult
-	1,  // 41: le0x.v1.ControllerMessage.hello:type_name -> le0x.v1.ControllerHello
-	32, // 42: le0x.v1.ControllerMessage.command:type_name -> le0x.v1.CommandEnvelope
-	34, // 43: le0x.v1.AgentControl.Connect:input_type -> le0x.v1.AgentMessage
-	35, // 44: le0x.v1.AgentControl.Connect:output_type -> le0x.v1.ControllerMessage
-	44, // [44:45] is the sub-list for method output_type
-	43, // [43:44] is the sub-list for method input_type
-	43, // [43:43] is the sub-list for extension type_name
-	43, // [43:43] is the sub-list for extension extendee
-	0,  // [0:43] is the sub-list for field type_name
+	22, // 12: le0x.v1.Execution.useful_work:type_name -> le0x.v1.UsefulWorkEvidence
+	41, // 13: le0x.v1.UsefulWorkEvidence.last_useful_work_at:type_name -> google.protobuf.Timestamp
+	21, // 14: le0x.v1.UsefulWorkEvidence.metrics:type_name -> le0x.v1.WorkMetric
+	41, // 15: le0x.v1.UsefulWorkEvidence.collected_at:type_name -> google.protobuf.Timestamp
+	20, // 16: le0x.v1.MinerTelemetry.per_device:type_name -> le0x.v1.DeviceHashrate
+	41, // 17: le0x.v1.MinerTelemetry.collected_at:type_name -> google.protobuf.Timestamp
+	19, // 18: le0x.v1.ExecutionResult.execution:type_name -> le0x.v1.Execution
+	19, // 19: le0x.v1.Executions.executions:type_name -> le0x.v1.Execution
+	26, // 20: le0x.v1.UnmanagedProcess.evidence:type_name -> le0x.v1.ProcessEvidence
+	41, // 21: le0x.v1.UnmanagedProcess.observed_at:type_name -> google.protobuf.Timestamp
+	27, // 22: le0x.v1.UnmanagedProcesses.processes:type_name -> le0x.v1.UnmanagedProcess
+	32, // 23: le0x.v1.Inventory.gpus:type_name -> le0x.v1.GPU
+	40, // 24: le0x.v1.TypedError.details:type_name -> le0x.v1.TypedError.DetailsEntry
+	3,  // 25: le0x.v1.CommandEnvelope.ping:type_name -> le0x.v1.Ping
+	5,  // 26: le0x.v1.CommandEnvelope.get_status:type_name -> le0x.v1.GetStatus
+	6,  // 27: le0x.v1.CommandEnvelope.get_inventory:type_name -> le0x.v1.GetInventory
+	13, // 28: le0x.v1.CommandEnvelope.start_execution:type_name -> le0x.v1.StartExecution
+	14, // 29: le0x.v1.CommandEnvelope.stop_execution:type_name -> le0x.v1.StopExecution
+	15, // 30: le0x.v1.CommandEnvelope.restart_execution:type_name -> le0x.v1.RestartExecution
+	16, // 31: le0x.v1.CommandEnvelope.get_executions:type_name -> le0x.v1.GetExecutions
+	17, // 32: le0x.v1.CommandEnvelope.get_unmanaged_processes:type_name -> le0x.v1.GetUnmanagedProcesses
+	18, // 33: le0x.v1.CommandEnvelope.set_maintenance_hold:type_name -> le0x.v1.SetMaintenanceHold
+	4,  // 34: le0x.v1.CommandResult.pong:type_name -> le0x.v1.Pong
+	30, // 35: le0x.v1.CommandResult.status:type_name -> le0x.v1.Status
+	31, // 36: le0x.v1.CommandResult.inventory:type_name -> le0x.v1.Inventory
+	33, // 37: le0x.v1.CommandResult.error:type_name -> le0x.v1.TypedError
+	24, // 38: le0x.v1.CommandResult.execution:type_name -> le0x.v1.ExecutionResult
+	25, // 39: le0x.v1.CommandResult.executions:type_name -> le0x.v1.Executions
+	28, // 40: le0x.v1.CommandResult.unmanaged_processes:type_name -> le0x.v1.UnmanagedProcesses
+	29, // 41: le0x.v1.CommandResult.maintenance_hold:type_name -> le0x.v1.MaintenanceHoldState
+	0,  // 42: le0x.v1.AgentMessage.hello:type_name -> le0x.v1.AgentHello
+	2,  // 43: le0x.v1.AgentMessage.heartbeat:type_name -> le0x.v1.Heartbeat
+	35, // 44: le0x.v1.AgentMessage.command_result:type_name -> le0x.v1.CommandResult
+	1,  // 45: le0x.v1.ControllerMessage.hello:type_name -> le0x.v1.ControllerHello
+	34, // 46: le0x.v1.ControllerMessage.command:type_name -> le0x.v1.CommandEnvelope
+	36, // 47: le0x.v1.AgentControl.Connect:input_type -> le0x.v1.AgentMessage
+	37, // 48: le0x.v1.AgentControl.Connect:output_type -> le0x.v1.ControllerMessage
+	48, // [48:49] is the sub-list for method output_type
+	47, // [47:48] is the sub-list for method input_type
+	47, // [47:47] is the sub-list for extension type_name
+	47, // [47:47] is the sub-list for extension extendee
+	0,  // [0:47] is the sub-list for field type_name
 }
 
 func init() { file_proto_le0x_v1_agent_control_proto_init() }
@@ -3251,8 +3535,9 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 		return
 	}
 	file_proto_le0x_v1_agent_control_proto_msgTypes[10].OneofWrappers = []any{}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[21].OneofWrappers = []any{}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[32].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[22].OneofWrappers = []any{}
+	file_proto_le0x_v1_agent_control_proto_msgTypes[23].OneofWrappers = []any{}
+	file_proto_le0x_v1_agent_control_proto_msgTypes[34].OneofWrappers = []any{
 		(*CommandEnvelope_Ping)(nil),
 		(*CommandEnvelope_GetStatus)(nil),
 		(*CommandEnvelope_GetInventory)(nil),
@@ -3263,7 +3548,7 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 		(*CommandEnvelope_GetUnmanagedProcesses)(nil),
 		(*CommandEnvelope_SetMaintenanceHold)(nil),
 	}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[33].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[35].OneofWrappers = []any{
 		(*CommandResult_Pong)(nil),
 		(*CommandResult_Status)(nil),
 		(*CommandResult_Inventory)(nil),
@@ -3273,12 +3558,12 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 		(*CommandResult_UnmanagedProcesses)(nil),
 		(*CommandResult_MaintenanceHold)(nil),
 	}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[34].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[36].OneofWrappers = []any{
 		(*AgentMessage_Hello)(nil),
 		(*AgentMessage_Heartbeat)(nil),
 		(*AgentMessage_CommandResult)(nil),
 	}
-	file_proto_le0x_v1_agent_control_proto_msgTypes[35].OneofWrappers = []any{
+	file_proto_le0x_v1_agent_control_proto_msgTypes[37].OneofWrappers = []any{
 		(*ControllerMessage_Hello)(nil),
 		(*ControllerMessage_Command)(nil),
 	}
@@ -3288,7 +3573,7 @@ func file_proto_le0x_v1_agent_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_le0x_v1_agent_control_proto_rawDesc), len(file_proto_le0x_v1_agent_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   39,
+			NumMessages:   41,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

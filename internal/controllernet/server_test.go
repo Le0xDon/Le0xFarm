@@ -71,7 +71,7 @@ func TestReconnectHelloCannotRaceMaintenancePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 5, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: hostID.String()}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: hostID.String()}}}); err != nil {
 		t.Fatal(err)
 	}
 	received := make(chan *le0xv1.ControllerHello, 1)
@@ -436,7 +436,7 @@ func TestLiveSessionRequiresFreshExecutionsAndChangesEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 5, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
 			t.Fatal(err)
 		}
 		if hello, err := stream.Recv(); err != nil || hello.GetHello() == nil {
@@ -687,7 +687,7 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 		t.Fatal(err)
 	}
 	host := "host_0123456789abcdef0123456789abcdef"
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 5, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
 		t.Fatal(err)
 	}
 	if message, err := stream.Recv(); err != nil || message.GetHello() == nil {
@@ -940,6 +940,50 @@ func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 			}
 			if tc.name == "old-protocol" && server.ActiveConnections() != 0 {
 				t.Fatal("old protocol peer established a runtime session")
+			}
+		})
+	}
+}
+
+func TestMalformedRuntimeEvidenceIsRejectedBeforeLogging(t *testing.T) {
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	collected := time.Unix(1_234, 0).UTC()
+	valid := func() *le0xv1.ExecutionResult {
+		return &le0xv1.ExecutionResult{Execution: &le0xv1.Execution{
+			ExecutionId:    "execution_0123456789abcdef0123456789abcdef",
+			State:          "RUNNING",
+			Pid:            42,
+			StartedAt:      timestamppb.New(collected.Add(-time.Second)),
+			Ownership:      &le0xv1.WorkloadOwnership{WorkloadId: "workload_0123456789abcdef0123456789abcdef", DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostId: hostID.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: true}},
+			MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test", Health: "MINING", CollectedAt: timestamppb.New(collected)},
+			UsefulWork:     &le0xv1.UsefulWorkEvidence{Provider: "test", Availability: "AVAILABLE", UsefulWork: "CONFIRMED", Upstream: "UNKNOWN", Confidence: "ADAPTER_REPORTED", CollectedAt: timestamppb.New(collected), FreshForMilliseconds: 10_000},
+		}}
+	}
+	cases := []struct {
+		name      string
+		malicious string
+		mutate    func(*le0xv1.ExecutionResult, string)
+	}{
+		{"provider-control", "provider\nINJECTED_PROVIDER", func(result *le0xv1.ExecutionResult, value string) { result.Execution.UsefulWork.Provider = value }},
+		{"provider-oversize", strings.Repeat("p", 65), func(result *le0xv1.ExecutionResult, value string) { result.Execution.UsefulWork.Provider = value }},
+		{"reason-enum", "REMOTE_SECRET_REASON", func(result *le0xv1.ExecutionResult, value string) { result.Execution.UsefulWork.ReasonCode = value }},
+		{"health-enum", "REMOTE_SECRET_HEALTH", func(result *le0xv1.ExecutionResult, value string) { result.Execution.MinerTelemetry.Health = value }},
+		{"warning-control", "warning\nINJECTED_WARNING", func(result *le0xv1.ExecutionResult, value string) { result.Execution.Warnings = []string{value} }},
+		{"telemetry-message-control", "message\nINJECTED_MESSAGE", func(result *le0xv1.ExecutionResult, value string) { result.Execution.MinerTelemetry.Message = value }},
+		{"result-message-control", "result\nINJECTED_RESULT", func(result *le0xv1.ExecutionResult, value string) { result.Message = value }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buffer := &lockedBuffer{}
+			server := newTestServer(t, Config{Output: testLogger(buffer)})
+			result := valid()
+			tc.mutate(result, tc.malicious)
+			if _, err := server.validateAndLogRuntimeExecution("START_EXECUTION", result, hostID); err == nil {
+				t.Fatal("malformed remote result was accepted")
+			}
+			logged := buffer.String()
+			if !strings.Contains(logged, "invalid runtime execution result") || strings.Contains(logged, tc.malicious) || strings.Contains(logged, "USEFUL_WORK:") || strings.Contains(logged, "MINER:") {
+				t.Fatalf("unsafe runtime result crossed logging boundary: %q", logged)
 			}
 		})
 	}

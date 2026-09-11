@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
@@ -256,6 +257,11 @@ type Source struct {
 	Client             *http.Client
 	HugePagesAvailable bool
 	MSRAvailable       func() bool
+	Now                func() time.Time
+	mu                 sync.Mutex
+	lastAccepted       uint64
+	haveAccepted       bool
+	lastUsefulWorkAt   time.Time
 }
 
 func (s *Source) Poll(ctx context.Context) (*model.MinerTelemetry, error) {
@@ -284,8 +290,30 @@ func (s *Source) Poll(ctx context.Context) (*model.MinerTelemetry, error) {
 		return nil, farmerr.Error{Code: farmerr.RPC_UNREACHABLE, HumanMessage: "XMRig API response is malformed", Details: map[string]string{"reason": err.Error()}}
 	}
 	telemetry.AdapterID = AdapterID
-	hp, msr := s.HugePagesAvailable, s.MSRAvailable()
+	hp, msr := s.HugePagesAvailable, false
+	if s.MSRAvailable != nil {
+		msr = s.MSRAvailable()
+	}
 	telemetry.HugePagesAvailable, telemetry.MSRAvailable = &hp, &msr
+	now := time.Now().UTC()
+	if s.Now != nil {
+		now = s.Now().UTC()
+	}
+	telemetry.CollectedAt = now
+	telemetry.UsefulWork.CollectedAt = now
+	s.mu.Lock()
+	if telemetry.AcceptedShares != nil {
+		accepted := *telemetry.AcceptedShares
+		if accepted > 0 && (!s.haveAccepted || accepted > s.lastAccepted) {
+			s.lastUsefulWorkAt = now
+		}
+		s.lastAccepted, s.haveAccepted = accepted, true
+	}
+	if !s.lastUsefulWorkAt.IsZero() {
+		last := s.lastUsefulWorkAt
+		telemetry.UsefulWork.LastUsefulWorkAt = &last
+	}
+	s.mu.Unlock()
 	return telemetry, nil
 }
 
@@ -319,10 +347,32 @@ func ParseSummary(data []byte) (*model.MinerTelemetry, error) {
 	if err := ensureEOF(decoder); err != nil {
 		return nil, err
 	}
-	telemetry := &model.MinerTelemetry{AdapterID: AdapterID, MinerVersion: native.Version, Algorithm: native.Algo, HighestHashrateHPS: native.Hashrate.Highest, AcceptedShares: native.Results.SharesGood, TotalResults: native.Results.SharesTotal, UptimeSeconds: native.Uptime}
+	if len(native.Version) > 64 || len(native.Kind) > 64 || len(native.Algo) > 64 {
+		return nil, errors.New("XMRig summary identity field exceeds limit")
+	}
+	for _, value := range native.Hashrate.Total {
+		if value != nil && *value < 0 {
+			return nil, errors.New("XMRig summary contains a negative hashrate")
+		}
+	}
+	if native.Hashrate.Highest != nil && *native.Hashrate.Highest < 0 {
+		return nil, errors.New("XMRig summary contains a negative highest hashrate")
+	}
+	if native.Results.SharesTotal != nil && native.Results.SharesGood != nil && *native.Results.SharesTotal < *native.Results.SharesGood {
+		return nil, errors.New("XMRig summary share counters are inconsistent")
+	}
+	healthy := true
+	telemetry := &model.MinerTelemetry{AdapterID: AdapterID, MinerVersion: native.Version, Algorithm: native.Algo, HighestHashrateHPS: native.Hashrate.Highest, AcceptedShares: native.Results.SharesGood, TotalResults: native.Results.SharesTotal, UptimeSeconds: native.Uptime,
+		UsefulWork: &model.UsefulWorkEvidence{Provider: AdapterID, Availability: model.TelemetryAvailable, RuntimeHealthy: &healthy, UsefulWork: model.UsefulWorkUnknown, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported}}
 	if native.Connection != nil {
 		connected := native.Connection.Pool != ""
 		telemetry.PoolConnected = &connected
+		telemetry.UsefulWork.EndpointVisible = &connected
+		if connected {
+			telemetry.UsefulWork.Upstream = model.UpstreamConnected
+		} else {
+			telemetry.UsefulWork.Upstream = model.UpstreamDisconnected
+		}
 		telemetry.PoolLatencyMS = native.Connection.Ping
 		if telemetry.UptimeSeconds == 0 {
 			telemetry.UptimeSeconds = native.Connection.Uptime
@@ -330,6 +380,9 @@ func ParseSummary(data []byte) (*model.MinerTelemetry, error) {
 	}
 	if len(native.Hashrate.Total) > 0 {
 		telemetry.HashrateShortHPS = native.Hashrate.Total[0]
+		if native.Hashrate.Total[0] != nil {
+			telemetry.UsefulWork.Metrics = append(telemetry.UsefulWork.Metrics, model.WorkMetric{Kind: "HASHRATE_CURRENT", Unit: "H/S", Value: *native.Hashrate.Total[0]})
+		}
 	}
 	if len(native.Hashrate.Total) > 1 {
 		telemetry.HashrateMediumHPS = native.Hashrate.Total[1]
@@ -341,8 +394,41 @@ func ParseSummary(data []byte) (*model.MinerTelemetry, error) {
 		rejected := *native.Results.SharesTotal - *native.Results.SharesGood
 		telemetry.RejectedShares = &rejected
 	}
+	telemetry.UsefulWork.AcceptedWork = telemetry.AcceptedShares
+	telemetry.UsefulWork.RejectedWork = telemetry.RejectedShares
+	telemetry.UsefulWork.StaleWork = telemetry.StaleShares
+	connected := telemetry.PoolConnected != nil && *telemetry.PoolConnected
+	positive := telemetry.HashrateShortHPS != nil && *telemetry.HashrateShortHPS > 0
+	if positive {
+		job := true
+		telemetry.UsefulWork.JobPresent = &job
+	}
+	if excessiveRejects(telemetry.AcceptedShares, telemetry.RejectedShares) {
+		telemetry.UsefulWork.UsefulWork = model.UsefulWorkNotConfirmed
+		telemetry.UsefulWork.ReasonCode = farmerr.TOO_MANY_REJECTS
+	} else if positive && connected {
+		telemetry.UsefulWork.UsefulWork = model.UsefulWorkConfirmed
+	} else if telemetry.HashrateShortHPS != nil {
+		telemetry.UsefulWork.UsefulWork = model.UsefulWorkNotConfirmed
+		if *telemetry.HashrateShortHPS <= 0 {
+			telemetry.UsefulWork.ReasonCode = farmerr.ZERO_HASHRATE
+		} else {
+			telemetry.UsefulWork.ReasonCode = farmerr.POOL_UNREACHABLE
+		}
+	} else if telemetry.UsefulWork.Upstream == model.UpstreamDisconnected {
+		telemetry.UsefulWork.UsefulWork = model.UsefulWorkNotConfirmed
+		telemetry.UsefulWork.ReasonCode = farmerr.POOL_UNREACHABLE
+	}
 	telemetry.HugePagesPercent = parseHugePages(native.HugePages)
 	return telemetry, nil
+}
+
+func excessiveRejects(accepted, rejected *uint64) bool {
+	if accepted == nil || rejected == nil {
+		return false
+	}
+	total := *accepted + *rejected
+	return total >= 10 && float64(*rejected)/float64(total) > 0.20
 }
 
 func parseHugePages(data json.RawMessage) *float64 {

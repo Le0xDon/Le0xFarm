@@ -1,6 +1,7 @@
 package wiremap
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,32 @@ func TestUnmanagedProcessWireRoundTripAndStrictValidation(t *testing.T) {
 	}
 }
 
+func TestUsefulWorkEvidenceWireValidationPreservesZeroAndUnknown(t *testing.T) {
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	zero := 0.0
+	accepted := uint64(0)
+	collected := time.Unix(1234, 0).UTC()
+	wire := &le0xv1.Execution{ExecutionId: "execution_0123456789abcdef0123456789abcdef", State: "RUNNING", Pid: 42, StartedAt: Timestamp(collected.Add(-time.Second)), MinerTelemetry: &le0xv1.MinerTelemetry{Health: "DEGRADED", CollectedAt: Timestamp(collected)}, UsefulWork: &le0xv1.UsefulWorkEvidence{Provider: "future-compute-adapter", Availability: "AVAILABLE", UsefulWork: "NOT_CONFIRMED", AcceptedWork: &accepted, Upstream: "UNKNOWN", Confidence: "ADAPTER_REPORTED", CollectedAt: Timestamp(collected), FreshForMilliseconds: 10_000, Metrics: []*le0xv1.WorkMetric{{Kind: "TASKS_PER_SECOND", Unit: "TASK/S", Value: zero}}}}
+	parsed, err := ParseExecution(wire, host)
+	if err != nil || parsed.MinerTelemetry == nil || parsed.UsefulWork == nil {
+		t.Fatalf("evidence parse=%+v err=%v", parsed, err)
+	}
+	evidence := parsed.UsefulWork
+	if evidence.AcceptedWork == nil || *evidence.AcceptedWork != 0 || len(evidence.Metrics) != 1 || evidence.Metrics[0].Value != 0 || evidence.Upstream != model.UpstreamUnknown {
+		t.Fatalf("explicit zero was confused with unknown: %+v", evidence)
+	}
+	bad := proto.Clone(wire).(*le0xv1.Execution)
+	bad.UsefulWork.Metrics[0].Value = math.Inf(1)
+	if _, err := ParseExecution(bad, host); err == nil {
+		t.Fatal("non-finite metric accepted")
+	}
+	bad = proto.Clone(wire).(*le0xv1.Execution)
+	bad.UsefulWork.Availability = "FRESH_ENOUGH_MAYBE"
+	if _, err := ParseExecution(bad, host); err == nil {
+		t.Fatal("unknown availability accepted")
+	}
+}
+
 func TestExecutionPlanWireOwnershipAndResolvedDataOnly(t *testing.T) {
 	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
 	workload, _ := identity.ParseWorkloadID("workload_0123456789abcdef0123456789abcdef")
@@ -54,12 +81,12 @@ func TestExecutionPlanWireOwnershipAndResolvedDataOnly(t *testing.T) {
 
 func TestExecutionObservationValidationAndExplicitUnmanaged(t *testing.T) {
 	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
-	base := &le0xv1.Execution{ExecutionId: "execution_0123456789abcdef0123456789abcdef", State: "RUNNING", Ownership: &le0xv1.WorkloadOwnership{WorkloadId: "workload_0123456789abcdef0123456789abcdef", DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostId: host.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: true}}}
+	base := &le0xv1.Execution{ExecutionId: "execution_0123456789abcdef0123456789abcdef", State: "RUNNING", Pid: 42, StartedAt: Timestamp(time.Unix(100, 0).UTC()), Ownership: &le0xv1.WorkloadOwnership{WorkloadId: "workload_0123456789abcdef0123456789abcdef", DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostId: host.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: true}}}
 	parsed, err := ParseExecution(base, host)
 	if err != nil || parsed.Ownership == nil || parsed.Ownership.WorkloadID.String() != base.Ownership.WorkloadId {
 		t.Fatalf("valid ownership rejected: %+v err=%v", parsed, err)
 	}
-	unmanaged := &le0xv1.Execution{ExecutionId: "execution_1123456789abcdef0123456789abcdef", State: "RUNNING"}
+	unmanaged := &le0xv1.Execution{ExecutionId: "execution_1123456789abcdef0123456789abcdef", State: "RUNNING", Pid: 43, StartedAt: Timestamp(time.Unix(101, 0).UTC())}
 	parsed, err = ParseExecution(unmanaged, host)
 	if err != nil || parsed.Ownership != nil {
 		t.Fatalf("unmanaged execution not represented explicitly: %+v err=%v", parsed, err)
@@ -71,6 +98,56 @@ func TestExecutionObservationValidationAndExplicitUnmanaged(t *testing.T) {
 	}
 	if _, err := ParseExecutions(&le0xv1.Executions{Executions: []*le0xv1.Execution{base, base}}, host); err == nil {
 		t.Fatal("duplicate execution observation accepted")
+	}
+}
+
+func TestExecutionObservationRejectsImpossibleActiveUsefulWork(t *testing.T) {
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	collected := time.Unix(1_234, 0).UTC()
+	base := &le0xv1.Execution{
+		ExecutionId:    "execution_0123456789abcdef0123456789abcdef",
+		State:          "RUNNING",
+		Pid:            42,
+		StartedAt:      Timestamp(collected.Add(-time.Second)),
+		Ownership:      &le0xv1.WorkloadOwnership{WorkloadId: "workload_0123456789abcdef0123456789abcdef", DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("a", 64), HostId: host.String(), ResourceClaim: &le0xv1.ResourceClaim{Cpu: true}},
+		MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test", Health: "MINING", CollectedAt: Timestamp(collected)},
+		UsefulWork:     &le0xv1.UsefulWorkEvidence{Provider: "generic-test", Availability: "AVAILABLE", UsefulWork: "CONFIRMED", Upstream: "UNKNOWN", Confidence: "ADAPTER_REPORTED", CollectedAt: Timestamp(collected), FreshForMilliseconds: 10_000},
+	}
+	if _, err := ParseExecution(base, host); err != nil {
+		t.Fatalf("valid running confirmed observation rejected: %v", err)
+	}
+	stopped := proto.Clone(base).(*le0xv1.Execution)
+	stopped.State, stopped.Pid, stopped.StartedAt = "STOPPED", 0, nil
+	if _, err := ParseExecution(stopped, host); err == nil {
+		t.Fatal("STOPPED PID 0 observation authorized MINING")
+	}
+	missingPID := proto.Clone(base).(*le0xv1.Execution)
+	missingPID.Pid = 0
+	if _, err := ParseExecution(missingPID, host); err == nil {
+		t.Fatal("RUNNING PID 0 observation authorized MINING")
+	}
+	missingStart := proto.Clone(base).(*le0xv1.Execution)
+	missingStart.StartedAt = nil
+	if _, err := ParseExecution(missingStart, host); err == nil {
+		t.Fatal("RUNNING observation without process start identity authorized MINING")
+	}
+	unmanaged := proto.Clone(base).(*le0xv1.Execution)
+	unmanaged.Ownership = nil
+	if _, err := ParseExecution(unmanaged, host); err == nil {
+		t.Fatal("unmanaged observation authorized confirmed useful work")
+	}
+
+	historical := proto.Clone(base).(*le0xv1.Execution)
+	historical.State, historical.Pid = "STOPPED", 0
+	historical.MinerTelemetry.Health = "DEGRADED"
+	historical.UsefulWork.Availability = "STALE"
+	historical.UsefulWork.ReasonCode = "TELEMETRY_STALE"
+	if parsed, err := ParseExecution(historical, host); err != nil || parsed.Status != model.ExecutionStopped || parsed.UsefulWork.Availability != model.TelemetryStale {
+		t.Fatalf("safe historical stopped evidence rejected: %+v err=%v", parsed, err)
+	}
+	starting := &le0xv1.Execution{ExecutionId: base.ExecutionId, State: "STARTING", Ownership: base.Ownership, MinerTelemetry: &le0xv1.MinerTelemetry{AdapterId: "test", Health: "STARTING"}, UsefulWork: &le0xv1.UsefulWorkEvidence{Provider: "generic-test", Availability: "UNAVAILABLE", UsefulWork: "UNKNOWN", Upstream: "UNKNOWN", Confidence: "UNKNOWN", ReasonCode: "TELEMETRY_UNAVAILABLE"}}
+	if _, err := ParseExecution(starting, host); err != nil {
+		t.Fatalf("legitimate STARTING observation rejected: %v", err)
 	}
 }
 

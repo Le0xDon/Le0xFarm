@@ -143,12 +143,16 @@ bind-close-start race, потому что XMRig сам открывает liste
 обычной startup/runtime ошибке, не к использованию внешнего bind address.
 
 Telemetry polling по умолчанию выполняется раз в 3 секунды, startup grace равен 45
-секундам, stale threshold — 10 секунд. XMRig `/2/summary` нормализуется в общие поля
-version, algorithm, short/medium/long/highest hashrate, shares/results, pool connection,
-latency, uptime и optimization status. Process RUNNING сам по себе не означает MINING.
-MINING требует mining mode, healthy API, connected pool и hashrate > 0. STRESS и
-BENCHMARK не влияют на общий Agent status. Для активных MINING executions используются
-IDLE, STARTING, MINING, DEGRADED и ERROR с deterministic safety precedence
+секундам, stale threshold — 10 секунд. Generic useful-work evidence отдельно передаёт
+availability/freshness, runtime/job/upstream facts, accepted/rejected/stale work,
+optional workload-specific metrics, provenance и confidence; отсутствие метрики не
+превращается в ноль. XMRig `/2/summary` добавляет hashrate, shares/results, pool
+connectivity, latency, uptime и optimization status. Только XMRig adapter решает, что
+для его MINING достаточно fresh healthy API, connected pool и positive hashrate.
+Process RUNNING сам по себе не означает MINING. До достаточного evidence он STARTING,
+а после startup grace при missing/unavailable/stale или недостаточном evidence —
+DEGRADED без автоматического telemetry-driven restart. STRESS и BENCHMARK не влияют на
+общий Agent status. Для активных MINING executions используется deterministic precedence
 ERROR > DEGRADED > STARTING > MINING > IDLE. STOPPED history не влияет на status.
 XMRig STRESS не является полностью offline workload: штатная реализация
 XMRig может подключаться к внешнему upstream stress service `randomx.xmrig.com:443`.
@@ -335,9 +339,10 @@ resolved executable, argv, environment, working directory и restart policy.
 ObservedState и ExecutionObservation сохраняют наблюдения по ExecutionID.
 
 ProtocolVersion — версия взаимодействия компонентов; SchemaVersion — версия структуры
-документов. Текущие значения равны 5 и 1 соответственно; ProtocolVersion 5 добавляет typed
-unmanaged-process observations и persistent Maintenance Hold synchronization поверх точной
-stable-DeviceID GPU binding M6 и fail-closed отклоняет старых peers, которые её не понимают.
+документов. Текущие значения равны 6 и 1 соответственно; ProtocolVersion 6 добавляет
+bounded generic useful-work evidence поверх typed unmanaged-process observations и
+persistent Maintenance Hold synchronization и fail-closed отклоняет старых peers, которые
+её не понимают.
 Типы и дальнейшее изменение остаются независимыми.
 Версия сборки `0.0.0-dev` хранится отдельно.
 

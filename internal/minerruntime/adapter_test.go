@@ -652,11 +652,14 @@ func errorCode(err error) farmerr.Code {
 	return code
 }
 
+func testEvidence(state model.UsefulWorkState, reason farmerr.Code) *model.UsefulWorkEvidence {
+	healthy := true
+	return &model.UsefulWorkEvidence{Provider: "test-no-http", Availability: model.TelemetryAvailable, RuntimeHealthy: &healthy, UsefulWork: state, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, ReasonCode: reason}
+}
+
 func TestEvaluateMinerStatus(t *testing.T) {
 	now := time.Now().UTC()
 	hash, zero := 100.0, 0.0
-	connected, disconnected := true, false
-	accepted, rejected := uint64(7), uint64(3)
 	running := supervisor.Snapshot{State: model.ExecutionRunning, StartedAt: now.Add(-time.Minute)}
 	cases := []struct {
 		name      string
@@ -667,13 +670,16 @@ func TestEvaluateMinerStatus(t *testing.T) {
 		code      farmerr.Code
 	}{
 		{"startup", model.MinerModeMining, supervisor.Snapshot{State: model.ExecutionRunning, StartedAt: now}, nil, model.MinerHealthStarting, ""},
-		{"running-only", model.MinerModeMining, running, nil, model.MinerHealthDegraded, farmerr.RPC_UNREACHABLE},
-		{"mining", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, PoolConnected: &connected}, model.MinerHealthMining, ""},
-		{"zero", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &zero, PoolConnected: &connected}, model.MinerHealthDegraded, farmerr.ZERO_HASHRATE},
-		{"pool", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, PoolConnected: &disconnected}, model.MinerHealthDegraded, farmerr.POOL_UNREACHABLE},
-		{"rejects", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, PoolConnected: &connected, AcceptedShares: &accepted, RejectedShares: &rejected}, model.MinerHealthDegraded, farmerr.TOO_MANY_REJECTS},
-		{"stale", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now.Add(-time.Minute), Age: time.Minute}, model.MinerHealthDegraded, farmerr.RPC_UNREACHABLE},
-		{"stress-positive", model.MinerModeStress, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash}, model.MinerHealthHealthy, ""},
+		{"running-only", model.MinerModeMining, running, nil, model.MinerHealthDegraded, farmerr.TELEMETRY_UNAVAILABLE},
+		{"mining", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}, model.MinerHealthMining, ""},
+		{"generic-non-hash-work", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}, model.MinerHealthMining, ""},
+		{"zero", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &zero, UsefulWork: testEvidence(model.UsefulWorkNotConfirmed, farmerr.ZERO_HASHRATE)}, model.MinerHealthDegraded, farmerr.ZERO_HASHRATE},
+		{"pool", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkNotConfirmed, farmerr.POOL_UNREACHABLE)}, model.MinerHealthDegraded, farmerr.POOL_UNREACHABLE},
+		{"rejects", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkNotConfirmed, farmerr.TOO_MANY_REJECTS)}, model.MinerHealthDegraded, farmerr.TOO_MANY_REJECTS},
+		{"unavailable", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now, UsefulWork: &model.UsefulWorkEvidence{Provider: "test-no-http", Availability: model.TelemetryUnavailable}}, model.MinerHealthDegraded, farmerr.TELEMETRY_UNAVAILABLE},
+		{"stale", model.MinerModeMining, running, &model.MinerTelemetry{CollectedAt: now.Add(-time.Minute), Age: time.Minute, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}, model.MinerHealthDegraded, farmerr.TELEMETRY_STALE},
+		{"pre-restart-sample", model.MinerModeMining, supervisor.Snapshot{State: model.ExecutionRunning, StartedAt: now.Add(-time.Second)}, &model.MinerTelemetry{CollectedAt: now.Add(-2 * time.Second), UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}, model.MinerHealthStarting, ""},
+		{"stress-positive", model.MinerModeStress, running, &model.MinerTelemetry{CollectedAt: now, HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}, model.MinerHealthHealthy, ""},
 		{"failed", model.MinerModeMining, supervisor.Snapshot{State: model.ExecutionFailed, LastError: "crash"}, nil, model.MinerHealthError, farmerr.PROCESS_CRASHED},
 	}
 	for _, tc := range cases {
@@ -688,8 +694,7 @@ func TestEvaluateMinerStatus(t *testing.T) {
 
 func TestOverallStatusTracksOnlyHealthyMiningExecution(t *testing.T) {
 	hash := 100.0
-	connected := true
-	source := &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, PoolConnected: &connected}}}}
+	source := &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}}}}
 	registry := NewRegistry()
 	if err := registry.Register(&fakeAdapter{source: source}); err != nil {
 		t.Fatal(err)
@@ -762,7 +767,7 @@ func TestTelemetryFailureDoesNotExposeAdapterErrorText(t *testing.T) {
 
 func TestTelemetryRecoversAfterTemporaryFailure(t *testing.T) {
 	hash := 10.0
-	source := &sequenceSource{results: []sourceResult{{err: errors.New("temporary")}, {telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash}}}}
+	source := &sequenceSource{results: []sourceResult{{err: errors.New("temporary")}, {telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}}}}
 	adapter := &fakeAdapter{source: source}
 	registry := NewRegistry()
 	_ = registry.Register(adapter)
@@ -782,4 +787,274 @@ func TestTelemetryRecoversAfterTemporaryFailure(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("telemetry did not recover")
+}
+
+type epochTelemetrySource struct {
+	mu        sync.Mutex
+	telemetry *model.MinerTelemetry
+	second    chan struct{}
+	release   chan struct{}
+	calls     int
+}
+
+func (source *epochTelemetrySource) Poll(context.Context) (*model.MinerTelemetry, error) {
+	source.mu.Lock()
+	source.calls++
+	call := source.calls
+	source.mu.Unlock()
+	if call == 2 {
+		close(source.second)
+		<-source.release
+	}
+	return source.telemetry, nil
+}
+
+func TestNewConnectionEpochRequiresNewTelemetryPoll(t *testing.T) {
+	hash := 10.0
+	source := &epochTelemetrySource{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}, second: make(chan struct{}), release: make(chan struct{})}
+	registry := NewRegistry()
+	_ = registry.Register(&fakeAdapter{source: source})
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, model.Inventory{}, Config{PollInterval: time.Millisecond, StartupGrace: time.Millisecond, StaleAfter: time.Second})
+	defer manager.Shutdown(context.Background())
+	plan := testPlan(t, model.MinerModeMining)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	if _, _, err := manager.Start(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool { return manager.OverallStatus() == model.AgentStateMining })
+	<-source.second
+	manager.RequireFreshTelemetry()
+	if got := manager.OverallStatus(); got == model.AgentStateMining {
+		t.Fatal("pre-epoch telemetry still authorized MINING")
+	}
+	close(source.release)
+	waitUntil(t, time.Second, func() bool { return manager.OverallStatus() == model.AgentStateMining })
+}
+
+type blockedTelemetrySource struct {
+	entered   chan struct{}
+	release   chan struct{}
+	telemetry *model.MinerTelemetry
+	once      sync.Once
+}
+
+func (source *blockedTelemetrySource) Poll(context.Context) (*model.MinerTelemetry, error) {
+	source.once.Do(func() { close(source.entered) })
+	<-source.release
+	return source.telemetry, nil
+}
+
+func TestLateTelemetryPollAfterStopCannotRestoreWorking(t *testing.T) {
+	hash := 10.0
+	source := &blockedTelemetrySource{entered: make(chan struct{}), release: make(chan struct{}), telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}}
+	registry := NewRegistry()
+	_ = registry.Register(&fakeAdapter{source: source})
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, model.Inventory{}, Config{PollInterval: time.Hour, StartupGrace: time.Millisecond, StaleAfter: time.Second})
+	plan := testPlan(t, model.MinerModeMining)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	if _, _, err := manager.Start(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	<-source.entered
+	if _, _, err := manager.Stop(plan.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	close(source.release)
+	manager.pollWG.Wait()
+	items := manager.List()
+	if len(items) != 1 || items[0].Process.State != model.ExecutionStopped || items[0].Telemetry != nil || manager.OverallStatus() != model.AgentStateIdle {
+		t.Fatalf("late poll changed stopped reality: %+v status=%s", items, manager.OverallStatus())
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMaintenanceHoldDuringTelemetryPollCannotRestoreWorking(t *testing.T) {
+	hash := 10.0
+	source := &blockedTelemetrySource{entered: make(chan struct{}), release: make(chan struct{}), telemetry: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")}}
+	processes := supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond})
+	registry := NewRegistry()
+	_ = registry.Register(&fakeAdapter{source: source})
+	manager := New(processes, registry, t.TempDir(), nil, model.Inventory{}, Config{PollInterval: time.Hour, StartupGrace: time.Millisecond, StaleAfter: time.Second})
+	plan := testPlan(t, model.MinerModeMining)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	if _, _, err := manager.Start(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	<-source.entered
+	if active, _, err := processes.ApplyMaintenanceHold(true, 1); err != nil || !active {
+		t.Fatalf("hold=%t err=%v", active, err)
+	}
+	close(source.release)
+	waitUntil(t, time.Second, func() bool {
+		items := manager.List()
+		return len(items) == 1 && items[0].Process.State == model.ExecutionStopped && items[0].Telemetry == nil
+	})
+	if manager.OverallStatus() != model.AgentStateIdle {
+		t.Fatalf("late poll made held execution active: %s", manager.OverallStatus())
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type watchdogBlockedTelemetrySource struct {
+	mu            sync.Mutex
+	calls         int
+	firstEntered  chan struct{}
+	releaseFirst  chan struct{}
+	secondEntered chan struct{}
+	releaseSecond chan struct{}
+	oldTelemetry  *model.MinerTelemetry
+}
+
+func (source *watchdogBlockedTelemetrySource) Poll(context.Context) (*model.MinerTelemetry, error) {
+	source.mu.Lock()
+	source.calls++
+	call := source.calls
+	source.mu.Unlock()
+	switch call {
+	case 1:
+		close(source.firstEntered)
+		<-source.releaseFirst
+		return source.oldTelemetry, nil
+	case 2:
+		close(source.secondEntered)
+		<-source.releaseSecond
+		return nil, errors.New("current process telemetry intentionally unavailable")
+	default:
+		return nil, errors.New("telemetry intentionally unavailable")
+	}
+}
+
+func TestWatchdogRestartDuringBlockedTelemetryPollRejectsOldProcessEvidence(t *testing.T) {
+	hash := 10.0
+	source := &watchdogBlockedTelemetrySource{
+		firstEntered:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondEntered: make(chan struct{}),
+		releaseSecond: make(chan struct{}),
+		oldTelemetry:  &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: testEvidence(model.UsefulWorkConfirmed, "")},
+	}
+	var releaseFirst, releaseSecond sync.Once
+	release := func() {
+		releaseFirst.Do(func() { close(source.releaseFirst) })
+		releaseSecond.Do(func() { close(source.releaseSecond) })
+	}
+	restart := make(chan time.Time, 1)
+	processes := supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond, RestartInitial: time.Second, RestartMax: time.Second, After: func(time.Duration) <-chan time.Time { return restart }})
+	registry := NewRegistry()
+	if err := registry.Register(&fakeAdapter{source: source}); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(processes, registry, t.TempDir(), nil, model.Inventory{}, Config{PollInterval: time.Nanosecond, StartupGrace: time.Millisecond, StaleAfter: time.Second})
+	defer func() {
+		release()
+		_ = manager.Shutdown(context.Background())
+	}()
+	plan := testPlan(t, model.MinerModeMining)
+	plan.RestartPolicy = model.RestartOnFailure
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	if _, _, err := manager.Start(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	<-source.firstEntered
+	first, ok := processes.Get(plan.ExecutionID)
+	if !ok || first.State != model.ExecutionRunning || first.PID <= 0 || first.ProcessInstance == "" {
+		t.Fatalf("initial process was not running: %+v", first)
+	}
+	if err := syscall.Kill(-first.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		current, exists := processes.Get(plan.ExecutionID)
+		return exists && current.State == model.ExecutionBackoff
+	})
+	restart <- time.Now()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		current, exists := processes.Get(plan.ExecutionID)
+		if exists && current.State == model.ExecutionRunning && current.ProcessInstance != "" && (current.PID != first.PID || !current.StartedAt.Equal(first.StartedAt)) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if current, _ := processes.Get(plan.ExecutionID); current.State != model.ExecutionRunning || current.ProcessInstance == "" || (current.PID == first.PID && current.StartedAt.Equal(first.StartedAt)) {
+		t.Fatalf("watchdog replacement did not start: %+v", current)
+	}
+	releaseFirst.Do(func() { close(source.releaseFirst) })
+	<-source.secondEntered // The old poll has completed its generation check.
+	current, _ := processes.Get(plan.ExecutionID)
+	items := manager.List()
+	if (current.PID == first.PID && current.StartedAt.Equal(first.StartedAt)) || len(items) != 1 || items[0].Process.PID != current.PID || !items[0].Process.StartedAt.Equal(current.StartedAt) || (items[0].Telemetry != nil && items[0].Telemetry.Health == model.MinerHealthMining) || manager.OverallStatus() == model.AgentStateMining {
+		t.Fatalf("old poll blessed watchdog replacement: old=%+v current=%+v observations=%+v status=%s", first, current, items, manager.OverallStatus())
+	}
+}
+
+type replacementTelemetrySource struct {
+	mu         sync.Mutex
+	calls      int
+	oldEntered chan struct{}
+	releaseOld chan struct{}
+	old        *model.MinerTelemetry
+	current    *model.MinerTelemetry
+}
+
+func (source *replacementTelemetrySource) Poll(context.Context) (*model.MinerTelemetry, error) {
+	source.mu.Lock()
+	source.calls++
+	call := source.calls
+	source.mu.Unlock()
+	if call == 1 {
+		close(source.oldEntered)
+		<-source.releaseOld
+		return source.old, nil
+	}
+	return source.current, nil
+}
+
+func TestLateTelemetryForReplacedExecutionCannotBlessReplacement(t *testing.T) {
+	hash := 10.0
+	oldEvidence := testEvidence(model.UsefulWorkConfirmed, "")
+	oldEvidence.Provider = "old-source"
+	newEvidence := testEvidence(model.UsefulWorkConfirmed, "")
+	newEvidence.Provider = "new-source"
+	source := &replacementTelemetrySource{oldEntered: make(chan struct{}), releaseOld: make(chan struct{}), old: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: oldEvidence}, current: &model.MinerTelemetry{AdapterID: "test-no-http", HashrateShortHPS: &hash, UsefulWork: newEvidence}}
+	registry := NewRegistry()
+	_ = registry.Register(&fakeAdapter{source: source})
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, model.Inventory{}, Config{PollInterval: time.Hour, StartupGrace: time.Millisecond, StaleAfter: time.Second})
+	first := testPlan(t, model.MinerModeMining)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: first.HostID}, CPU: model.CPU{Threads: 4}})
+	if _, _, err := manager.Start(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	<-source.oldEntered
+	if _, _, err := manager.Stop(first.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	second := testPlan(t, model.MinerModeMining)
+	second.HostID = first.HostID
+	second.Ownership.HostID = first.HostID
+	if _, _, err := manager.Start(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		for _, item := range manager.List() {
+			if item.Process.ExecutionID == second.ExecutionID && item.Telemetry != nil && item.Telemetry.UsefulWork != nil {
+				return item.Telemetry.UsefulWork.Provider == "new-source" && item.Telemetry.Health == model.MinerHealthMining
+			}
+		}
+		return false
+	})
+	close(source.releaseOld)
+	time.Sleep(5 * time.Millisecond)
+	for _, item := range manager.List() {
+		if item.Process.ExecutionID == second.ExecutionID && (item.Telemetry == nil || item.Telemetry.UsefulWork == nil || item.Telemetry.UsefulWork.Provider != "new-source") {
+			t.Fatalf("old execution telemetry contaminated replacement: %+v", item)
+		}
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }

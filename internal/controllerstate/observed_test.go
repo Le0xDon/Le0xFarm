@@ -163,3 +163,126 @@ func TestOlderExecutionSnapshotCannotOverwriteNewerRuntimeResult(t *testing.T) {
 		t.Fatalf("newer runtime fact was lost: %+v", got.Executions)
 	}
 }
+
+func TestUsefulWorkEvidenceIsEpochScopedAndDeepCopied(t *testing.T) {
+	store := New()
+	hostID, _ := identity.NewHostID()
+	agentID, _ := identity.NewAgentID()
+	executionID, _ := identity.NewExecutionID()
+	last := time.Unix(900, 0).UTC()
+	healthy := true
+	accepted := uint64(1)
+	evidence := &model.UsefulWorkEvidence{Provider: "test", Availability: model.TelemetryAvailable, RuntimeHealthy: &healthy, UsefulWork: model.UsefulWorkConfirmed, AcceptedWork: &accepted, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, LastUsefulWorkAt: &last, Metrics: []model.WorkMetric{{Kind: "TASKS", Unit: "TASK/S", Value: 1}}}
+	store.Connect(agentID, hostID, 1)
+	if !store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: executionID, Status: model.ExecutionRunning, UsefulWork: evidence}}, time.Now(), 0) {
+		t.Fatal("current telemetry rejected")
+	}
+	first, _ := store.Get(hostID)
+	first.Executions[0].UsefulWork.Metrics[0].Kind = "MUTATED"
+	*first.Executions[0].UsefulWork.LastUsefulWorkAt = time.Time{}
+	*first.Executions[0].UsefulWork.AcceptedWork = 99
+	*first.Executions[0].UsefulWork.RuntimeHealthy = false
+	second, _ := store.Get(hostID)
+	if second.Executions[0].UsefulWork.Metrics[0].Kind != "TASKS" || second.Executions[0].UsefulWork.LastUsefulWorkAt.IsZero() || *second.Executions[0].UsefulWork.AcceptedWork != 1 || !*second.Executions[0].UsefulWork.RuntimeHealthy {
+		t.Fatal("caller mutated retained useful-work evidence")
+	}
+	if !store.Connect(agentID, hostID, 2) {
+		t.Fatal("new epoch rejected")
+	}
+	if store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: executionID, Status: model.ExecutionRunning, UsefulWork: evidence}}, time.Now(), 1) {
+		t.Fatal("old-epoch telemetry was accepted")
+	}
+	current, _ := store.Get(hostID)
+	if len(current.Executions) != 0 || current.Fresh {
+		t.Fatalf("new epoch inherited old telemetry: %+v", current)
+	}
+}
+
+func TestControllerObservationExpiresUsefulWorkBeforeHostFreshness(t *testing.T) {
+	now := time.Unix(2_000, 0).UTC()
+	store := NewWithOptions(StoreOptions{Now: func() time.Time { return now }, FreshnessTimeout: 45 * time.Second})
+	hostID, _ := identity.NewHostID()
+	agentID, _ := identity.NewAgentID()
+	executionID, _ := identity.NewExecutionID()
+	evidence := &model.UsefulWorkEvidence{Provider: "test", Availability: model.TelemetryAvailable, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, CollectedAt: now, FreshFor: 10 * time.Second}
+	store.Connect(agentID, hostID, 1)
+	store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: executionID, Status: model.ExecutionRunning, MinerTelemetry: &model.MinerTelemetry{CollectedAt: now, Health: model.MinerHealthMining}, UsefulWork: evidence}}, now, 0)
+	store.SetAgentState(hostID, 1, model.AgentStateMining)
+	if got, _ := store.Get(hostID); got.Executions[0].UsefulWork.Availability != model.TelemetryAvailable || got.AgentState != model.AgentStateMining {
+		t.Fatalf("fresh evidence changed early: %+v", got)
+	}
+	now = now.Add(10*time.Second + time.Nanosecond)
+	got, _ := store.Get(hostID)
+	if !got.Fresh || got.Executions[0].UsefulWork.Availability != model.TelemetryStale || got.Executions[0].MinerTelemetry.Health != model.MinerHealthDegraded || got.AgentState != model.AgentStateDegraded {
+		t.Fatalf("stale evidence remained confirmed: %+v", got)
+	}
+}
+
+func TestGenericUsefulWorkExpiryWithoutMinerTelemetryDegradesHost(t *testing.T) {
+	now := time.Unix(3_000, 0).UTC()
+	store := NewWithOptions(StoreOptions{Now: func() time.Time { return now }, FreshnessTimeout: time.Minute})
+	hostID, _ := identity.NewHostID()
+	agentID, _ := identity.NewAgentID()
+	executionID, _ := identity.NewExecutionID()
+	evidence := &model.UsefulWorkEvidence{Provider: "future-compute", Availability: model.TelemetryAvailable, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, CollectedAt: now, FreshFor: 5 * time.Second}
+	store.Connect(agentID, hostID, 1)
+	store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: executionID, Status: model.ExecutionRunning, UsefulWork: evidence}}, now, 0)
+	store.SetAgentState(hostID, 1, model.AgentStateMining)
+	if fresh, _ := store.Get(hostID); fresh.AgentState != model.AgentStateMining || fresh.Executions[0].UsefulWork.Availability != model.TelemetryAvailable {
+		t.Fatalf("fresh generic evidence did not retain working state: %+v", fresh)
+	}
+	now = now.Add(5*time.Second + time.Nanosecond)
+	stale, _ := store.Get(hostID)
+	if stale.AgentState != model.AgentStateDegraded || stale.Executions[0].UsefulWork.Availability != model.TelemetryStale {
+		t.Fatalf("stale generic evidence left host working: %+v", stale)
+	}
+}
+
+func TestUsefulWorkAgeIsDerivedWithoutDoubleAging(t *testing.T) {
+	now := time.Unix(4_000, 0).UTC()
+	store := NewWithOptions(StoreOptions{Now: func() time.Time { return now }, FreshnessTimeout: time.Minute})
+	hostID, _ := identity.NewHostID()
+	agentID, _ := identity.NewAgentID()
+	executionID, _ := identity.NewExecutionID()
+	evidence := &model.UsefulWorkEvidence{Provider: "future-compute", Availability: model.TelemetryAvailable, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, CollectedAt: now.Add(-2 * time.Second), Age: 2 * time.Second, FreshFor: 30 * time.Second}
+	store.Connect(agentID, hostID, 1)
+	store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: executionID, Status: model.ExecutionRunning, UsefulWork: evidence}}, now, 0)
+	now = now.Add(3 * time.Second)
+	first, _ := store.Get(hostID)
+	second, _ := store.Get(hostID)
+	if first.Executions[0].UsefulWork.Age != 5*time.Second || second.Executions[0].UsefulWork.Age != 5*time.Second {
+		t.Fatalf("repeated read double-aged evidence: first=%s second=%s", first.Executions[0].UsefulWork.Age, second.Executions[0].UsefulWork.Age)
+	}
+	now = now.Add(time.Second)
+	third, _ := store.Get(hostID)
+	if third.Executions[0].UsefulWork.Age != 6*time.Second {
+		t.Fatalf("evidence age did not derive from retained source sample: %s", third.Executions[0].UsefulWork.Age)
+	}
+}
+
+func TestMixedUsefulWorkAggregationIsTruthful(t *testing.T) {
+	now := time.Unix(5_000, 0).UTC()
+	store := NewWithOptions(StoreOptions{Now: func() time.Time { return now }, FreshnessTimeout: time.Minute})
+	hostID, _ := identity.NewHostID()
+	agentID, _ := identity.NewAgentID()
+	staleID, _ := identity.ParseExecutionID("execution_0123456789abcdef0123456789abcdef")
+	freshID, _ := identity.ParseExecutionID("execution_1123456789abcdef0123456789abcdef")
+	staleEvidence := &model.UsefulWorkEvidence{Provider: "old-compute", Availability: model.TelemetryAvailable, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, CollectedAt: now, FreshFor: 5 * time.Second}
+	freshEvidence := &model.UsefulWorkEvidence{Provider: "current-compute", Availability: model.TelemetryAvailable, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported, CollectedAt: now, FreshFor: 20 * time.Second}
+	store.Connect(agentID, hostID, 1)
+	store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: staleID, Status: model.ExecutionRunning, UsefulWork: staleEvidence}, {ExecutionID: freshID, Status: model.ExecutionRunning, UsefulWork: freshEvidence}}, now, 0)
+	store.SetAgentState(hostID, 1, model.AgentStateMining)
+	now = now.Add(10 * time.Second)
+	mixed, _ := store.Get(hostID)
+	if mixed.AgentState != model.AgentStateDegraded || mixed.Executions[0].UsefulWork.Availability != model.TelemetryStale || mixed.Executions[1].UsefulWork.Availability != model.TelemetryAvailable {
+		t.Fatalf("mixed fresh/stale aggregation was not conservative: %+v", mixed)
+	}
+
+	store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: staleID, Status: model.ExecutionStopped, UsefulWork: staleEvidence}, {ExecutionID: freshID, Status: model.ExecutionRunning, UsefulWork: freshEvidence}}, now, 0)
+	store.SetAgentState(hostID, 1, model.AgentStateMining)
+	now = now.Add(10 * time.Second)
+	stoppedOld, _ := store.Get(hostID)
+	if stoppedOld.AgentState != model.AgentStateMining || stoppedOld.Executions[0].UsefulWork.Availability != model.TelemetryStale || stoppedOld.Executions[1].UsefulWork.Availability != model.TelemetryAvailable {
+		t.Fatalf("stopped historical evidence affected active host status: %+v", stoppedOld)
+	}
+}

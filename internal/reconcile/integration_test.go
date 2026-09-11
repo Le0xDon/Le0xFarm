@@ -89,7 +89,8 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	dialer := &switchingBufDialer{}
 	runtime := supervisor.New(supervisor.Config{StopGrace: 100 * time.Millisecond})
 	registry := minerruntime.NewRegistry()
-	if err := registry.Register(sleepRuntimeAdapter{}); err != nil {
+	telemetrySource := &reconnectBarrierTelemetrySource{}
+	if err := registry.Register(sleepRuntimeAdapter{telemetry: telemetrySource}); err != nil {
 		t.Fatal(err)
 	}
 	facts, _ := inventory.Local().Discover(hostID)
@@ -130,13 +131,17 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		return server, commands, coordinator, store, db, cancel, done
 	}
 
-	server1, commands1, _, _, db1, stop1, done1 := startController()
+	server1, commands1, coordinator1, _, db1, stop1, done1 := startController()
 	waitSessionReady(t, server1, hostID)
 	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionRunning)
+	waitUsefulWorkConfirmed(t, coordinator1.observed, hostID, snapshot.ExecutionID)
 	first := mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID)
 	if commands1.Count(controllernet.RuntimeStart) != 1 {
 		t.Fatalf("initial START count=%d", commands1.Count(controllernet.RuntimeStart))
 	}
+	pollEntered, releasePoll := telemetrySource.blockNext()
+	defer releasePoll()
+	<-pollEntered
 	stop1()
 	if err := <-done1; err != nil {
 		t.Fatal(err)
@@ -150,6 +155,22 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 
 	server2, commands2, coordinator2, store2, db2, stop2, done2 := startController()
 	waitSessionReady(t, server2, hostID)
+	currentObservation, ok := coordinator2.observed.Get(hostID)
+	if !ok {
+		t.Fatal("restarted Controller has no current-epoch observation")
+	}
+	foundRunningWithoutOldEvidence := false
+	for _, execution := range currentObservation.Executions {
+		if execution.ExecutionID != snapshot.ExecutionID {
+			continue
+		}
+		foundRunningWithoutOldEvidence = execution.Status == model.ExecutionRunning && execution.PID == first.PID && (execution.UsefulWork == nil || execution.UsefulWork.Availability != model.TelemetryAvailable || execution.UsefulWork.UsefulWork != model.UsefulWorkConfirmed)
+	}
+	if !foundRunningWithoutOldEvidence || currentObservation.AgentState == model.AgentStateMining {
+		t.Fatalf("old-epoch telemetry was authoritative before a fresh poll: %+v", currentObservation)
+	}
+	releasePoll()
+	waitUsefulWorkConfirmed(t, coordinator2.observed, hostID, snapshot.ExecutionID)
 	time.Sleep(30 * time.Millisecond)
 	if commands2.Count(controllernet.RuntimeStart) != 0 || mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID).PID != first.PID {
 		t.Fatal("restarted Controller duplicated the persisted execution")
@@ -448,7 +469,9 @@ func TestGPUDesiredRuntimeFullPathAndHardwareInvalidation(t *testing.T) {
 	}
 }
 
-type sleepRuntimeAdapter struct{}
+type sleepRuntimeAdapter struct {
+	telemetry minerruntime.TelemetrySource
+}
 
 const integrationGPUAdapterID = "integration-gpu-sleep"
 
@@ -535,27 +558,72 @@ func (sleepRuntimeAdapter) Capabilities() minerruntime.Capabilities {
 func (sleepRuntimeAdapter) Validate(model.MinerSpec, model.Inventory) ([]string, error) {
 	return nil, nil
 }
-func (sleepRuntimeAdapter) Prepare(_ context.Context, request minerruntime.PrepareRequest) (minerruntime.Prepared, error) {
+func (adapter sleepRuntimeAdapter) Prepare(_ context.Context, request minerruntime.PrepareRequest) (minerruntime.Prepared, error) {
 	plan := request.Plan
 	plan.Executable = "/bin/sleep"
 	plan.Args = []string{"60"}
 	plan.RestartPolicy = model.RestartNever
-	return minerruntime.Prepared{Plan: plan, Telemetry: healthyTestTelemetry{}}, nil
+	telemetry := adapter.telemetry
+	if telemetry == nil {
+		telemetry = healthyTestTelemetry{}
+	}
+	return minerruntime.Prepared{Plan: plan, Telemetry: telemetry}, nil
 }
 
 type healthyTestTelemetry struct{}
 
 func (healthyTestTelemetry) Poll(context.Context) (*model.MinerTelemetry, error) {
-	return &model.MinerTelemetry{AdapterID: integrationAdapterID, Health: model.MinerHealthHealthy}, nil
+	healthy := true
+	return &model.MinerTelemetry{AdapterID: integrationAdapterID, UsefulWork: &model.UsefulWorkEvidence{Provider: integrationAdapterID, Availability: model.TelemetryAvailable, RuntimeHealthy: &healthy, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported}}, nil
+}
+
+type reconnectBarrierTelemetrySource struct {
+	mu      sync.Mutex
+	block   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (source *reconnectBarrierTelemetrySource) Poll(context.Context) (*model.MinerTelemetry, error) {
+	source.mu.Lock()
+	block, entered, release := source.block, source.entered, source.release
+	source.mu.Unlock()
+	if block {
+		close(entered)
+		<-release
+	}
+	return healthyTestTelemetry{}.Poll(context.Background())
+}
+
+func (source *reconnectBarrierTelemetrySource) blockNext() (<-chan struct{}, func()) {
+	source.mu.Lock()
+	source.block = true
+	source.entered = make(chan struct{})
+	source.release = make(chan struct{})
+	entered, release := source.entered, source.release
+	source.mu.Unlock()
+	var once sync.Once
+	return entered, func() {
+		once.Do(func() {
+			source.mu.Lock()
+			if source.release == release {
+				source.block = false
+			}
+			source.mu.Unlock()
+			close(release)
+		})
+	}
 }
 
 type gpuHealthyTestTelemetry struct{}
 
 func (gpuHealthyTestTelemetry) Poll(context.Context) (*model.MinerTelemetry, error) {
+	healthy := true
 	return &model.MinerTelemetry{
 		AdapterID:   integrationGPUAdapterID,
 		CollectedAt: time.Now().UTC(),
 		Health:      model.MinerHealthHealthy,
+		UsefulWork:  &model.UsefulWorkEvidence{Provider: integrationGPUAdapterID, Availability: model.TelemetryAvailable, RuntimeHealthy: &healthy, UsefulWork: model.UsefulWorkConfirmed, Upstream: model.UpstreamUnknown, Confidence: model.EvidenceConfidenceAdapterReported},
 	}, nil
 }
 
@@ -681,4 +749,21 @@ func waitObservedExecutionState(t *testing.T, observed *controllerstate.Store, h
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("Controller did not observe execution %s in state %s", executionID, state)
+}
+
+func waitUsefulWorkConfirmed(t *testing.T, observed *controllerstate.Store, hostID identity.HostID, executionID identity.ExecutionID) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		current, ok := observed.Get(hostID)
+		if ok {
+			for _, execution := range current.Executions {
+				if execution.ExecutionID == executionID && execution.UsefulWork != nil && execution.UsefulWork.Availability == model.TelemetryAvailable && execution.UsefulWork.UsefulWork == model.UsefulWorkConfirmed && execution.MinerTelemetry != nil && execution.MinerTelemetry.Health == model.MinerHealthMining {
+					return
+				}
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Controller did not receive confirmed useful work for %s", executionID)
 }

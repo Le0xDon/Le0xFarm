@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 )
@@ -257,7 +258,43 @@ func (store *Store) Get(hostID identity.HostID) (HostObservation, bool) {
 		item.observation.ProcessesFresh = false
 		item.observation.Revision++
 	}
-	return cloneObservation(item.observation), true
+	result := cloneObservation(item.observation)
+	if !item.freshAt.IsZero() {
+		ageObservedTelemetry(&result, store.now().Sub(item.freshAt))
+	}
+	return result, true
+}
+
+func ageObservedTelemetry(observation *HostObservation, elapsed time.Duration) {
+	if elapsed <= 0 {
+		return
+	}
+	staleWorking := false
+	for index := range observation.Executions {
+		execution := &observation.Executions[index]
+		telemetry := execution.MinerTelemetry
+		evidence := execution.UsefulWork
+		if evidence == nil {
+			continue
+		}
+		if telemetry != nil {
+			telemetry.Age += elapsed
+		}
+		evidence.Age += elapsed
+		if evidence.Availability == model.TelemetryAvailable && evidence.FreshFor > 0 && evidence.Age > evidence.FreshFor {
+			wasConfirmedActive := execution.Status == model.ExecutionRunning && evidence.UsefulWork == model.UsefulWorkConfirmed
+			evidence.Availability = model.TelemetryStale
+			evidence.ReasonCode = farmerr.TELEMETRY_STALE
+			if telemetry != nil {
+				telemetry.Health = model.MinerHealthDegraded
+				telemetry.ErrorCode = farmerr.TELEMETRY_STALE
+			}
+			staleWorking = staleWorking || wasConfirmedActive
+		}
+	}
+	if staleWorking && observation.AgentState == model.AgentStateMining {
+		observation.AgentState = model.AgentStateDegraded
+	}
 }
 
 func (store *Store) current(hostID identity.HostID, epoch ConnectionEpoch) *entry {
@@ -299,6 +336,7 @@ func cloneExecutions(values []model.ExecutionObservation) []model.ExecutionObser
 }
 
 func cloneExecution(value model.ExecutionObservation) model.ExecutionObservation {
+	value.Warnings = append([]string(nil), value.Warnings...)
 	if value.Ownership != nil {
 		copy := *value.Ownership
 		copy.DeviceIDs = append([]identity.DeviceID(nil), value.Ownership.DeviceIDs...)
@@ -311,9 +349,89 @@ func cloneExecution(value model.ExecutionObservation) model.ExecutionObservation
 	if value.MinerTelemetry != nil {
 		copy := *value.MinerTelemetry
 		copy.PerDevice = append([]model.DeviceHashrate(nil), value.MinerTelemetry.PerDevice...)
+		copy.HashrateShortHPS = copyFloat64(value.MinerTelemetry.HashrateShortHPS)
+		copy.HashrateMediumHPS = copyFloat64(value.MinerTelemetry.HashrateMediumHPS)
+		copy.HashrateLongHPS = copyFloat64(value.MinerTelemetry.HashrateLongHPS)
+		copy.HighestHashrateHPS = copyFloat64(value.MinerTelemetry.HighestHashrateHPS)
+		copy.AcceptedShares = copyUint64(value.MinerTelemetry.AcceptedShares)
+		copy.RejectedShares = copyUint64(value.MinerTelemetry.RejectedShares)
+		copy.StaleShares = copyUint64(value.MinerTelemetry.StaleShares)
+		copy.TotalResults = copyUint64(value.MinerTelemetry.TotalResults)
+		copy.PoolConnected = copyBool(value.MinerTelemetry.PoolConnected)
+		copy.PoolLatencyMS = copyUint32(value.MinerTelemetry.PoolLatencyMS)
+		copy.HugePagesAvailable = copyBool(value.MinerTelemetry.HugePagesAvailable)
+		copy.HugePagesPercent = copyFloat64(value.MinerTelemetry.HugePagesPercent)
+		copy.MSRAvailable = copyBool(value.MinerTelemetry.MSRAvailable)
+		if value.MinerTelemetry.UsefulWork != nil {
+			evidence := *value.MinerTelemetry.UsefulWork
+			evidence.RuntimeHealthy = copyBool(value.MinerTelemetry.UsefulWork.RuntimeHealthy)
+			evidence.JobPresent = copyBool(value.MinerTelemetry.UsefulWork.JobPresent)
+			evidence.AcceptedWork = copyUint64(value.MinerTelemetry.UsefulWork.AcceptedWork)
+			evidence.RejectedWork = copyUint64(value.MinerTelemetry.UsefulWork.RejectedWork)
+			evidence.StaleWork = copyUint64(value.MinerTelemetry.UsefulWork.StaleWork)
+			evidence.EndpointVisible = copyBool(value.MinerTelemetry.UsefulWork.EndpointVisible)
+			evidence.Metrics = append([]model.WorkMetric(nil), value.MinerTelemetry.UsefulWork.Metrics...)
+			if value.MinerTelemetry.UsefulWork.LastUsefulWorkAt != nil {
+				last := *value.MinerTelemetry.UsefulWork.LastUsefulWorkAt
+				evidence.LastUsefulWorkAt = &last
+			}
+			copy.UsefulWork = &evidence
+		}
 		value.MinerTelemetry = &copy
 	}
+	value.UsefulWork = copyUsefulWork(value.UsefulWork)
 	return value
+}
+
+func copyUsefulWork(value *model.UsefulWorkEvidence) *model.UsefulWorkEvidence {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.RuntimeHealthy = copyBool(value.RuntimeHealthy)
+	copy.JobPresent = copyBool(value.JobPresent)
+	copy.AcceptedWork = copyUint64(value.AcceptedWork)
+	copy.RejectedWork = copyUint64(value.RejectedWork)
+	copy.StaleWork = copyUint64(value.StaleWork)
+	copy.EndpointVisible = copyBool(value.EndpointVisible)
+	copy.Metrics = append([]model.WorkMetric(nil), value.Metrics...)
+	if value.LastUsefulWorkAt != nil {
+		last := *value.LastUsefulWorkAt
+		copy.LastUsefulWorkAt = &last
+	}
+	return &copy
+}
+
+func copyBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyUint32(value *uint32) *uint32 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyUint64(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyFloat64(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func compare(a, b string) int {

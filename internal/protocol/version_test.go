@@ -3,7 +3,7 @@ package protocol
 import "testing"
 
 func TestM43Versions(t *testing.T) {
-	if CurrentProtocolVersion != 5 {
+	if CurrentProtocolVersion != 6 {
 		t.Fatalf("ProtocolVersion=%d", CurrentProtocolVersion)
 	}
 	if CurrentSchemaVersion != 1 {

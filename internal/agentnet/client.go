@@ -235,6 +235,9 @@ func connectOnce(ctx context.Context, config Config) error {
 			return err
 		}
 	}
+	if config.MinerRuntime != nil {
+		config.MinerRuntime.RequireFreshTelemetry()
+	}
 	config.Output.Printf("Connected to Controller %s (Farm %s)", hello.ControllerId, hello.FarmId)
 	heartbeats := make(chan error, 1)
 	var sendMu sync.Mutex
@@ -264,6 +267,7 @@ func connectOnce(ctx context.Context, config Config) error {
 	for {
 		message, err := stream.Recv()
 		if err != nil {
+			err = establishedStreamError(ctx, err)
 			select {
 			case commandErr := <-commandErrors:
 				return sessionError{err: commandErr, established: true}
@@ -294,6 +298,22 @@ func connectOnce(ctx context.Context, config Config) error {
 		default:
 		}
 	}
+}
+
+func establishedStreamError(parent context.Context, err error) error {
+	if parent.Err() != nil {
+		return parent.Err()
+	}
+	// gRPC can publish DeadlineExceeded just before context propagates the same
+	// already-expired parent deadline. Synchronize that terminal condition so
+	// callers never mistake a healthy, parent-cancelled stream for transport loss.
+	if status.Code(err) == codes.DeadlineExceeded {
+		if deadline, ok := parent.Deadline(); ok && !time.Now().Before(deadline) {
+			<-parent.Done()
+			return parent.Err()
+		}
+	}
+	return err
 }
 
 func bootstrap(ctx context.Context, config Config, binding agenttrust.Binding, hasBinding bool) error {
@@ -743,6 +763,24 @@ func wireObservation(observation minerruntime.Observation) *le0xv1.Execution {
 			wire.PerDevice = append(wire.PerDevice, &le0xv1.DeviceHashrate{DeviceId: device.DeviceID.String(), HashrateHps: device.HashrateHPS})
 		}
 		out.MinerTelemetry = wire
+		out.UsefulWork = wireUsefulWork(telemetry.UsefulWork)
+	}
+	return out
+}
+
+func wireUsefulWork(evidence *model.UsefulWorkEvidence) *le0xv1.UsefulWorkEvidence {
+	if evidence == nil {
+		return nil
+	}
+	out := &le0xv1.UsefulWorkEvidence{Provider: evidence.Provider, Availability: string(evidence.Availability), RuntimeHealthy: evidence.RuntimeHealthy, JobPresent: evidence.JobPresent, UsefulWork: string(evidence.UsefulWork), AcceptedWork: evidence.AcceptedWork, RejectedWork: evidence.RejectedWork, StaleWork: evidence.StaleWork, Upstream: string(evidence.Upstream), EndpointVisible: evidence.EndpointVisible, Confidence: string(evidence.Confidence), AgeMilliseconds: uint64(max(evidence.Age.Milliseconds(), 0)), ReasonCode: string(evidence.ReasonCode), FreshForMilliseconds: uint64(max(evidence.FreshFor.Milliseconds(), 0))}
+	if !evidence.CollectedAt.IsZero() {
+		out.CollectedAt = timestamppb.New(evidence.CollectedAt)
+	}
+	if evidence.LastUsefulWorkAt != nil && !evidence.LastUsefulWorkAt.IsZero() {
+		out.LastUsefulWorkAt = timestamppb.New(*evidence.LastUsefulWorkAt)
+	}
+	for _, metric := range evidence.Metrics {
+		out.Metrics = append(out.Metrics, &le0xv1.WorkMetric{Kind: metric.Kind, Unit: metric.Unit, Value: metric.Value})
 	}
 	return out
 }
