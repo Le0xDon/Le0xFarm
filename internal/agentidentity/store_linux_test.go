@@ -144,20 +144,66 @@ func TestConcurrentFirstRun(t *testing.T) {
 	const count = 16
 	ids := make([]Identity, count)
 	errs := make([]error, count)
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range ids {
 		wg.Add(1)
-		go func() { defer wg.Done(); ids[i], errs[i] = LoadOrCreate(dir) }()
+		go func() {
+			defer wg.Done()
+			<-start
+			ids[i], errs[i] = LoadOrCreate(dir)
+		}()
 	}
+	close(start)
 	wg.Wait()
 	for i := range ids {
 		if errs[i] != nil || ids[i] != ids[0] {
 			t.Fatalf("concurrent identity mismatch: %v", errs[i])
 		}
 	}
+	persisted, err := LoadOrCreate(dir)
+	if err != nil || persisted != ids[0] {
+		t.Fatalf("persisted identity mismatch: %v", err)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 1 {
 		t.Fatal("concurrent creation left temporary files")
+	}
+}
+
+func TestConcurrentPublishBetweenReadAndExistenceCheck(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agent")
+	afterMissing := make(chan struct{})
+	continueLoad := make(chan struct{})
+	type result struct {
+		id  Identity
+		err error
+	}
+	loser := make(chan result, 1)
+	go func() {
+		id, err := loadOrCreate(dir, func() {
+			close(afterMissing)
+			<-continueLoad
+		})
+		loser <- result{id: id, err: err}
+	}()
+
+	<-afterMissing
+	winner, err := LoadOrCreate(dir)
+	close(continueLoad)
+	if err != nil {
+		t.Fatalf("publish winning identity: %v", err)
+	}
+	got := <-loser
+	if got.err != nil {
+		t.Fatalf("load concurrently published identity: %v", got.err)
+	}
+	if got.id != winner {
+		t.Fatalf("identities did not converge: loser=%+v winner=%+v", got.id, winner)
+	}
+	persisted, err := LoadOrCreate(dir)
+	if err != nil || persisted != winner {
+		t.Fatalf("persisted identity mismatch: %v", err)
 	}
 }
 

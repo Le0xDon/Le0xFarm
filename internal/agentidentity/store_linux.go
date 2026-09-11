@@ -61,6 +61,10 @@ func storageError(code farmerr.Code, path string, err error) error {
 // A synced temporary file is published with an atomic no-replace hard link.
 // Concurrent initializers converge on the winner's identity without overwriting it.
 func LoadOrCreate(dir string) (Identity, error) {
+	return loadOrCreate(dir, nil)
+}
+
+func loadOrCreate(dir string, afterInitialNotFound func()) (Identity, error) {
 	var empty Identity
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return empty, storageError(farmerr.INTERNAL_ERROR, dir, err)
@@ -83,12 +87,20 @@ func LoadOrCreate(dir string) (Identity, error) {
 		}
 		return id, nil
 	}
-	// Reject dangling symlinks too: an existing directory entry is not a first run.
+	if afterInitialNotFound != nil {
+		afterInitialNotFound()
+	}
+	// A concurrent initializer may have published a valid identity since read.
+	// Re-read through the normal validation path; unsafe entries still fail closed.
 	if _, err := root.Lstat(FileName); !errors.Is(err, os.ErrNotExist) {
-		if err == nil {
-			err = errors.New("identity path already exists but cannot be read")
+		if err != nil {
+			return empty, storageError(farmerr.CONFIG_CONFLICT, filepath.Join(dir, FileName), err)
 		}
-		return empty, storageError(farmerr.CONFIG_CONFLICT, filepath.Join(dir, FileName), err)
+		existing, readErr := read(root)
+		if readErr != nil {
+			return empty, storageError(farmerr.CONFIG_CONFLICT, filepath.Join(dir, FileName), readErr)
+		}
+		return existing, nil
 	}
 	host, err := identity.NewHostID()
 	if err != nil {
