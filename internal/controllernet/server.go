@@ -18,6 +18,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/controllerstate"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
 	"github.com/le0xdon/le0xfarm/internal/model"
@@ -50,6 +51,11 @@ type Config struct {
 	// AgentControl stream. Production desired-state control is a later milestone.
 	RuntimeCommands []*le0xv1.CommandEnvelope
 	RuntimeTarget   identity.AgentID
+	Maintenance     MaintenanceProvider
+}
+
+type MaintenanceProvider interface {
+	GetMaintenanceHold(context.Context, identity.HostID) (farmmodel.MaintenanceHold, bool, error)
 }
 
 type Server struct {
@@ -60,6 +66,8 @@ type Server struct {
 	grpcServer         *grpc.Server
 	mu                 sync.Mutex
 	sessionLifecycleMu sync.Mutex
+	maintenanceMu      sync.Mutex
+	maintenanceLocks   map[identity.HostID]*sync.Mutex
 	connections        int
 	nextEpoch          controllerstate.ConnectionEpoch
 	sessions           map[identity.HostID]*liveSession
@@ -71,6 +79,9 @@ type pendingCommand struct {
 	nonce           []byte
 	request         *RuntimeRequest
 	runtimeSequence uint64
+	holdActive      bool
+	holdRevision    uint64
+	done            chan error
 }
 
 func New(config Config) (*Server, error) {
@@ -106,7 +117,7 @@ func New(config Config) (*Server, error) {
 			return nil, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "runtime commands require a target AgentID"}
 		}
 	}
-	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config, sessions: make(map[identity.HostID]*liveSession)}, nil
+	return &Server{controllerID: config.ControllerID, farmID: config.FarmID, config: config, sessions: make(map[identity.HostID]*liveSession), maintenanceLocks: make(map[identity.HostID]*sync.Mutex)}, nil
 }
 
 func (s *Server) IDs() (identity.ControllerID, identity.FarmID) { return s.controllerID, s.farmID }
@@ -218,7 +229,11 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 				}
 				return err
 			}
-			return stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: s.config.ProtocolVersion, SchemaVersion: s.config.SchemaVersion, ControllerId: s.controllerID.String(), FarmId: s.farmID.String(), AgentCertificateDer: issued, FarmCaCertificateDer: s.config.PKI.CACertificateDER()}}})
+			active, revision, err := s.maintenanceState(stream.Context(), hostID)
+			if err != nil {
+				return statusError(farmerr.SERVICE_NOT_READY, "Maintenance Hold state is unavailable")
+			}
+			return stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: s.config.ProtocolVersion, SchemaVersion: s.config.SchemaVersion, ControllerId: s.controllerID.String(), FarmId: s.farmID.String(), AgentCertificateDer: issued, FarmCaCertificateDer: s.config.PKI.CACertificateDER(), MaintenanceHoldActive: active, MaintenanceHoldRevision: revision}}})
 		}
 		if err := controllerpki.VerifyAgentCertificate(cert, s.config.PKI.CA, s.farmID, agentID, hostID, time.Now()); err != nil {
 			if code, ok := farmerr.CodeOf(err); ok {
@@ -280,6 +295,14 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			return stream.Context().Err()
 		}
 	}
+	maintenanceLock := s.maintenanceLock(hostID)
+	maintenanceLock.Lock()
+	holdActive, holdRevision, err := s.maintenanceState(stream.Context(), hostID)
+	if err != nil {
+		maintenanceLock.Unlock()
+		s.sessionLifecycleMu.Unlock()
+		return statusError(farmerr.SERVICE_NOT_READY, "Maintenance Hold state is unavailable")
+	}
 	s.mu.Lock()
 	s.connections++
 	s.nextEpoch++
@@ -288,9 +311,6 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 	handler := s.handler
 	s.mu.Unlock()
 	s.sessionLifecycleMu.Unlock()
-	if handler != nil {
-		handler.SessionConnected(live.info)
-	}
 	defer func() {
 		live.revoke()
 		s.mu.Lock()
@@ -313,8 +333,13 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 	s.log("Hostname: %s", hello.Hostname)
 	s.log("Protocol: %d", hello.ProtocolVersion)
 	s.log("Schema: %d", hello.SchemaVersion)
-	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: s.config.ProtocolVersion, SchemaVersion: s.config.SchemaVersion, ControllerId: s.controllerID.String(), FarmId: s.farmID.String()}}}); err != nil {
+	if err := stream.Send(&le0xv1.ControllerMessage{Payload: &le0xv1.ControllerMessage_Hello{Hello: &le0xv1.ControllerHello{ProtocolVersion: s.config.ProtocolVersion, SchemaVersion: s.config.SchemaVersion, ControllerId: s.controllerID.String(), FarmId: s.farmID.String(), MaintenanceHoldActive: holdActive, MaintenanceHoldRevision: holdRevision}}}); err != nil {
+		maintenanceLock.Unlock()
 		return err
+	}
+	maintenanceLock.Unlock()
+	if handler != nil {
+		handler.SessionConnected(live.info)
 	}
 	queue := func(command *le0xv1.CommandEnvelope) error {
 		kind := commandKind(command)
@@ -358,7 +383,7 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 			}
 		}
 	}()
-	var gotExecutions, gotInventory, gotStatus, bootstrapRequested, devSent, ready bool
+	var gotExecutions, gotInventory, gotProcesses, gotStatus, bootstrapRequested, devSent, ready bool
 	for {
 		var message *le0xv1.AgentMessage
 		var err error
@@ -396,6 +421,9 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 				if err := queueIfAbsent(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}}); err != nil {
 					return err
 				}
+				if err := queueIfAbsent(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetUnmanagedProcesses{GetUnmanagedProcesses: &le0xv1.GetUnmanagedProcesses{}}}); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -414,8 +442,11 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 		live.pendingMu.Unlock()
 		if result.GetError() != nil {
 			s.log("%s: ERROR %s", pendingResult.kind, result.GetError().Code)
+			typed := &farmerr.Error{Code: farmerr.Code(result.GetError().Code), HumanMessage: result.GetError().HumanMessage, Details: result.GetError().Details, SuggestedFix: result.GetError().SuggestedFix, LogsRef: result.GetError().LogsRef}
+			if pendingResult.done != nil {
+				pendingResult.done <- typed
+			}
 			if pendingResult.request != nil {
-				typed := &farmerr.Error{Code: farmerr.Code(result.GetError().Code), HumanMessage: result.GetError().HumanMessage, Details: result.GetError().Details, SuggestedFix: result.GetError().SuggestedFix, LogsRef: result.GetError().LogsRef}
 				if handler := s.handlerSnapshot(); handler != nil {
 					handler.RuntimeResult(s.sessionInfo(live), *pendingResult.request, nil, typed)
 				}
@@ -501,13 +532,38 @@ func (s *Server) Connect(stream le0xv1.AgentControl_ConnectServer) error {
 					if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetInventory{GetInventory: &le0xv1.GetInventory{}}}); err != nil {
 						return err
 					}
+					if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_GetUnmanagedProcesses{GetUnmanagedProcesses: &le0xv1.GetUnmanagedProcesses{}}}); err != nil {
+						return err
+					}
 					if err := queue(&le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_Ping{Ping: &le0xv1.Ping{Nonce: nonce()}}}); err != nil {
 						return err
 					}
 				}
 			}
+		case "GET_UNMANAGED_PROCESSES":
+			if result.GetUnmanagedProcesses() == nil {
+				s.log("GET_UNMANAGED_PROCESSES: invalid result")
+			} else if parsed, err := wiremap.ParseUnmanagedProcesses(result.GetUnmanagedProcesses()); err != nil {
+				s.log("GET_UNMANAGED_PROCESSES: rejected result (%v)", err)
+			} else {
+				gotProcesses = true
+				s.log("UNMANAGED_PROCESSES: %d", len(parsed))
+				if handler, ok := s.handlerSnapshot().(ProcessSessionHandler); ok {
+					handler.ProcessesObserved(s.sessionInfo(live), parsed)
+				}
+			}
+		case "SET_MAINTENANCE_HOLD":
+			state := result.GetMaintenanceHold()
+			if pendingResult.done == nil {
+				break
+			}
+			if state == nil || state.Active != pendingResult.holdActive || state.Revision != pendingResult.holdRevision {
+				pendingResult.done <- farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "Agent returned mismatched Maintenance Hold state"}
+			} else {
+				pendingResult.done <- nil
+			}
 		}
-		if gotExecutions && gotInventory && gotStatus && !ready && s.sessionCurrent(live) {
+		if gotExecutions && gotInventory && gotProcesses && gotStatus && !ready && s.sessionCurrent(live) {
 			s.mu.Lock()
 			if s.sessions[hostID] == live {
 				live.info.Ready = true
@@ -580,7 +636,7 @@ func validateInventoryWire(in *le0xv1.Inventory, expectedHost identity.HostID) e
 
 func validAgentState(state model.AgentState) bool {
 	switch state {
-	case model.AgentStateIdle, model.AgentStateStarting, model.AgentStateMining, model.AgentStateDegraded, model.AgentStateError:
+	case model.AgentStateIdle, model.AgentStateStarting, model.AgentStateMining, model.AgentStateDegraded, model.AgentStateError, model.AgentStateMaintenance:
 		return true
 	default:
 		return false
@@ -604,6 +660,10 @@ func commandKind(command *le0xv1.CommandEnvelope) string {
 		return "GetStatus"
 	case command.GetGetInventory() != nil:
 		return "GetInventory"
+	case command.GetGetUnmanagedProcesses() != nil:
+		return "GET_UNMANAGED_PROCESSES"
+	case command.GetSetMaintenanceHold() != nil:
+		return "SET_MAINTENANCE_HOLD"
 	case command.GetStartExecution() != nil:
 		return "START_EXECUTION"
 	case command.GetStopExecution() != nil:
@@ -615,6 +675,36 @@ func commandKind(command *le0xv1.CommandEnvelope) string {
 	default:
 		return "Unknown"
 	}
+}
+
+func (s *Server) maintenanceState(ctx context.Context, hostID identity.HostID) (bool, uint64, error) {
+	if s.config.Maintenance == nil {
+		return false, 0, nil
+	}
+	hold, exists, err := s.config.Maintenance.GetMaintenanceHold(ctx, hostID)
+	if err != nil || !exists {
+		return false, 0, err
+	}
+	return hold.Active, hold.Revision, nil
+}
+
+// AcquireMaintenanceAuthority serializes persistent Hold publication with the
+// reconnect hello that establishes Agent-side process-creation authority.
+func (s *Server) AcquireMaintenanceAuthority(hostID identity.HostID) func() {
+	lock := s.maintenanceLock(hostID)
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (s *Server) maintenanceLock(hostID identity.HostID) *sync.Mutex {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	lock := s.maintenanceLocks[hostID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.maintenanceLocks[hostID] = lock
+	}
+	return lock
 }
 func (s *Server) log(format string, args ...any) {
 	if s.config.Output != nil {

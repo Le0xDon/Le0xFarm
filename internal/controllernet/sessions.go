@@ -52,6 +52,10 @@ type SessionHandler interface {
 	RuntimeResult(SessionInfo, RuntimeRequest, *model.ExecutionObservation, *farmerr.Error)
 }
 
+type ProcessSessionHandler interface {
+	ProcessesObserved(SessionInfo, []model.UnmanagedProcessObservation)
+}
+
 type liveSession struct {
 	info            SessionInfo
 	stream          le0xv1.AgentControl_ConnectServer
@@ -123,6 +127,41 @@ func (s *Server) SendRuntime(ctx context.Context, info SessionInfo, request Runt
 	}
 	go s.expireRuntimeResult(live, command.CommandId, sequence)
 	return sequence, nil
+}
+
+func (s *Server) SendMaintenanceHold(ctx context.Context, info SessionInfo, active bool, revision uint64) error {
+	s.mu.Lock()
+	live := s.sessions[info.HostID]
+	if live == nil || live.isRevoked() || live.info.ConnectionEpoch != info.ConnectionEpoch || live.info.AgentID != info.AgentID || !live.info.Authenticated {
+		s.mu.Unlock()
+		return farmerr.Error{Code: farmerr.SERVICE_NOT_READY, HumanMessage: "Agent session is unavailable for Maintenance Hold"}
+	}
+	s.mu.Unlock()
+	if revision < 1 {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "Maintenance Hold revision is invalid"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, s.config.RuntimeActionTimeout)
+	defer cancel()
+	done := make(chan error, 1)
+	command := &le0xv1.CommandEnvelope{CommandId: commandID(), Command: &le0xv1.CommandEnvelope_SetMaintenanceHold{SetMaintenanceHold: &le0xv1.SetMaintenanceHold{Active: active, Revision: revision}}}
+	if _, err := live.send(sendCtx, command, pendingCommand{kind: commandKind(command), holdActive: active, holdRevision: revision, done: done}); err != nil {
+		live.revoke()
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-sendCtx.Done():
+		live.revoke()
+		return sendCtx.Err()
+	case <-live.revoked:
+		return farmerr.Error{Code: farmerr.SERVICE_NOT_READY, HumanMessage: "Agent session closed before Maintenance Hold confirmation"}
+	case <-live.stream.Context().Done():
+		return live.stream.Context().Err()
+	}
 }
 
 func (s *Server) expireRuntimeResult(live *liveSession, commandID string, sequence uint64) {

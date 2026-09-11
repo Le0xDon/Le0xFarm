@@ -146,11 +146,12 @@ type DesiredMining struct {
 type AgentState string
 
 const (
-	AgentStateIdle     AgentState = "IDLE"
-	AgentStateStarting AgentState = "STARTING"
-	AgentStateMining   AgentState = "MINING"
-	AgentStateDegraded AgentState = "DEGRADED"
-	AgentStateError    AgentState = "ERROR"
+	AgentStateIdle        AgentState = "IDLE"
+	AgentStateStarting    AgentState = "STARTING"
+	AgentStateMining      AgentState = "MINING"
+	AgentStateDegraded    AgentState = "DEGRADED"
+	AgentStateError       AgentState = "ERROR"
+	AgentStateMaintenance AgentState = "MAINTENANCE"
 )
 
 type ExecutionStatus string
@@ -184,6 +185,45 @@ type ExecutionObservation struct {
 	RestartCount   uint32
 	LastError      string
 	MinerTelemetry *MinerTelemetry
+}
+
+type ProcessResourceAttribution string
+
+const (
+	ProcessResourcesUnknown ProcessResourceAttribution = "UNKNOWN"
+	ProcessResourcesExact   ProcessResourceAttribution = "EXACT"
+)
+
+// ProcessEvidence is bounded, non-secret classification provenance. Detail is
+// explanatory metadata, never argv or environment content.
+type ProcessEvidence struct {
+	Kind     string
+	Provider string
+	Detail   string
+}
+
+// UnmanagedProcessObservation is an ephemeral process fact. ProcessInstance
+// distinguishes PID reuse and is not a Controller ownership identity.
+type UnmanagedProcessObservation struct {
+	PID             int
+	Executable      string
+	ProcessInstance string
+	CPURelevant     bool
+	GPURelevant     bool
+	ResourceScope   ProcessResourceAttribution
+	CPU             bool
+	DeviceIDs       []identity.DeviceID
+	Evidence        []ProcessEvidence
+	ObservedAt      time.Time
+}
+
+// ProcessSignature is supplied by a registered adapter/provider. It keeps
+// miner-specific classification outside the generic Linux scanner.
+type ProcessSignature struct {
+	Executable  string
+	Provider    string
+	CPURelevant bool
+	GPURelevant bool
 }
 
 // WorkloadOwnership is the adapter-neutral Controller snapshot identity that

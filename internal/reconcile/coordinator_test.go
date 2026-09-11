@@ -39,6 +39,103 @@ func TestCoordinatorOneInFlightStartAndLostResultReconnect(t *testing.T) {
 	}
 }
 
+func TestUnmanagedGPUConflictBlocksThenFreshRemovalAllowsStart(t *testing.T) {
+	host := testHost(1)
+	device, _ := identity.ParseDeviceID("device_00000000000000000000000000000001")
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{device}})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStoreWithInventory(observed, commander.info, nil, model.Inventory{Host: model.Host{HostID: host}, GPUs: []model.GPU{{DeviceID: device}}})
+	conflict := model.UnmanagedProcessObservation{PID: 44, Executable: "gpu-miner", ProcessInstance: "linux-proc-start-ticks:9", GPURelevant: true, ResourceScope: model.ProcessResourcesExact, DeviceIDs: []identity.DeviceID{device}, ObservedAt: time.Now().UTC(), Evidence: []model.ProcessEvidence{{Kind: "KNOWN_ADAPTER_EXECUTABLE", Provider: "test"}}}
+	observed.SetUnmanagedProcesses(host, 1, []model.UnmanagedProcessObservation{conflict}, time.Now())
+	coordinator.ReconcileHost(context.Background(), host)
+	if got := commander.requestsCopy(); len(got) != 0 {
+		t.Fatalf("unmanaged conflict dispatched runtime action: %+v", got)
+	}
+	current, _ := observed.Get(host)
+	if len(current.UnmanagedProcesses) != 1 || len(current.Executions) != 0 {
+		t.Fatalf("unmanaged process was adopted: %+v", current)
+	}
+	observed.SetUnmanagedProcesses(host, 1, nil, time.Now())
+	coordinator.ReconcileHost(context.Background(), host)
+	if got := commander.requestsCopy(); len(got) != 1 || got[0].Kind != controllernet.RuntimeStart {
+		t.Fatalf("fresh conflict removal did not permit START: %+v", got)
+	}
+}
+
+func TestMaintenanceHoldPreservesDesiredStopsExactAndRequiresFreshExit(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	workload := testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources)
+	store := newFakeStore(workload, snapshot)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, []model.ExecutionObservation{observedExecution(snapshot, model.ExecutionRunning)})
+
+	hold, err := coordinator.SetMaintenanceHold(context.Background(), host, 0, true, "service hardware")
+	if err != nil || !hold.Active || hold.Revision != 1 {
+		t.Fatalf("enter hold=%+v err=%v", hold, err)
+	}
+	waitRequests(t, commander, 1)
+	requests := commander.requestsCopy()
+	if requests[0].Kind != controllernet.RuntimeStop || requests[0].ExecutionID != snapshot.ExecutionID {
+		t.Fatalf("hold did not exact-stop managed execution: %+v", requests)
+	}
+	if current, _ := store.GetDesiredWorkload(context.Background(), workloadID); current.RunState != farmmodel.DesiredRunning || current.DesiredGeneration != workload.DesiredGeneration {
+		t.Fatalf("hold rewrote Desired intent: %+v", current)
+	}
+	for range 10 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if len(commander.requestsCopy()) != 1 {
+		t.Fatalf("hold caused duplicate STOP/START: %+v", commander.requestsCopy())
+	}
+	released, err := coordinator.SetMaintenanceHold(context.Background(), host, 1, false, "")
+	if err != nil || released.Active || released.Revision != 2 {
+		t.Fatalf("release hold=%+v err=%v", released, err)
+	}
+	coordinator.ReconcileHost(context.Background(), host)
+	if len(commander.requestsCopy()) != 1 {
+		t.Fatal("hold exit STARTed before fresh bootstrap")
+	}
+	coordinator.ExecutionsObserved(commander.info, nil, 1)
+	coordinator.InventoryObserved(commander.info, model.Inventory{Host: model.Host{HostID: host}})
+	coordinator.ProcessesObserved(commander.info, nil)
+	coordinator.StatusObserved(commander.info, model.AgentStateIdle)
+	waitRequests(t, commander, 2)
+	if got := commander.requestsCopy()[1]; got.Kind != controllernet.RuntimeStart || got.ExecutionID != snapshot.ExecutionID {
+		t.Fatalf("fresh hold exit did not resume normal reconcile: %+v", got)
+	}
+	if got := commander.holdsCopy(); len(got) != 2 || !got[0].active || got[0].revision != 1 || got[1].active || got[1].revision != 2 {
+		t.Fatalf("Agent hold commands=%+v", got)
+	}
+}
+
+func TestMaintenanceHoldSuppressesInitialAndReconnectReconcile(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	store.holds[host] = farmmodel.MaintenanceHold{HostID: host, Active: true, Revision: 4}
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, nil)
+	coordinator.ReconcileHost(context.Background(), host)
+	coordinator.SessionDisconnected(commander.info)
+	commander.setEpoch(2)
+	readyStore(observed, commander.info, nil)
+	coordinator.ReconcileHost(context.Background(), host)
+	if got := commander.requestsCopy(); len(got) != 0 {
+		t.Fatalf("hold allowed START across reconnect: %+v", got)
+	}
+}
+
 func TestRuntimeResultTransitionKeepsHostIneligibleUntilBlockPersists(t *testing.T) {
 	host := testHost(1)
 	workloadID := testWorkload(1)
@@ -420,6 +517,7 @@ func TestFreshExecutionsButStaleInventoryCannotStart(t *testing.T) {
 	observed.Connect(commander.info.AgentID, host, 1)
 	observed.SetExecutions(host, 1, nil, now, 0)
 	observed.SetInventory(host, 1, model.Inventory{Host: model.Host{HostID: host}, CPU: model.CPU{Threads: 32}})
+	observed.SetUnmanagedProcesses(host, 1, nil, now)
 	observed.SetAgentState(host, 1, model.AgentStateIdle)
 	observed.MarkReady(host, 1)
 	now = now.Add(40 * time.Second)
@@ -430,6 +528,7 @@ func TestFreshExecutionsButStaleInventoryCannotStart(t *testing.T) {
 		t.Fatal("START used stale inventory")
 	}
 	observed.SetInventory(host, 1, model.Inventory{Host: model.Host{HostID: host}, CPU: model.CPU{Threads: 16}})
+	observed.SetUnmanagedProcesses(host, 1, nil, now)
 	coordinator.ReconcileHost(context.Background(), host)
 	if requests := commander.requestsCopy(); len(requests) != 1 || requests[0].Kind != controllernet.RuntimeStart {
 		t.Fatalf("fresh inventory did not restore reconciliation: %+v", requests)
@@ -617,6 +716,7 @@ func TestCoordinatorHalfOpenObservationCannotDriveRuntimeAction(t *testing.T) {
 	observed.Connect(commander.info.AgentID, host, commander.info.ConnectionEpoch)
 	observed.SetExecutions(host, commander.info.ConnectionEpoch, []model.ExecutionObservation{observedExecution(snapshot, model.ExecutionRunning)}, now, 0)
 	observed.SetInventory(host, commander.info.ConnectionEpoch, model.Inventory{Host: model.Host{HostID: host}})
+	observed.SetUnmanagedProcesses(host, commander.info.ConnectionEpoch, nil, now)
 	observed.SetAgentState(host, commander.info.ConnectionEpoch, model.AgentStateMining)
 	if !observed.MarkReady(host, commander.info.ConnectionEpoch) {
 		t.Fatal("bootstrap did not become READY")
@@ -679,6 +779,7 @@ func readyStoreWithInventory(store *controllerstate.Store, info controllernet.Se
 	store.Connect(info.AgentID, info.HostID, info.ConnectionEpoch)
 	store.SetExecutions(info.HostID, info.ConnectionEpoch, executions, time.Now(), 0)
 	store.SetInventory(info.HostID, info.ConnectionEpoch, inventory)
+	store.SetUnmanagedProcesses(info.HostID, info.ConnectionEpoch, nil, time.Now())
 	store.SetAgentState(info.HostID, info.ConnectionEpoch, model.AgentStateIdle)
 	store.MarkReady(info.HostID, info.ConnectionEpoch)
 }
@@ -692,6 +793,12 @@ type fakeCommander struct {
 	mu       sync.Mutex
 	info     controllernet.SessionInfo
 	requests []controllernet.RuntimeRequest
+	holds    []fakeHoldCommand
+}
+
+type fakeHoldCommand struct {
+	active   bool
+	revision uint64
 }
 
 type barrierCommander struct {
@@ -745,6 +852,15 @@ func (commander *fakeCommander) SendRuntime(_ context.Context, info controllerne
 	commander.requests = append(commander.requests, request)
 	return sequence, nil
 }
+func (commander *fakeCommander) SendMaintenanceHold(_ context.Context, info controllernet.SessionInfo, active bool, revision uint64) error {
+	commander.mu.Lock()
+	defer commander.mu.Unlock()
+	if info.ConnectionEpoch != commander.info.ConnectionEpoch {
+		return farmerr.Error{Code: farmerr.SERVICE_NOT_READY}
+	}
+	commander.holds = append(commander.holds, fakeHoldCommand{active: active, revision: revision})
+	return nil
+}
 func (commander *fakeCommander) setEpoch(epoch controllerstate.ConnectionEpoch) {
 	commander.mu.Lock()
 	commander.info.ConnectionEpoch = epoch
@@ -754,6 +870,11 @@ func (commander *fakeCommander) requestsCopy() []controllernet.RuntimeRequest {
 	commander.mu.Lock()
 	defer commander.mu.Unlock()
 	return append([]controllernet.RuntimeRequest(nil), commander.requests...)
+}
+func (commander *fakeCommander) holdsCopy() []fakeHoldCommand {
+	commander.mu.Lock()
+	defer commander.mu.Unlock()
+	return append([]fakeHoldCommand(nil), commander.holds...)
 }
 
 type fakeStore struct {
@@ -765,10 +886,11 @@ type fakeStore struct {
 	blockRelease   chan struct{}
 	validationErr  error
 	validationFunc func(model.Inventory) error
+	holds          map[identity.HostID]farmmodel.MaintenanceHold
 }
 
 func newFakeStore(workload farmmodel.DesiredWorkload, snapshots ...farmmodel.ResolvedExecutionSnapshot) *fakeStore {
-	return &fakeStore{workloads: map[identity.WorkloadID]farmmodel.DesiredWorkload{workload.WorkloadID: workload}, snapshots: append([]farmmodel.ResolvedExecutionSnapshot(nil), snapshots...), bindings: make(map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding)}
+	return &fakeStore{workloads: map[identity.WorkloadID]farmmodel.DesiredWorkload{workload.WorkloadID: workload}, snapshots: append([]farmmodel.ResolvedExecutionSnapshot(nil), snapshots...), bindings: make(map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding), holds: make(map[identity.HostID]farmmodel.MaintenanceHold)}
 }
 func (store *fakeStore) replace(workload farmmodel.DesiredWorkload, snapshots ...farmmodel.ResolvedExecutionSnapshot) {
 	store.mu.Lock()
@@ -864,6 +986,31 @@ func (store *fakeStore) ValidateResolvedSnapshotForStart(_ context.Context, _ fa
 		return store.validationFunc(inventory)
 	}
 	return store.validationErr
+}
+func (store *fakeStore) GetMaintenanceHold(_ context.Context, hostID identity.HostID) (farmmodel.MaintenanceHold, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	hold, ok := store.holds[hostID]
+	return hold, ok, nil
+}
+func (store *fakeStore) SetMaintenanceHold(_ context.Context, hostID identity.HostID, expected uint64, active bool, reason string) (farmmodel.MaintenanceHold, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	current, exists := store.holds[hostID]
+	if (!exists && expected != 0) || (exists && current.Revision != expected) {
+		return farmmodel.MaintenanceHold{}, farmerr.Error{Code: farmerr.REVISION_CONFLICT}
+	}
+	if exists && current.Active == active && current.Reason == reason {
+		return current, nil
+	}
+	if !exists {
+		current = farmmodel.MaintenanceHold{HostID: hostID, Revision: 1}
+	} else {
+		current.Revision++
+	}
+	current.Active, current.Reason = active, reason
+	store.holds[hostID] = current
+	return current, nil
 }
 func (store *fakeStore) isBlocked(id identity.WorkloadID, generation uint64) bool {
 	store.mu.Lock()

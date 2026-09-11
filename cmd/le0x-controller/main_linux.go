@@ -224,7 +224,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if runtimeCommand != nil {
 		runtimeCommands = append(runtimeCommands, runtimeCommand)
 	}
-	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: *insecureDev, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Trust: trust, Pairing: pairingWindow, PKI: pki, RuntimeCommands: runtimeCommands, RuntimeTarget: targetAgent, Output: log.New(stdout, "", 0)})
+	server, err := controllernet.New(controllernet.Config{ListenAddress: *listen, InsecureDev: *insecureDev, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, Trust: trust, Pairing: pairingWindow, PKI: pki, RuntimeCommands: runtimeCommands, RuntimeTarget: targetAgent, Maintenance: farmService, Output: log.New(stdout, "", 0)})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

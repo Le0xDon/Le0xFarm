@@ -13,6 +13,7 @@ import (
 
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
 	"github.com/le0xdon/le0xfarm/internal/model"
@@ -24,9 +25,74 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+type maintenanceProviderStub struct {
+	mu     sync.Mutex
+	hold   farmmodel.MaintenanceHold
+	exists bool
+}
+
+func (provider *maintenanceProviderStub) GetMaintenanceHold(context.Context, identity.HostID) (farmmodel.MaintenanceHold, bool, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	return provider.hold, provider.exists, nil
+}
+
+func (provider *maintenanceProviderStub) set(hold farmmodel.MaintenanceHold) {
+	provider.mu.Lock()
+	provider.hold, provider.exists = hold, true
+	provider.mu.Unlock()
+}
+
 func TestControllerRequiresExplicitDevelopmentMode(t *testing.T) {
 	if _, err := New(Config{}); err == nil {
 		t.Fatal("plaintext allowed without --insecure-dev")
+	}
+}
+
+func TestReconnectHelloCannotRaceMaintenancePublication(t *testing.T) {
+	hostID, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	provider := &maintenanceProviderStub{}
+	server := newTestServer(t, Config{Maintenance: provider})
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	le0xv1.RegisterAgentControlServer(grpcServer, server)
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+
+	release := server.AcquireMaintenanceAuthority(hostID)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, "buf", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stream, err := le0xv1.NewAgentControlClient(conn).Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 5, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: hostID.String()}}}); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan *le0xv1.ControllerHello, 1)
+	go func() {
+		message, _ := stream.Recv()
+		received <- message.GetHello()
+	}()
+	select {
+	case hello := <-received:
+		t.Fatalf("hello crossed held maintenance publication boundary: %+v", hello)
+	case <-time.After(20 * time.Millisecond):
+	}
+	provider.set(farmmodel.MaintenanceHold{HostID: hostID, Active: true, Revision: 3})
+	release()
+	select {
+	case hello := <-received:
+		if hello == nil || !hello.MaintenanceHoldActive || hello.MaintenanceHoldRevision != 3 {
+			t.Fatalf("hello did not publish current hold: %+v", hello)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("hello did not resume after maintenance publication")
 	}
 }
 
@@ -274,7 +340,7 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := map[string]bool{}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		message, err = stream.Recv()
 		if err != nil {
 			t.Fatal(err)
@@ -294,6 +360,9 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 		case command.GetGetInventory() != nil:
 			seen["GetInventory"] = true
 			result = &le0xv1.CommandResult{CommandId: command.CommandId, Result: &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: hostID}}}
+		case command.GetGetUnmanagedProcesses() != nil:
+			seen["GetUnmanagedProcesses"] = true
+			result = &le0xv1.CommandResult{CommandId: command.CommandId, Result: &le0xv1.CommandResult_UnmanagedProcesses{UnmanagedProcesses: &le0xv1.UnmanagedProcesses{}}}
 		default:
 			t.Fatalf("unexpected bootstrap command: %v", command)
 		}
@@ -301,7 +370,7 @@ func TestControllerHandshakeAndCommands(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if !seen["Ping"] || !seen["GetStatus"] || !seen["GetInventory"] {
+	if !seen["Ping"] || !seen["GetStatus"] || !seen["GetInventory"] || !seen["GetUnmanagedProcesses"] {
 		t.Fatalf("bootstrap commands missing: %v", seen)
 	}
 	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Heartbeat{Heartbeat: &le0xv1.Heartbeat{ObservedStateRevision: 0}}}); err != nil {
@@ -367,7 +436,7 @@ func TestLiveSessionRequiresFreshExecutionsAndChangesEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 4, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 5, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
 			t.Fatal(err)
 		}
 		if hello, err := stream.Recv(); err != nil || hello.GetHello() == nil {
@@ -388,7 +457,7 @@ func TestLiveSessionRequiresFreshExecutionsAndChangesEpoch(t *testing.T) {
 		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: &le0xv1.CommandResult{CommandId: first.GetCommand().CommandId, Result: &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{}}}}}); err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 4; i++ {
 			message, err := stream.Recv()
 			if err != nil {
 				t.Fatal(err)
@@ -402,6 +471,8 @@ func TestLiveSessionRequiresFreshExecutionsAndChangesEpoch(t *testing.T) {
 				result.Result = &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: info.HostID.String()}}
 			case command.GetPing() != nil:
 				result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: command.GetPing().Nonce}}
+			case command.GetGetUnmanagedProcesses() != nil:
+				result.Result = &le0xv1.CommandResult_UnmanagedProcesses{UnmanagedProcesses: &le0xv1.UnmanagedProcesses{}}
 			default:
 				t.Fatalf("runtime command sent before session READY: %v", command)
 			}
@@ -616,7 +687,7 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 		t.Fatal(err)
 	}
 	host := "host_0123456789abcdef0123456789abcdef"
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 4, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 5, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
 		t.Fatal(err)
 	}
 	if message, err := stream.Recv(); err != nil || message.GetHello() == nil {
@@ -630,7 +701,7 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_CommandResult{CommandResult: &le0xv1.CommandResult{CommandId: bootstrap.GetCommand().CommandId, Result: &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{}}}}}); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		message, err := stream.Recv()
 		if err != nil {
 			t.Fatal(err)
@@ -644,6 +715,8 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 			result.Result = &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: host}}
 		case command.GetPing() != nil:
 			result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: command.GetPing().Nonce}}
+		case command.GetGetUnmanagedProcesses() != nil:
+			result.Result = &le0xv1.CommandResult_UnmanagedProcesses{UnmanagedProcesses: &le0xv1.UnmanagedProcesses{}}
 		default:
 			t.Fatalf("unexpected bootstrap command: %v", command)
 		}
@@ -657,8 +730,8 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Heartbeat{Heartbeat: &le0xv1.Heartbeat{Timestamp: timestamppb.Now()}}}); err != nil {
 		t.Fatal(err)
 	}
-	seenExecutions, seenInventory, seenStatus := false, false, false
-	for i := 0; i < 3; i++ {
+	seenExecutions, seenInventory, seenStatus, seenProcesses := false, false, false, false
+	for i := 0; i < 4; i++ {
 		message, err := stream.Recv()
 		if err != nil {
 			t.Fatal(err)
@@ -675,6 +748,9 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 		case command.GetGetInventory() != nil:
 			seenInventory = true
 			result.Result = &le0xv1.CommandResult_Inventory{Inventory: &le0xv1.Inventory{HostId: host}}
+		case command.GetGetUnmanagedProcesses() != nil:
+			seenProcesses = true
+			result.Result = &le0xv1.CommandResult_UnmanagedProcesses{UnmanagedProcesses: &le0xv1.UnmanagedProcesses{}}
 		default:
 			t.Fatalf("unexpected refresh command: %v", command)
 		}
@@ -682,8 +758,8 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 			t.Fatal(err)
 		}
 	}
-	if !seenExecutions || !seenInventory || !seenStatus {
-		t.Fatalf("refresh commands executions=%t inventory=%t status=%t", seenExecutions, seenInventory, seenStatus)
+	if !seenExecutions || !seenInventory || !seenStatus || !seenProcesses {
+		t.Fatalf("refresh commands executions=%t inventory=%t status=%t processes=%t", seenExecutions, seenInventory, seenStatus, seenProcesses)
 	}
 	select {
 	case <-recorder.executions:

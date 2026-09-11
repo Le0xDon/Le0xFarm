@@ -24,6 +24,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/miners/xmrig"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/packages"
+	"github.com/le0xdon/le0xfarm/internal/processobserve"
 	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 )
 
@@ -110,10 +111,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return fail(stderr, false, err)
 		}
 		packageStore := packages.New(dir)
+		processSource := processobserve.Local()
 		minerRuntime := minerruntime.New(runtimeSupervisor, registry, dir, packageStore, facts, minerruntime.Config{RefreshInventory: func() model.Inventory {
 			refreshed, _ := inventorySource.Discover(id.HostID)
 			return refreshed
-		}})
+		}, ProcessObserver: &processSource})
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()

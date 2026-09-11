@@ -29,6 +29,9 @@ type HostObservation struct {
 	InventoryFresh       bool
 	InventoryRefreshedAt time.Time
 	Inventory            model.Inventory
+	ProcessesFresh       bool
+	ProcessesRefreshedAt time.Time
+	UnmanagedProcesses   []model.UnmanagedProcessObservation
 	AgentState           model.AgentState
 	Executions           []model.ExecutionObservation
 	// RuntimeSequence is the greatest accepted current-epoch runtime action
@@ -44,8 +47,10 @@ type entry struct {
 	observation      HostObservation
 	inventoryCurrent bool
 	statusCurrent    bool
+	processesCurrent bool
 	freshAt          time.Time
 	inventoryFreshAt time.Time
+	processesFreshAt time.Time
 	runtimeSequence  uint64
 }
 
@@ -117,6 +122,22 @@ func (store *Store) SetInventory(hostID identity.HostID, epoch ConnectionEpoch, 
 	return true
 }
 
+func (store *Store) SetUnmanagedProcesses(hostID identity.HostID, epoch ConnectionEpoch, processes []model.UnmanagedProcessObservation, refreshedAt time.Time) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item := store.current(hostID, epoch)
+	if item == nil {
+		return false
+	}
+	item.observation.UnmanagedProcesses = cloneProcesses(processes)
+	item.processesCurrent = true
+	item.observation.ProcessesFresh = true
+	item.observation.ProcessesRefreshedAt = refreshedAt.UTC()
+	item.processesFreshAt = store.now()
+	item.observation.Revision++
+	return true
+}
+
 func (store *Store) SetAgentState(hostID identity.HostID, epoch ConnectionEpoch, state model.AgentState) bool {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -134,10 +155,34 @@ func (store *Store) MarkReady(hostID identity.HostID, epoch ConnectionEpoch) boo
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	item := store.current(hostID, epoch)
-	if item == nil || !item.observation.Fresh || !item.inventoryCurrent || !item.statusCurrent {
+	if item == nil || item.observation.Ready || !item.observation.Fresh || !item.inventoryCurrent || !item.statusCurrent || !item.processesCurrent {
 		return false
 	}
 	item.observation.Ready = true
+	item.observation.Revision++
+	return true
+}
+
+// RequireFreshBootstrap invalidates all START-authorizing observations without
+// disconnecting the current session. Maintenance exit uses it before normal
+// reconciliation may resume.
+func (store *Store) RequireFreshBootstrap(hostID identity.HostID, epoch ConnectionEpoch) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	item := store.current(hostID, epoch)
+	if item == nil {
+		return false
+	}
+	item.observation.Ready = false
+	item.observation.Fresh = false
+	item.observation.InventoryFresh = false
+	item.observation.ProcessesFresh = false
+	item.freshAt = time.Time{}
+	item.inventoryFreshAt = time.Time{}
+	item.processesFreshAt = time.Time{}
+	item.inventoryCurrent = false
+	item.processesCurrent = false
+	item.statusCurrent = false
 	item.observation.Revision++
 	return true
 }
@@ -185,6 +230,9 @@ func (store *Store) Disconnect(hostID identity.HostID, epoch ConnectionEpoch) bo
 	item.inventoryCurrent = false
 	item.inventoryFreshAt = time.Time{}
 	item.observation.InventoryFresh = false
+	item.processesCurrent = false
+	item.processesFreshAt = time.Time{}
+	item.observation.ProcessesFresh = false
 	item.statusCurrent = false
 	item.observation.Revision++
 	return true
@@ -205,6 +253,10 @@ func (store *Store) Get(hostID identity.HostID) (HostObservation, bool) {
 		item.observation.InventoryFresh = false
 		item.observation.Revision++
 	}
+	if item.observation.ProcessesFresh && (item.processesFreshAt.IsZero() || store.now().Sub(item.processesFreshAt) > store.freshnessTimeout) {
+		item.observation.ProcessesFresh = false
+		item.observation.Revision++
+	}
 	return cloneObservation(item.observation), true
 }
 
@@ -219,7 +271,18 @@ func (store *Store) current(hostID identity.HostID, epoch ConnectionEpoch) *entr
 func cloneObservation(value HostObservation) HostObservation {
 	value.Inventory = cloneInventory(value.Inventory)
 	value.Executions = cloneExecutions(value.Executions)
+	value.UnmanagedProcesses = cloneProcesses(value.UnmanagedProcesses)
 	return value
+}
+
+func cloneProcesses(values []model.UnmanagedProcessObservation) []model.UnmanagedProcessObservation {
+	result := make([]model.UnmanagedProcessObservation, len(values))
+	for i, value := range values {
+		value.DeviceIDs = append([]identity.DeviceID(nil), value.DeviceIDs...)
+		value.Evidence = append([]model.ProcessEvidence(nil), value.Evidence...)
+		result[i] = value
+	}
+	return result
 }
 
 func cloneInventory(value model.Inventory) model.Inventory {

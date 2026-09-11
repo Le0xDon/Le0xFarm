@@ -8,7 +8,7 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Текущий этап — **M4.3 Desired Runtime Reconciliation**. Существующий M1 transport использует
+Текущий этап — **M7 Unmanaged Miner Scan + Maintenance Hold**. Существующий M1 transport использует
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
 может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
@@ -19,13 +19,14 @@ Controller-to-Agent package distribution и systemd не реализованы.
 
 Controller применяет persistent `DesiredWorkload` через level-triggered reconciler: desired
 state остаётся авторитетным намерением, fresh Agent observation — фактом, а START/STOP — только
-средством сходимости. ProtocolVersion 4 передаёт adapter-neutral ownership tuple
+средством сходимости. ProtocolVersion 5 передаёт adapter-neutral ownership tuple
 `ExecutionID`/`WorkloadID`/`DesiredGeneration`/`ResolvedHash`, target `HostID` и точный CPU/GPU
 `ResourceClaim`. Agent валидирует и возвращает эти поля без интерпретации profile/pool/wallet
 policy; Controller не определяет ownership по PID, hostname, command line или miner adapter.
 
 Каждое принятое соединение получает неперсистентный monotonic `ConnectionEpoch`. После hello
-session остаётся NOT READY до полного свежего `GET_EXECUTIONS`, inventory и status; до READY
+session остаётся NOT READY до полного свежего `GET_EXECUTIONS`, inventory, unmanaged-process scan
+и status; до READY
 runtime commands запрещены. Disconnect сбрасывает ready/fresh и in-flight actions этого epoch.
 Результаты старого epoch не меняют текущий observed state, а stale generation может только
 обнаружить obsolete execution для последующего exact-ID STOP.
@@ -36,6 +37,14 @@ Obsolete owned execution сначала получает exact-ID STOP; replacem
 подтверждённой остановки или fresh absence. Unmanaged execution никогда не останавливается и не
 adopt-ится; неизвестный или пересекающийся claim блокирует START, известный непересекающийся claim
 не мешает независимому workload. In-flight actions живут только в памяти и подавляют дубликаты.
+
+M7 добавляет консервативный Linux observe-only scan по сигнатурам зарегистрированных adapters.
+Он сохраняет только basename executable, PID с process-instance start fact, безопасно установленный
+resource scope и bounded provenance — без argv/env. Le0x-owned process исключается по точному
+PID+instance; конфликтующий unmanaged process блокирует START, но никогда не adopt-ится и не
+останавливается Le0xFarm. Persistent per-Host Maintenance Hold exact-останавливает только managed
+executions, сохраняет Desired RUNNING и подавляет reconcile/watchdog START до explicit выхода и
+нового полного observation. Это software-состояние, а не electrical isolation.
 
 Terminal `FAILED` и definite non-transient START rejection блокируют только текущую generation в
 минимальной persistent runtime binding. Явный `RetryWorkload` увеличивает revision и generation,
@@ -326,9 +335,10 @@ resolved executable, argv, environment, working directory и restart policy.
 ObservedState и ExecutionObservation сохраняют наблюдения по ExecutionID.
 
 ProtocolVersion — версия взаимодействия компонентов; SchemaVersion — версия структуры
-документов. Текущие значения равны 4 и 1 соответственно; ProtocolVersion 4 добавляет
-к resolved runtime plan точную stable-DeviceID GPU binding и fail-closed отклоняет старых peers,
-которые её не понимают. Типы и дальнейшее изменение остаются независимыми.
+документов. Текущие значения равны 5 и 1 соответственно; ProtocolVersion 5 добавляет typed
+unmanaged-process observations и persistent Maintenance Hold synchronization поверх точной
+stable-DeviceID GPU binding M6 и fail-closed отклоняет старых peers, которые её не понимают.
+Типы и дальнейшее изменение остаются независимыми.
 Версия сборки `0.0.0-dev` хранится отдельно.
 
 ## M0.2 — protocol contracts

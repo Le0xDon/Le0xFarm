@@ -102,7 +102,7 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		agentDone <- agentnet.Run(agentCtx, agentnet.Config{Target: "buf", InsecureDev: true, TrustDir: agentDir, AgentID: agentID, HostID: hostID, Inventory: inventory.Local(), Supervisor: runtime, MinerRuntime: minerRuntime, HeartbeatInterval: 20 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Dialer: func(context.Context, string) (net.Conn, error) { return dialer.Dial() }})
 	}()
 
-	startController := func() (*controllernet.Server, *countingCommander, *farmconfig.Service, *controllerdb.DB, context.CancelFunc, <-chan error) {
+	startController := func() (*controllernet.Server, *countingCommander, *Coordinator, *farmconfig.Service, *controllerdb.DB, context.CancelFunc, <-chan error) {
 		db, err := controllerdb.Open(context.Background(), databaseDir)
 		if err != nil {
 			t.Fatal(err)
@@ -114,7 +114,7 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		}
 		listener := bufconn.Listen(1024 * 1024)
 		dialer.Set(listener)
-		server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, ShutdownGracePeriod: 20 * time.Millisecond})
+		server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, Maintenance: store, ShutdownGracePeriod: 20 * time.Millisecond})
 		if err != nil {
 			db.Close()
 			t.Fatal(err)
@@ -127,10 +127,10 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		done := make(chan error, 1)
 		go coordinator.Run(ctx, 10*time.Millisecond)
 		go func() { done <- server.Serve(ctx, listener) }()
-		return server, commands, store, db, cancel, done
+		return server, commands, coordinator, store, db, cancel, done
 	}
 
-	server1, commands1, _, db1, stop1, done1 := startController()
+	server1, commands1, _, _, db1, stop1, done1 := startController()
 	waitSessionReady(t, server1, hostID)
 	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionRunning)
 	first := mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID)
@@ -148,7 +148,7 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		t.Fatalf("Controller shutdown changed Agent execution: %+v", got)
 	}
 
-	server2, commands2, store2, db2, stop2, done2 := startController()
+	server2, commands2, coordinator2, store2, db2, stop2, done2 := startController()
 	waitSessionReady(t, server2, hostID)
 	time.Sleep(30 * time.Millisecond)
 	if commands2.Count(controllernet.RuntimeStart) != 0 || mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID).PID != first.PID {
@@ -213,16 +213,13 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		t.Fatal("unchanged effective settings caused runtime commands")
 	}
 	snapshot = corrected
-	stopped := workload.DesiredWorkloadContent
-	stopped.RunState = farmmodel.DesiredStopped
-	workload, err = store2.UpdateDesiredWorkload(context.Background(), workload.WorkloadID, workload.Meta.Revision, stopped)
-	if err != nil {
-		t.Fatal(err)
+	hold, err := coordinator2.SetMaintenanceHold(context.Background(), hostID, 0, true, "integration maintenance")
+	if err != nil || !hold.Active || hold.Revision != 1 {
+		t.Fatalf("enter Maintenance Hold=%+v err=%v", hold, err)
 	}
-	// The periodic coordinator notices the persistent desired mutation.
 	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionStopped)
-	if commands2.Count(controllernet.RuntimeStop) != 3 {
-		t.Fatalf("STOP count=%d", commands2.Count(controllernet.RuntimeStop))
+	if current, _ := store2.GetDesiredWorkload(context.Background(), workload.WorkloadID); current.RunState != farmmodel.DesiredRunning {
+		t.Fatal("Maintenance Hold rewrote Desired RUNNING")
 	}
 	stop2()
 	if err := <-done2; err != nil {
@@ -232,11 +229,35 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server3, commands3, _, db3, stop3, done3 := startController()
+	server3, commands3, coordinator3, store3, db3, stop3, done3 := startController()
 	waitSessionReady(t, server3, hostID)
 	time.Sleep(30 * time.Millisecond)
-	if commands3.Count(controllernet.RuntimeStart) != 0 || commands3.Count(controllernet.RuntimeStop) != 0 || mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID).State != model.ExecutionStopped {
-		t.Fatal("STOPPED desired state was not stable after reconnect")
+	if commands3.Count(controllernet.RuntimeStart) != 0 || mustRuntimeSnapshot(t, runtime, snapshot.ExecutionID).State != model.ExecutionStopped {
+		t.Fatal("persistent Maintenance Hold allowed reconnect restart")
+	}
+	active, revision := runtime.MaintenanceHold()
+	if !active || revision != 1 {
+		t.Fatalf("Agent did not retain reconnect hold: active=%t revision=%d", active, revision)
+	}
+	if _, err := coordinator3.SetMaintenanceHold(context.Background(), hostID, 1, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionRunning)
+	if commands3.Count(controllernet.RuntimeStart) != 1 {
+		t.Fatalf("hold exit START count=%d", commands3.Count(controllernet.RuntimeStart))
+	}
+	current, err := store3.GetDesiredWorkload(context.Background(), workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := current.DesiredWorkloadContent
+	stopped.RunState = farmmodel.DesiredStopped
+	if _, err := store3.UpdateDesiredWorkload(context.Background(), workload.WorkloadID, current.Meta.Revision, stopped); err != nil {
+		t.Fatal(err)
+	}
+	waitExecutionState(t, runtime, snapshot.ExecutionID, model.ExecutionStopped)
+	if commands3.Count(controllernet.RuntimeStop) != 1 {
+		t.Fatalf("final exact STOP count=%d", commands3.Count(controllernet.RuntimeStop))
 	}
 	stop3()
 	if err := <-done3; err != nil {
@@ -563,6 +584,12 @@ func (commands *countingCommander) SendRuntime(ctx context.Context, info control
 	commands.counts[request.Kind]++
 	commands.mu.Unlock()
 	return commands.server.SendRuntime(ctx, info, request)
+}
+func (commands *countingCommander) SendMaintenanceHold(ctx context.Context, info controllernet.SessionInfo, active bool, revision uint64) error {
+	return commands.server.SendMaintenanceHold(ctx, info, active, revision)
+}
+func (commands *countingCommander) AcquireMaintenanceAuthority(host identity.HostID) func() {
+	return commands.server.AcquireMaintenanceAuthority(host)
 }
 func (commands *countingCommander) Count(kind controllernet.RuntimeKind) int {
 	commands.mu.Lock()

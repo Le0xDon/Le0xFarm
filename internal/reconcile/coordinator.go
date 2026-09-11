@@ -31,11 +31,21 @@ type WorkloadStore interface {
 	RetryWorkload(context.Context, identity.WorkloadID, uint64) (farmmodel.DesiredWorkload, error)
 	ValidateResolvedSnapshotForStart(context.Context, farmmodel.ResolvedExecutionSnapshot, model.Inventory) error
 	RefreshResolvedSnapshotForInventory(context.Context, identity.WorkloadID, model.Inventory) error
+	GetMaintenanceHold(context.Context, identity.HostID) (farmmodel.MaintenanceHold, bool, error)
+	SetMaintenanceHold(context.Context, identity.HostID, uint64, bool, string) (farmmodel.MaintenanceHold, error)
 }
 
 type Commander interface {
 	Session(identity.HostID) (controllernet.SessionInfo, bool)
 	SendRuntime(context.Context, controllernet.SessionInfo, controllernet.RuntimeRequest) (uint64, error)
+}
+
+type maintenanceCommander interface {
+	SendMaintenanceHold(context.Context, controllernet.SessionInfo, bool, uint64) error
+}
+
+type maintenanceAuthority interface {
+	AcquireMaintenanceAuthority(identity.HostID) func()
 }
 
 type inFlightAction struct {
@@ -51,13 +61,15 @@ type Coordinator struct {
 	inFlight    map[ActionKey]inFlightAction
 	hostLocksMu sync.Mutex
 	hostLocks   map[identity.HostID]*sync.Mutex
+	authorityMu sync.Mutex
+	authority   map[identity.HostID]*sync.RWMutex
 }
 
 func NewCoordinator(store WorkloadStore, observed *controllerstate.Store, commander Commander, output *log.Logger) *Coordinator {
 	if output == nil {
 		output = log.Default()
 	}
-	return &Coordinator{store: store, observed: observed, commander: commander, output: output, inFlight: make(map[ActionKey]inFlightAction), hostLocks: make(map[identity.HostID]*sync.Mutex)}
+	return &Coordinator{store: store, observed: observed, commander: commander, output: output, inFlight: make(map[ActionKey]inFlightAction), hostLocks: make(map[identity.HostID]*sync.Mutex), authority: make(map[identity.HostID]*sync.RWMutex)}
 }
 
 func (coordinator *Coordinator) Run(ctx context.Context, interval time.Duration) {
@@ -94,6 +106,9 @@ func (coordinator *Coordinator) ReconcileAll(ctx context.Context) {
 }
 
 func (coordinator *Coordinator) ReconcileHost(ctx context.Context, hostID identity.HostID) {
+	authority := coordinator.authorityLock(hostID)
+	authority.RLock()
+	defer authority.RUnlock()
 	lock := coordinator.hostLock(hostID)
 	lock.Lock()
 	dispatch, ok := coordinator.prepareDispatchLocked(ctx, hostID)
@@ -158,6 +173,15 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 	slices.SortFunc(workloads, func(a, b farmmodel.DesiredWorkload) int {
 		return strings.Compare(a.WorkloadID.String(), b.WorkloadID.String())
 	})
+	hold, hasHold, err := coordinator.store.GetMaintenanceHold(ctx, hostID)
+	if err != nil {
+		coordinator.output.Printf("RECONCILE: Maintenance Hold unavailable for HostID %s", hostID)
+		return preparedDispatch{}, false
+	}
+	var holdPtr *farmmodel.MaintenanceHold
+	if hasHold {
+		holdPtr = &hold
+	}
 	for _, workload := range workloads {
 		if workload.HostID != hostID {
 			continue
@@ -204,9 +228,9 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 		if blocked {
 			bindingPtr = &binding
 		}
-		planned := Plan(PlanInput{Workload: workload, Current: current, Snapshots: snapshots, Binding: bindingPtr, Observed: observed, InFlight: coordinator.inFlightSnapshot(), OtherOwned: byExecution})
+		planned := Plan(PlanInput{Workload: workload, Current: current, Snapshots: snapshots, Binding: bindingPtr, Hold: holdPtr, Observed: observed, InFlight: coordinator.inFlightSnapshot(), OtherOwned: byExecution})
 		if planned.Conflict != "" {
-			coordinator.output.Printf("RECONCILE: WorkloadID %s blocked pending safe convergence: %s", workload.WorkloadID, planned.Conflict)
+			coordinator.output.Printf("RECONCILE: WorkloadID %s blocked pending safe convergence code=%s reason=%q", workload.WorkloadID, planned.Code, planned.Conflict)
 			continue
 		}
 		if len(planned.Actions) == 0 {
@@ -220,7 +244,7 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 			continue
 		}
 		if action.Key.Action == ActionStart {
-			if !observed.InventoryFresh {
+			if !observed.InventoryFresh || !observed.ProcessesFresh {
 				return preparedDispatch{}, false
 			}
 			if err := coordinator.store.ValidateResolvedSnapshotForStart(ctx, action.Snapshot, observed.Inventory); err != nil {
@@ -265,7 +289,10 @@ func (coordinator *Coordinator) actionStillCurrent(ctx context.Context, action A
 		return false
 	}
 	if action.Key.Action == ActionStart {
-		if !currentObserved.InventoryFresh || !observed.InventoryFresh || !reflect.DeepEqual(currentObserved.Inventory, observed.Inventory) {
+		if !currentObserved.InventoryFresh || !observed.InventoryFresh || !currentObserved.ProcessesFresh || !observed.ProcessesFresh || !reflect.DeepEqual(currentObserved.Inventory, observed.Inventory) || !reflect.DeepEqual(currentObserved.UnmanagedProcesses, observed.UnmanagedProcesses) {
+			return false
+		}
+		if hold, exists, err := coordinator.store.GetMaintenanceHold(ctx, action.Key.HostID); err != nil || (exists && hold.Active) {
 			return false
 		}
 		if latest.RunState != farmmodel.DesiredRunning || latest.DesiredGeneration != action.Key.DesiredGeneration {
@@ -317,8 +344,9 @@ func (coordinator *Coordinator) ExecutionsObserved(info controllernet.SessionInf
 	if updated {
 		coordinator.resolveInFlightThroughObservation(info.HostID, info.ConnectionEpoch, runtimeSequence)
 	}
+	ready := coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
 	lock.Unlock()
-	if updated {
+	if updated || ready {
 		go coordinator.ReconcileHost(context.Background(), info.HostID)
 	}
 }
@@ -326,23 +354,46 @@ func (coordinator *Coordinator) ExecutionsObserved(info controllernet.SessionInf
 func (coordinator *Coordinator) InventoryObserved(info controllernet.SessionInfo, inventory model.Inventory) {
 	lock := coordinator.hostLock(info.HostID)
 	lock.Lock()
-	defer lock.Unlock()
-	coordinator.observed.SetInventory(info.HostID, info.ConnectionEpoch, inventory)
+	updated := coordinator.observed.SetInventory(info.HostID, info.ConnectionEpoch, inventory)
+	becameReady := coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
+	current, _ := coordinator.observed.Get(info.HostID)
+	lock.Unlock()
+	if becameReady || (updated && current.Ready && current.ConnectionEpoch == info.ConnectionEpoch) {
+		go coordinator.ReconcileHost(context.Background(), info.HostID)
+	}
+}
+
+func (coordinator *Coordinator) ProcessesObserved(info controllernet.SessionInfo, processes []model.UnmanagedProcessObservation) {
+	lock := coordinator.hostLock(info.HostID)
+	lock.Lock()
+	updated := coordinator.observed.SetUnmanagedProcesses(info.HostID, info.ConnectionEpoch, processes, time.Now().UTC())
+	becameReady := coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
+	current, _ := coordinator.observed.Get(info.HostID)
+	lock.Unlock()
+	if becameReady || (updated && current.Ready && current.ConnectionEpoch == info.ConnectionEpoch) {
+		go coordinator.ReconcileHost(context.Background(), info.HostID)
+	}
 }
 
 func (coordinator *Coordinator) StatusObserved(info controllernet.SessionInfo, state model.AgentState) {
 	lock := coordinator.hostLock(info.HostID)
 	lock.Lock()
-	defer lock.Unlock()
-	coordinator.observed.SetAgentState(info.HostID, info.ConnectionEpoch, state)
+	updated := coordinator.observed.SetAgentState(info.HostID, info.ConnectionEpoch, state)
+	becameReady := coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
+	current, _ := coordinator.observed.Get(info.HostID)
+	lock.Unlock()
+	if becameReady || (updated && current.Ready && current.ConnectionEpoch == info.ConnectionEpoch) {
+		go coordinator.ReconcileHost(context.Background(), info.HostID)
+	}
 }
 
 func (coordinator *Coordinator) SessionReady(info controllernet.SessionInfo) {
 	lock := coordinator.hostLock(info.HostID)
 	lock.Lock()
-	ready := coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
+	coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
+	current, _ := coordinator.observed.Get(info.HostID)
 	lock.Unlock()
-	if ready {
+	if current.Ready && current.ConnectionEpoch == info.ConnectionEpoch {
 		go coordinator.ReconcileHost(context.Background(), info.HostID)
 	}
 }
@@ -429,6 +480,46 @@ func (coordinator *Coordinator) RetryWorkload(ctx context.Context, id identity.W
 		go coordinator.ReconcileHost(context.Background(), workload.HostID)
 	}
 	return workload, err
+}
+
+// SetMaintenanceHold persists Host suppression without changing Desired. The
+// Host authority write lock excludes Controller START dispatch during the
+// transition; the Agent Supervisor independently gates actual process creation.
+func (coordinator *Coordinator) SetMaintenanceHold(ctx context.Context, hostID identity.HostID, expectedRevision uint64, active bool, reason string) (farmmodel.MaintenanceHold, error) {
+	commander, ok := coordinator.commander.(maintenanceCommander)
+	if !ok {
+		return farmmodel.MaintenanceHold{}, farmerr.Error{Code: farmerr.SERVICE_NOT_READY, HumanMessage: "Maintenance Hold transport is unavailable"}
+	}
+	authority := coordinator.authorityLock(hostID)
+	authority.Lock()
+	defer authority.Unlock()
+	lock := coordinator.hostLock(hostID)
+	lock.Lock()
+	releaseTransportAuthority := func() {}
+	if commander, ok := coordinator.commander.(maintenanceAuthority); ok {
+		releaseTransportAuthority = commander.AcquireMaintenanceAuthority(hostID)
+	}
+	defer releaseTransportAuthority()
+	hold, err := coordinator.store.SetMaintenanceHold(ctx, hostID, expectedRevision, active, reason)
+	if err != nil {
+		lock.Unlock()
+		return farmmodel.MaintenanceHold{}, err
+	}
+	session, connected := coordinator.commander.Session(hostID)
+	lock.Unlock()
+	if connected {
+		err = commander.SendMaintenanceHold(ctx, session, hold.Active, hold.Revision)
+	}
+	if !hold.Active && connected && err == nil {
+		lock.Lock()
+		coordinator.observed.RequireFreshBootstrap(hostID, session.ConnectionEpoch)
+		lock.Unlock()
+	}
+	if err != nil {
+		return hold, err
+	}
+	go coordinator.ReconcileHost(context.Background(), hostID)
+	return hold, nil
 }
 
 func (coordinator *Coordinator) DeleteDesiredWorkload(ctx context.Context, id identity.WorkloadID, expectedRevision uint64) error {
@@ -606,4 +697,16 @@ func (coordinator *Coordinator) hostLock(hostID identity.HostID) *sync.Mutex {
 	return lock
 }
 
+func (coordinator *Coordinator) authorityLock(hostID identity.HostID) *sync.RWMutex {
+	coordinator.authorityMu.Lock()
+	defer coordinator.authorityMu.Unlock()
+	if lock := coordinator.authority[hostID]; lock != nil {
+		return lock
+	}
+	lock := &sync.RWMutex{}
+	coordinator.authority[hostID] = lock
+	return lock
+}
+
 var _ controllernet.SessionHandler = (*Coordinator)(nil)
+var _ controllernet.ProcessSessionHandler = (*Coordinator)(nil)

@@ -59,10 +59,17 @@ type DesiredWorkloads interface {
 	RefreshResolvedSnapshotForInventory(context.Context, identity.WorkloadID, model.Inventory) error
 }
 
+type MaintenanceHolds interface {
+	GetMaintenanceHold(context.Context, identity.HostID) (farmmodel.MaintenanceHold, bool, error)
+	ListMaintenanceHolds(context.Context) ([]farmmodel.MaintenanceHold, error)
+	SetMaintenanceHold(context.Context, identity.HostID, uint64, bool, string) (farmmodel.MaintenanceHold, error)
+}
+
 var _ interface {
 	Pools
 	WalletRefs
 	MiningProfiles
 	HostProfileSettings
 	DesiredWorkloads
+	MaintenanceHolds
 } = (*Service)(nil)

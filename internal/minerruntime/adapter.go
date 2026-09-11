@@ -7,6 +7,8 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/packages"
+	"github.com/le0xdon/le0xfarm/internal/processobserve"
 	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 )
 
@@ -61,6 +64,10 @@ type Adapter interface {
 	Prepare(context.Context, PrepareRequest) (Prepared, error)
 }
 
+type ProcessClassifier interface {
+	ProcessSignatures() []model.ProcessSignature
+}
+
 type Registry struct {
 	mu       sync.RWMutex
 	adapters map[string]Adapter
@@ -88,6 +95,24 @@ func (r *Registry) Get(id string) (Adapter, bool) {
 	return adapter, ok
 }
 
+func (r *Registry) ProcessSignatures() []model.ProcessSignature {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []model.ProcessSignature
+	for _, adapter := range r.adapters {
+		if classifier, ok := adapter.(ProcessClassifier); ok {
+			result = append(result, classifier.ProcessSignatures()...)
+		}
+	}
+	slices.SortFunc(result, func(a, b model.ProcessSignature) int {
+		if a.Provider != b.Provider {
+			return strings.Compare(a.Provider, b.Provider)
+		}
+		return strings.Compare(a.Executable, b.Executable)
+	})
+	return result
+}
+
 type Observation struct {
 	Process   supervisor.Snapshot
 	Telemetry *model.MinerTelemetry
@@ -100,6 +125,7 @@ type Config struct {
 	StaleAfter       time.Duration
 	Now              func() time.Time
 	RefreshInventory func() model.Inventory
+	ProcessObserver  *processobserve.Source
 }
 
 type Manager struct {
@@ -345,11 +371,70 @@ func (m *Manager) acquireFinalStartValidation(plan model.ExecutionPlan) (func(),
 		m.setInventoryAndInvalidateLocked(inventory)
 	}
 	err := m.validatePlanAgainstInventory(plan, inventory)
+	if err == nil {
+		var processes []model.UnmanagedProcessObservation
+		processes, err = m.observeUnmanaged(inventory)
+		if err == nil {
+			err = unmanagedConflict(plan, processes)
+		}
+	}
 	if err != nil {
 		m.bindingStartMu.Unlock()
 		return nil, err
 	}
 	return m.bindingStartMu.Unlock, nil
+}
+
+// ObserveUnmanaged returns fresh observe-only process facts. It never mutates
+// Supervisor ownership or process state.
+func (m *Manager) ObserveUnmanaged() ([]model.UnmanagedProcessObservation, error) {
+	m.bindingStartMu.Lock()
+	defer m.bindingStartMu.Unlock()
+	m.mu.Lock()
+	inventory := cloneInventory(m.inventory)
+	m.mu.Unlock()
+	return m.observeUnmanaged(inventory)
+}
+
+func (m *Manager) observeUnmanaged(inventory model.Inventory) ([]model.UnmanagedProcessObservation, error) {
+	if m.config.ProcessObserver == nil {
+		return []model.UnmanagedProcessObservation{}, nil
+	}
+	managed := make([]processobserve.ManagedInstance, 0)
+	for _, item := range m.supervisor.List() {
+		if item.PID > 0 && item.ProcessInstance != "" {
+			managed = append(managed, processobserve.ManagedInstance{PID: item.PID, ProcessInstance: item.ProcessInstance})
+		}
+	}
+	processes, err := m.config.ProcessObserver.Observe(inventory, m.registry.ProcessSignatures(), managed)
+	if err != nil {
+		return nil, farmerr.Error{Code: farmerr.UNMANAGED_OBSERVATION_FAILED, HumanMessage: "fresh unmanaged process observation failed", Details: map[string]string{"reason": err.Error()}}
+	}
+	return processes, nil
+}
+
+func unmanagedConflict(plan model.ExecutionPlan, processes []model.UnmanagedProcessObservation) error {
+	for _, process := range processes {
+		overlaps := process.CPU && plan.Ownership.CPU
+		for _, wanted := range plan.Ownership.DeviceIDs {
+			if slices.Contains(process.DeviceIDs, wanted) {
+				overlaps = true
+				break
+			}
+		}
+		ambiguous := process.ResourceScope == model.ProcessResourcesUnknown &&
+			((plan.Ownership.CPU && process.CPURelevant) || (len(plan.Ownership.DeviceIDs) != 0 && process.GPURelevant))
+		if !overlaps && !ambiguous {
+			continue
+		}
+		details := map[string]string{"pid": strconv.Itoa(process.PID), "executable": process.Executable, "resource_scope": string(process.ResourceScope)}
+		if len(process.Evidence) != 0 {
+			details["evidence_kind"] = process.Evidence[0].Kind
+			details["evidence_provider"] = process.Evidence[0].Provider
+		}
+		return farmerr.Error{Code: farmerr.UNMANAGED_PROCESS_CONFLICT, HumanMessage: "unmanaged mining process conflicts with requested resources", Details: details, SuggestedFix: "Stop the unmanaged process manually, then refresh observations before retrying."}
+	}
+	return nil
 }
 
 func (m *Manager) validatePlanAgainstInventory(plan model.ExecutionPlan, inventory model.Inventory) error {

@@ -297,6 +297,105 @@ func TestProcessGroupAndShutdownCleanup(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return processGone(childPID) })
 }
 
+func TestMaintenanceHoldStopsOnlyManagedAndSuppressesStart(t *testing.T) {
+	unmanaged := exec.Command("/bin/sleep", "60")
+	if err := unmanaged.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = unmanaged.Process.Kill()
+		_, _ = unmanaged.Process.Wait()
+	})
+
+	s := New(Config{StopGrace: 100 * time.Millisecond})
+	defer s.Shutdown(context.Background())
+	plan := sleepPlan(t)
+	running, _, err := s.Start(plan)
+	if err != nil || running.State != model.ExecutionRunning {
+		t.Fatalf("managed start=%+v err=%v", running, err)
+	}
+	active, revision, err := s.ApplyMaintenanceHold(true, 1)
+	if err != nil || !active || revision != 1 {
+		t.Fatalf("apply hold active=%t revision=%d err=%v", active, revision, err)
+	}
+	managed, ok := s.Get(plan.ExecutionID)
+	if !ok || managed.State != model.ExecutionStopped || managed.PID != 0 {
+		t.Fatalf("managed process not exactly stopped: %+v", managed)
+	}
+	if err := syscall.Kill(unmanaged.Process.Pid, 0); err != nil {
+		t.Fatalf("same-name unmanaged process was affected: %v", err)
+	}
+	if active, revision, err := s.ApplyMaintenanceHold(true, 1); err != nil || !active || revision != 1 {
+		t.Fatalf("idempotent enter active=%t revision=%d err=%v", active, revision, err)
+	}
+	if _, _, err := s.Start(plan); code(err) != farmerr.MAINTENANCE_HOLD {
+		t.Fatalf("START during hold error=%v", err)
+	}
+	if _, _, err := s.Stop(plan.ExecutionID); err != nil {
+		t.Fatalf("explicit STOP during hold failed: %v", err)
+	}
+	if active, revision, err := s.ApplyMaintenanceHold(false, 2); err != nil || active || revision != 2 {
+		t.Fatalf("release hold active=%t revision=%d err=%v", active, revision, err)
+	}
+	if active, revision, err := s.ApplyMaintenanceHold(false, 2); err != nil || active || revision != 2 {
+		t.Fatalf("idempotent exit active=%t revision=%d err=%v", active, revision, err)
+	}
+	if restarted, _, err := s.Start(plan); err != nil || restarted.State != model.ExecutionRunning {
+		t.Fatalf("START after hold release=%+v err=%v", restarted, err)
+	}
+}
+
+func TestMaintenanceHoldWinsPrepareToStartBarrier(t *testing.T) {
+	s := New(Config{})
+	defer s.Shutdown(context.Background())
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s.SetStartValidator(func(model.ExecutionPlan) (func(), error) {
+		close(entered)
+		<-release
+		return nil, nil
+	})
+	plan := sleepPlan(t)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := s.Start(plan)
+		done <- err
+	}()
+	<-entered
+	if _, _, err := s.ApplyMaintenanceHold(true, 1); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; code(err) != farmerr.MAINTENANCE_HOLD {
+		t.Fatalf("barrier START error=%v", err)
+	}
+	if snapshot, ok := s.Get(plan.ExecutionID); !ok || snapshot.PID != 0 || snapshot.State != model.ExecutionStopped {
+		t.Fatalf("process crossed hold boundary: %+v", snapshot)
+	}
+}
+
+func TestMaintenanceHoldCancelsWatchdogRestart(t *testing.T) {
+	restart := make(chan time.Time)
+	s := New(Config{RestartInitial: time.Second, RestartMax: time.Second, After: func(time.Duration) <-chan time.Time { return restart }})
+	defer s.Shutdown(context.Background())
+	plan := helperPlan(t, "crash", model.RestartOnFailure)
+	if _, _, err := s.Start(plan); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		snapshot, _ := s.Get(plan.ExecutionID)
+		return snapshot.State == model.ExecutionBackoff
+	})
+	if _, _, err := s.ApplyMaintenanceHold(true, 1); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	snapshot, _ := s.Get(plan.ExecutionID)
+	if snapshot.State != model.ExecutionStopped || snapshot.PID != 0 {
+		t.Fatalf("watchdog defeated hold: %+v", snapshot)
+	}
+}
+
 func code(err error) farmerr.Code {
 	value, _ := farmerr.CodeOf(err)
 	return value

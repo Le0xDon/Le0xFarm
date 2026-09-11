@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,39 +34,43 @@ type Config struct {
 	After          func(time.Duration) <-chan time.Time
 }
 type Snapshot struct {
-	ExecutionID  identity.ExecutionID
-	Ownership    model.WorkloadOwnership
-	State        model.ExecutionStatus
-	PID          int
-	StartedAt    time.Time
-	ExitCode     *int
-	RestartCount uint32
-	LastError    string
-	Stdout       string
-	Stderr       string
+	ExecutionID     identity.ExecutionID
+	Ownership       model.WorkloadOwnership
+	State           model.ExecutionStatus
+	PID             int
+	StartedAt       time.Time
+	ExitCode        *int
+	RestartCount    uint32
+	ProcessInstance string
+	LastError       string
+	Stdout          string
+	Stderr          string
 }
 type Supervisor struct {
 	mu             sync.Mutex
 	cfg            Config
 	executions     map[identity.ExecutionID]*execution
 	startValidator func(model.ExecutionPlan) (release func(), err error)
+	maintenance    bool
+	holdRevision   uint64
 	closed         bool
 }
 type execution struct {
-	plan           model.ExecutionPlan
-	state          model.ExecutionStatus
-	cmd            *exec.Cmd
-	pid            int
-	started        time.Time
-	exitCode       *int
-	restarts       uint32
-	lastErr        string
-	stdout, stderr *tail
-	desired        bool
-	done           chan struct{}
-	generation     uint64
-	crashes        []time.Time
-	backoffCancel  chan struct{}
+	plan            model.ExecutionPlan
+	state           model.ExecutionStatus
+	cmd             *exec.Cmd
+	pid             int
+	started         time.Time
+	processInstance string
+	exitCode        *int
+	restarts        uint32
+	lastErr         string
+	stdout, stderr  *tail
+	desired         bool
+	done            chan struct{}
+	generation      uint64
+	crashes         []time.Time
+	backoffCancel   chan struct{}
 }
 type tail struct {
 	mu  sync.Mutex
@@ -182,6 +188,10 @@ func (s *Supervisor) Start(p model.ExecutionPlan) (Snapshot, string, error) {
 		s.mu.Unlock()
 		return Snapshot{}, "", typed(farmerr.CONFIG_CONFLICT, "supervisor is shutting down", nil)
 	}
+	if s.maintenance {
+		s.mu.Unlock()
+		return Snapshot{ExecutionID: p.ExecutionID, Ownership: cloneOwnership(p.Ownership), State: model.ExecutionStopped}, "", typed(farmerr.MAINTENANCE_HOLD, "process START is suppressed by Maintenance Hold", nil)
+	}
 	if e, ok := s.executions[p.ExecutionID]; ok {
 		if !reflect.DeepEqual(e.plan, p) {
 			s.mu.Unlock()
@@ -250,6 +260,14 @@ func (s *Supervisor) startExisting(e *execution, gen uint64, msg string) (Snapsh
 	// Revalidate execution authority after the potentially blocking hardware
 	// check. The validation lease remains held across this check and cmd.Start.
 	s.mu.Lock()
+	if s.maintenance {
+		e.desired = false
+		e.state = model.ExecutionStopped
+		e.generation++
+		snap := snapshot(e)
+		s.mu.Unlock()
+		return snap, "", typed(farmerr.MAINTENANCE_HOLD, "process START is suppressed by Maintenance Hold", nil)
+	}
 	if !e.desired || e.generation != gen || s.closed {
 		snap := snapshot(e)
 		s.mu.Unlock()
@@ -275,6 +293,7 @@ func (s *Supervisor) startExisting(e *execution, gen uint64, msg string) (Snapsh
 	}
 	e.pid = cmd.Process.Pid
 	e.started = time.Now().UTC()
+	e.processInstance, _ = readProcessInstance(e.pid)
 	e.state = model.ExecutionRunning
 	snap := snapshot(e)
 	s.mu.Unlock()
@@ -447,6 +466,46 @@ func (s *Supervisor) Restart(id identity.ExecutionID) (Snapshot, string, error) 
 	s.mu.Unlock()
 	return snap, msg, err
 }
+
+// ApplyMaintenanceHold is the Agent's process-creation authority boundary.
+// Active hold publication and cmd.Start are serialized by the Supervisor
+// mutex. Existing entries are stopped only through their exact ExecutionID.
+func (s *Supervisor) ApplyMaintenanceHold(active bool, revision uint64) (bool, uint64, error) {
+	s.mu.Lock()
+	if revision < s.holdRevision || (revision == s.holdRevision && active != s.maintenance) {
+		currentActive, currentRevision := s.maintenance, s.holdRevision
+		s.mu.Unlock()
+		return currentActive, currentRevision, typed(farmerr.CONFIG_CONFLICT, "stale or conflicting Maintenance Hold revision", nil)
+	}
+	if revision > s.holdRevision {
+		s.holdRevision = revision
+		s.maintenance = active
+	}
+	ids := make([]identity.ExecutionID, 0)
+	if s.maintenance {
+		for id, execution := range s.executions {
+			if execution.desired || execution.state != model.ExecutionStopped {
+				ids = append(ids, id)
+			}
+		}
+	}
+	currentActive, currentRevision := s.maintenance, s.holdRevision
+	s.mu.Unlock()
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	for _, id := range ids {
+		if _, _, err := s.Stop(id); err != nil {
+			return currentActive, currentRevision, err
+		}
+	}
+	return currentActive, currentRevision, nil
+}
+
+func (s *Supervisor) MaintenanceHold() (bool, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maintenance, s.holdRevision
+}
+
 func (s *Supervisor) Get(id identity.ExecutionID) (Snapshot, bool) {
 	if id.Validate() != nil {
 		return Snapshot{}, false
@@ -489,7 +548,28 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 	return nil
 }
 func snapshot(e *execution) Snapshot {
-	return Snapshot{ExecutionID: e.plan.ExecutionID, Ownership: cloneOwnership(e.plan.Ownership), State: e.state, PID: e.pid, StartedAt: e.started, ExitCode: e.exitCode, RestartCount: e.restarts, LastError: e.lastErr, Stdout: e.stdout.String(), Stderr: e.stderr.String()}
+	return Snapshot{ExecutionID: e.plan.ExecutionID, Ownership: cloneOwnership(e.plan.Ownership), State: e.state, PID: e.pid, StartedAt: e.started, ExitCode: e.exitCode, RestartCount: e.restarts, ProcessInstance: e.processInstance, LastError: e.lastErr, Stdout: e.stdout.String(), Stderr: e.stderr.String()}
+}
+
+func readProcessInstance(pid int) (string, error) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return "", err
+	}
+	text := string(data)
+	close := strings.LastIndex(text, ")")
+	if close < 0 {
+		return "", errors.New("process stat has no command terminator")
+	}
+	fields := strings.Fields(text[close+1:])
+	if len(fields) <= 19 {
+		return "", errors.New("process stat is incomplete")
+	}
+	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil || startTicks == 0 {
+		return "", errors.New("process stat start time is invalid")
+	}
+	return "linux-proc-start-ticks:" + strconv.FormatUint(startTicks, 10), nil
 }
 
 func cloneOwnership(value model.WorkloadOwnership) model.WorkloadOwnership {

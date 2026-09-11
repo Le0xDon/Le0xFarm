@@ -57,6 +57,10 @@ type Adapter struct {
 
 func (a *Adapter) ID() string { return AdapterID }
 
+func (a *Adapter) ProcessSignatures() []model.ProcessSignature {
+	return []model.ProcessSignature{{Executable: "xmrig", Provider: AdapterID, CPURelevant: true}}
+}
+
 func (a *Adapter) Capabilities() minerruntime.Capabilities {
 	return minerruntime.Capabilities{CPU: true, HTTPAPI: true, Benchmark: true, Stress: true, Algorithms: []string{"rx/0", "rx/wow"}}
 }

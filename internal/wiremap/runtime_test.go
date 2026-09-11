@@ -3,12 +3,32 @@ package wiremap
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestUnmanagedProcessWireRoundTripAndStrictValidation(t *testing.T) {
+	device, _ := identity.ParseDeviceID("device_0123456789abcdef0123456789abcdef")
+	input := []model.UnmanagedProcessObservation{{PID: 42, Executable: "gpu-miner", ProcessInstance: "linux-proc-start-ticks:99", GPURelevant: true, ResourceScope: model.ProcessResourcesExact, DeviceIDs: []identity.DeviceID{device}, Evidence: []model.ProcessEvidence{{Kind: "KNOWN_ADAPTER_EXECUTABLE", Provider: "test", Detail: "registered basename"}}, ObservedAt: time.Unix(123, 0).UTC()}}
+	got, err := ParseUnmanagedProcesses(UnmanagedProcesses(input))
+	if err != nil || len(got) != 1 || got[0].PID != 42 || got[0].DeviceIDs[0] != device || got[0].Evidence[0].Provider != "test" {
+		t.Fatalf("round trip=%+v err=%v", got, err)
+	}
+	bad := UnmanagedProcesses(input)
+	bad.Processes[0].Executable = "/tmp/gpu-miner"
+	if _, err := ParseUnmanagedProcesses(bad); err == nil {
+		t.Fatal("process path was accepted instead of a non-secret basename")
+	}
+	bad = UnmanagedProcesses(input)
+	bad.Processes[0].Evidence = nil
+	if _, err := ParseUnmanagedProcesses(bad); err == nil {
+		t.Fatal("unproven process classification was accepted")
+	}
+}
 
 func TestExecutionPlanWireOwnershipAndResolvedDataOnly(t *testing.T) {
 	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")

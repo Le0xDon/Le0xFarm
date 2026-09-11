@@ -41,6 +41,7 @@ type PlanInput struct {
 	Current    *farmmodel.ResolvedExecutionSnapshot
 	Snapshots  []farmmodel.ResolvedExecutionSnapshot
 	Binding    *farmmodel.WorkloadRuntimeBinding
+	Hold       *farmmodel.MaintenanceHold
 	Observed   controllerstate.HostObservation
 	InFlight   map[ActionKey]struct{}
 	OtherOwned map[identity.ExecutionID]farmmodel.ResolvedExecutionSnapshot
@@ -48,6 +49,7 @@ type PlanInput struct {
 
 type PlanResult struct {
 	Actions  []Action
+	Code     farmerr.Code
 	Conflict string
 }
 
@@ -110,6 +112,19 @@ func Plan(input PlanInput) PlanResult {
 			return PlanResult{}
 		}
 		action := Action{Key: ActionKey{HostID: workload.HostID, WorkloadID: workload.WorkloadID, DesiredGeneration: current.Ownership.DesiredGeneration, ExecutionID: current.ExecutionID, ConnectionEpoch: observed.ConnectionEpoch, Action: ActionStop}}
+		if input.Current != nil {
+			action.Snapshot = *input.Current
+		}
+		if _, inFlight := input.InFlight[action.Key]; inFlight {
+			return PlanResult{}
+		}
+		return PlanResult{Actions: []Action{action}}
+	}
+	if input.Hold != nil && input.Hold.Active {
+		if current == nil {
+			return PlanResult{Code: farmerr.MAINTENANCE_HOLD, Conflict: "Desired RUNNING is suppressed by Maintenance Hold"}
+		}
+		action := Action{Key: ActionKey{HostID: workload.HostID, WorkloadID: workload.WorkloadID, DesiredGeneration: current.Ownership.DesiredGeneration, ExecutionID: current.ExecutionID, ConnectionEpoch: observed.ConnectionEpoch, Action: ActionStop}, Snapshot: *input.Current}
 		if _, inFlight := input.InFlight[action.Key]; inFlight {
 			return PlanResult{}
 		}
@@ -129,8 +144,8 @@ func Plan(input PlanInput) PlanResult {
 	if input.Current == nil {
 		return PlanResult{Conflict: "RUNNING workload has no current resolved snapshot"}
 	}
-	if conflict := startConflict(input, known); conflict != "" {
-		return PlanResult{Conflict: conflict}
+	if code, conflict := startConflict(input, known); conflict != "" {
+		return PlanResult{Code: code, Conflict: conflict}
 	}
 	action := Action{Key: ActionKey{HostID: workload.HostID, WorkloadID: workload.WorkloadID, DesiredGeneration: workload.DesiredGeneration, ExecutionID: input.Current.ExecutionID, ConnectionEpoch: observed.ConnectionEpoch, Action: ActionStart}, Snapshot: *input.Current}
 	if _, inFlight := input.InFlight[action.Key]; inFlight {
@@ -139,10 +154,23 @@ func Plan(input PlanInput) PlanResult {
 	return PlanResult{Actions: []Action{action}}
 }
 
-func startConflict(input PlanInput, known map[identity.ExecutionID]farmmodel.ResolvedExecutionSnapshot) string {
+func startConflict(input PlanInput, known map[identity.ExecutionID]farmmodel.ResolvedExecutionSnapshot) (farmerr.Code, string) {
 	claim := input.Current.Resources
 	if !inventoryContains(input.Observed.Inventory, claim.DeviceIDs) {
-		return "fresh inventory does not contain every desired DeviceID"
+		return farmerr.INCOMPATIBLE_HARDWARE, "fresh inventory does not contain every desired DeviceID"
+	}
+	for _, process := range input.Observed.UnmanagedProcesses {
+		overlaps := process.CPU && claim.CPU
+		for _, deviceID := range claim.DeviceIDs {
+			if slices.Contains(process.DeviceIDs, deviceID) {
+				overlaps = true
+				break
+			}
+		}
+		ambiguous := process.ResourceScope == model.ProcessResourcesUnknown && ((claim.CPU && process.CPURelevant) || (len(claim.DeviceIDs) != 0 && process.GPURelevant))
+		if overlaps || ambiguous {
+			return farmerr.UNMANAGED_PROCESS_CONFLICT, "fresh observation reports a conflicting unmanaged mining process"
+		}
 	}
 	for _, execution := range input.Observed.Executions {
 		if !blocksStartResources(execution.Status) {
@@ -153,22 +181,22 @@ func startConflict(input PlanInput, known map[identity.ExecutionID]farmmodel.Res
 		}
 		if snapshot, ok := known[execution.ExecutionID]; ok && ownershipMatchesSnapshot(execution.Ownership, snapshot) {
 			if snapshot.WorkloadID == input.Workload.WorkloadID {
-				return "obsolete owned execution must be absent before START"
+				return farmerr.CONFIG_CONFLICT, "obsolete owned execution must be absent before START"
 			}
 			if claimsOverlap(claim, snapshot.Resources) {
-				return "another Controller-owned execution overlaps desired resources"
+				return farmerr.CONFIG_CONFLICT, "another Controller-owned execution overlaps desired resources"
 			}
 			continue
 		}
 		if execution.Ownership == nil {
-			return "unmanaged execution has an unknown resource claim"
+			return farmerr.UNMANAGED_PROCESS_CONFLICT, "unmanaged execution has an unknown resource claim"
 		}
 		other := farmmodel.ResourceClaim{CPU: execution.Ownership.CPU, DeviceIDs: execution.Ownership.DeviceIDs}
 		if claimsOverlap(claim, other) {
-			return "unmanaged execution overlaps desired resources"
+			return farmerr.UNMANAGED_PROCESS_CONFLICT, "unmanaged execution overlaps desired resources"
 		}
 	}
-	return ""
+	return "", ""
 }
 
 func ownershipMatchesSnapshot(ownership *model.WorkloadOwnership, snapshot farmmodel.ResolvedExecutionSnapshot) bool {

@@ -3,7 +3,10 @@ package minerruntime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +17,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
+	"github.com/le0xdon/le0xfarm/internal/processobserve"
 	"github.com/le0xdon/le0xfarm/internal/runtime/supervisor"
 )
 
@@ -28,9 +32,13 @@ type fakeAdapter struct {
 	prepareEntered chan struct{}
 	prepareRelease chan struct{}
 	prepareOnce    sync.Once
+	signatures     []model.ProcessSignature
 }
 
 func (a *fakeAdapter) ID() string { return "test-no-http" }
+func (a *fakeAdapter) ProcessSignatures() []model.ProcessSignature {
+	return append([]model.ProcessSignature(nil), a.signatures...)
+}
 func (a *fakeAdapter) Capabilities() Capabilities {
 	if a.capabilities != nil {
 		return *a.capabilities
@@ -191,6 +199,107 @@ func TestSecondAdapterUsesGenericRuntimeWithoutHTTP(t *testing.T) {
 	}
 }
 
+func TestManagedProcessIsExcludedFromUnmanagedObservation(t *testing.T) {
+	registry := NewRegistry()
+	adapter := &fakeAdapter{source: &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http"}}}}, signatures: []model.ProcessSignature{{Executable: "sleep", Provider: "test-no-http", CPURelevant: true}}}
+	if err := registry.Register(adapter); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "proc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	observer := processobserve.Source{Root: root}
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, model.Inventory{}, Config{ProcessObserver: &observer})
+	defer manager.Shutdown(context.Background())
+	plan := testPlan(t, model.MinerModeStress)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	started, _, err := manager.Start(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startTicks uint64
+	if _, err := fmt.Sscanf(started.Process.ProcessInstance, "linux-proc-start-ticks:%d", &startTicks); err != nil {
+		t.Fatalf("managed process instance=%q: %v", started.Process.ProcessInstance, err)
+	}
+	makeObservedCPUProcess(t, root, started.Process.PID, startTicks, "sleep")
+	observed, err := manager.ObserveUnmanaged()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, process := range observed {
+		if process.PID == started.Process.PID {
+			t.Fatalf("managed execution was reported as unmanaged: %+v", process)
+		}
+	}
+}
+
+func TestUnmanagedConflictDoesNotKillAndFreshRemovalAllowsStart(t *testing.T) {
+	const executableName = "le0x-unmanaged-test-miner"
+	unmanaged := exec.Command("/bin/sleep", "60")
+	if err := unmanaged.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if unmanaged.ProcessState == nil {
+			_ = unmanaged.Process.Kill()
+			_, _ = unmanaged.Process.Wait()
+		}
+	})
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "proc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	makeObservedCPUProcess(t, root, unmanaged.Process.Pid, 123, executableName)
+	signatures := []model.ProcessSignature{{Executable: executableName, Provider: "test-no-http", CPURelevant: true}}
+	observer := processobserve.Source{Root: root}
+	registry := NewRegistry()
+	adapter := &fakeAdapter{source: &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http"}}}}, signatures: signatures}
+	if err := registry.Register(adapter); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, model.Inventory{}, Config{ProcessObserver: &observer})
+	defer manager.Shutdown(context.Background())
+	plan := testPlan(t, model.MinerModeStress)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	if _, _, err := manager.Start(context.Background(), plan); errorCode(err) != farmerr.UNMANAGED_PROCESS_CONFLICT {
+		t.Fatalf("conflicting START error=%v", err)
+	}
+	if err := syscall.Kill(unmanaged.Process.Pid, 0); err != nil {
+		t.Fatalf("unmanaged process was killed: %v", err)
+	}
+	if err := unmanaged.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = unmanaged.Process.Wait()
+	if err := os.RemoveAll(filepath.Join(root, "proc", fmt.Sprint(unmanaged.Process.Pid))); err != nil {
+		t.Fatal(err)
+	}
+	if started, _, err := manager.Start(context.Background(), plan); err != nil || started.Process.PID <= 0 {
+		t.Fatalf("START after fresh removal=%+v err=%v", started, err)
+	}
+}
+
+func makeObservedCPUProcess(t *testing.T, root string, pid int, startTicks uint64, executable string) {
+	t.Helper()
+	procDir := filepath.Join(root, "proc", fmt.Sprint(pid))
+	if err := os.MkdirAll(filepath.Join(procDir, "fd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("opt", executable), filepath.Join(procDir, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	fields := []string{"S"}
+	for len(fields) < 19 {
+		fields = append(fields, "0")
+	}
+	fields = append(fields, fmt.Sprint(startTicks))
+	if err := os.WriteFile(filepath.Join(procDir, "stat"), []byte(fmt.Sprintf("%d (%s) %s", pid, executable, strings.Join(fields, " "))), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGPUStartRequiresExactFreshHardwareBinding(t *testing.T) {
 	device, err := identity.ParseDeviceID("device_00000000000000000000000000000001")
 	if err != nil {
@@ -279,6 +388,106 @@ func TestGPUStartRevalidatesAfterPrepareBarrier(t *testing.T) {
 	}
 	if snapshot, ok := manager.supervisor.Get(plan.ExecutionID); !ok || snapshot.PID != 0 || snapshot.State == model.ExecutionRunning {
 		t.Fatalf("process was dispatched after binding changed during Prepare: %+v", snapshot)
+	}
+}
+
+func TestMaintenanceHoldActivatedDuringAdapterPrepareBlocksStart(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	adapter := &fakeAdapter{source: &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http"}}}}, prepareEntered: entered, prepareRelease: release}
+	registry := NewRegistry()
+	if err := registry.Register(adapter); err != nil {
+		t.Fatal(err)
+	}
+	processes := supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond})
+	manager := New(processes, registry, t.TempDir(), nil, model.Inventory{}, Config{})
+	defer manager.Shutdown(context.Background())
+	plan := testPlan(t, model.MinerModeStress)
+	manager.SetInventory(model.Inventory{Host: model.Host{HostID: plan.HostID}, CPU: model.CPU{Threads: 4}})
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := manager.Start(context.Background(), plan)
+		done <- err
+	}()
+	<-entered
+	if _, _, err := processes.ApplyMaintenanceHold(true, 1); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; errorCode(err) != farmerr.MAINTENANCE_HOLD {
+		t.Fatalf("START error=%v", err)
+	}
+	if snapshot, ok := processes.Get(plan.ExecutionID); ok && snapshot.PID != 0 {
+		t.Fatalf("process started during hold: %+v", snapshot)
+	}
+}
+
+func TestUnmanagedGPUConflictAppearingDuringPrepareBlocksActualStart(t *testing.T) {
+	device, _ := identity.ParseDeviceID("device_00000000000000000000000000000001")
+	caps := Capabilities{GPU: true, GPUVendors: []string{"nvidia"}, StdoutTelemetry: true}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	adapter := &fakeAdapter{
+		source:         &sequenceSource{results: []sourceResult{{telemetry: &model.MinerTelemetry{AdapterID: "test-no-http"}}}},
+		capabilities:   &caps,
+		prepareEntered: entered,
+		prepareRelease: release,
+		signatures:     []model.ProcessSignature{{Executable: "test-gpu-miner", Provider: "test-no-http", GPURelevant: true}},
+	}
+	registry := NewRegistry()
+	if err := registry.Register(adapter); err != nil {
+		t.Fatal(err)
+	}
+	plan, inventory := gpuTestPlan(t, device, "gpu-a", "01:00.0")
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "proc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	observer := processobserve.Source{Root: root}
+	manager := New(supervisor.New(supervisor.Config{StopGrace: 20 * time.Millisecond}), registry, t.TempDir(), nil, inventory, Config{ProcessObserver: &observer})
+	defer manager.Shutdown(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := manager.Start(context.Background(), plan)
+		done <- err
+	}()
+	<-entered
+	makeObservedGPUProcess(t, root, 901, 111, "test-gpu-miner", "01:00.0")
+	close(release)
+	if err := <-done; errorCode(err) != farmerr.UNMANAGED_PROCESS_CONFLICT {
+		t.Fatalf("START error=%v", err)
+	}
+	if snapshot, ok := manager.supervisor.Get(plan.ExecutionID); !ok || snapshot.PID != 0 || snapshot.State == model.ExecutionRunning {
+		t.Fatalf("conflicting unmanaged GPU reached process creation: %+v", snapshot)
+	}
+}
+
+func makeObservedGPUProcess(t *testing.T, root string, pid int, startTicks uint64, executable, pci string) {
+	t.Helper()
+	procDir := filepath.Join(root, "proc", fmt.Sprint(pid))
+	if err := os.MkdirAll(filepath.Join(procDir, "fd"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("opt", executable), filepath.Join(procDir, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	fields := []string{"S"}
+	for len(fields) < 19 {
+		fields = append(fields, "0")
+	}
+	fields = append(fields, fmt.Sprint(startTicks))
+	if err := os.WriteFile(filepath.Join(procDir, "stat"), []byte(fmt.Sprintf("%d (%s) %s", pid, executable, strings.Join(fields, " "))), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/dri/renderD128", filepath.Join(procDir, "fd", "9")); err != nil {
+		t.Fatal(err)
+	}
+	drm := filepath.Join(root, "sys", "class", "drm", "renderD128")
+	if err := os.MkdirAll(drm, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", "..", "devices", pci), filepath.Join(drm, "device")); err != nil {
+		t.Fatal(err)
 	}
 }
 

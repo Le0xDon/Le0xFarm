@@ -188,7 +188,9 @@ func connectOnce(ctx context.Context, config Config) error {
 	}
 	defer conn.Close()
 	client := le0xv1.NewAgentControlClient(conn)
-	stream, err := client.Connect(ctx)
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
+	stream, err := client.Connect(sessionCtx)
 	if err != nil {
 		return err
 	}
@@ -228,23 +230,65 @@ func connectOnce(ctx context.Context, config Config) error {
 	} else {
 		return err
 	}
+	if config.Supervisor != nil {
+		if _, _, err := config.Supervisor.ApplyMaintenanceHold(hello.MaintenanceHoldActive, hello.MaintenanceHoldRevision); err != nil {
+			return err
+		}
+	}
 	config.Output.Printf("Connected to Controller %s (Farm %s)", hello.ControllerId, hello.FarmId)
 	heartbeats := make(chan error, 1)
 	var sendMu sync.Mutex
-	go func() { heartbeats <- heartbeatLoop(ctx, stream, config.HeartbeatInterval, &sendMu) }()
+	go func() { heartbeats <- heartbeatLoop(sessionCtx, stream, config.HeartbeatInterval, &sendMu) }()
+	normalCommands := make(chan *le0xv1.CommandEnvelope, 16)
+	commandErrors := make(chan error, 1)
+	reportCommandError := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case commandErrors <- err:
+			cancelSession()
+		default:
+		}
+	}
+	go func() {
+		for {
+			select {
+			case command := <-normalCommands:
+				reportCommandError(handleCommand(stream, command, config, &sendMu))
+			case <-sessionCtx.Done():
+				return
+			}
+		}
+	}()
 	for {
 		message, err := stream.Recv()
 		if err != nil {
+			select {
+			case commandErr := <-commandErrors:
+				return sessionError{err: commandErr, established: true}
+			default:
+			}
 			return sessionError{err: err, established: true}
 		}
 		command := message.GetCommand()
 		if command == nil {
 			continue
 		}
-		if err := handleCommand(stream, command, config, &sendMu); err != nil {
-			return err
+		if command.GetSetMaintenanceHold() != nil {
+			go reportCommandError(handleCommand(stream, command, config, &sendMu))
+		} else {
+			select {
+			case normalCommands <- command:
+			case commandErr := <-commandErrors:
+				return sessionError{err: commandErr, established: true}
+			case <-sessionCtx.Done():
+				return sessionError{err: sessionCtx.Err(), established: true}
+			}
 		}
 		select {
+		case err := <-commandErrors:
+			return sessionError{err: err, established: true}
 		case err := <-heartbeats:
 			return sessionError{err: err, established: true}
 		default:
@@ -424,7 +468,13 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 		result.Result = &le0xv1.CommandResult_Pong{Pong: &le0xv1.Pong{Nonce: append([]byte(nil), command.GetPing().Nonce...)}}
 	case command.GetGetStatus() != nil:
 		state := model.AgentStateIdle
-		if config.MinerRuntime != nil {
+		if config.Supervisor != nil {
+			if active, _ := config.Supervisor.MaintenanceHold(); active {
+				state = model.AgentStateMaintenance
+			} else if config.MinerRuntime != nil {
+				state = config.MinerRuntime.OverallStatus()
+			}
+		} else if config.MinerRuntime != nil {
 			state = config.MinerRuntime.OverallStatus()
 		}
 		result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: string(state)}}
@@ -543,6 +593,30 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			}
 		}
 		result.Result = &le0xv1.CommandResult_Executions{Executions: &le0xv1.Executions{Executions: wire}}
+	case command.GetGetUnmanagedProcesses() != nil:
+		if config.MinerRuntime == nil {
+			// A Supervisor-only development Agent has no registered miner
+			// adapters, and therefore no process signatures to classify.
+			result.Result = &le0xv1.CommandResult_UnmanagedProcesses{UnmanagedProcesses: &le0xv1.UnmanagedProcesses{}}
+			break
+		}
+		processes, err := config.MinerRuntime.ObserveUnmanaged()
+		if err != nil {
+			result.Result = errorResult(err)
+		} else {
+			result.Result = &le0xv1.CommandResult_UnmanagedProcesses{UnmanagedProcesses: wiremap.UnmanagedProcesses(processes)}
+		}
+	case command.GetSetMaintenanceHold() != nil:
+		if config.Supervisor == nil {
+			result.Result = wireError(farmerr.SERVICE_NOT_READY, "runtime supervisor is unavailable")
+			break
+		}
+		active, revision, err := config.Supervisor.ApplyMaintenanceHold(command.GetSetMaintenanceHold().Active, command.GetSetMaintenanceHold().Revision)
+		if err != nil {
+			result.Result = errorResult(err)
+		} else {
+			result.Result = &le0xv1.CommandResult_MaintenanceHold{MaintenanceHold: &le0xv1.MaintenanceHoldState{Active: active, Revision: revision}}
+		}
 	default:
 		result.Result = &le0xv1.CommandResult_Error{Error: &le0xv1.TypedError{Code: "MISSING_COMMAND", HumanMessage: "Command variant is missing"}}
 	}

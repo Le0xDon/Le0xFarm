@@ -28,6 +28,9 @@ func TestObservationFreshReadyDisconnectAndEpochSafety(t *testing.T) {
 	if !store.SetInventory(hostID, 1, model.Inventory{Host: model.Host{HostID: hostID}}) || !store.SetAgentState(hostID, 1, model.AgentStateMining) {
 		t.Fatal("bootstrap observation rejected")
 	}
+	if !store.SetUnmanagedProcesses(hostID, 1, nil, time.Now()) {
+		t.Fatal("fresh process observation rejected")
+	}
 	if !store.MarkReady(hostID, 1) {
 		t.Fatal("complete bootstrap did not allow READY")
 	}
@@ -66,6 +69,7 @@ func TestInventoryFreshnessExpiresIndependentlyAndRefreshes(t *testing.T) {
 	store.Connect(agentID, hostID, 1)
 	store.SetExecutions(hostID, 1, nil, now, 0)
 	store.SetInventory(hostID, 1, model.Inventory{Host: model.Host{HostID: hostID}, CPU: model.CPU{Threads: 16}})
+	store.SetUnmanagedProcesses(hostID, 1, nil, now)
 	store.SetAgentState(hostID, 1, model.AgentStateIdle)
 	if !store.MarkReady(hostID, 1) {
 		t.Fatal("bootstrap did not become READY")
@@ -94,11 +98,17 @@ func TestObservationReturnsDeepCopies(t *testing.T) {
 	owner := &model.WorkloadOwnership{WorkloadID: workloadID, DesiredGeneration: 1, ResolvedHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", HostID: hostID, DeviceIDs: []identity.DeviceID{deviceID}}
 	store.Connect(agentID, hostID, 1)
 	store.SetExecutions(hostID, 1, []model.ExecutionObservation{{ExecutionID: executionID, Ownership: owner, Status: model.ExecutionRunning}}, time.Now(), 0)
+	store.SetUnmanagedProcesses(hostID, 1, []model.UnmanagedProcessObservation{{PID: 1, ProcessInstance: "linux-proc-start-ticks:1", DeviceIDs: []identity.DeviceID{deviceID}, Evidence: []model.ProcessEvidence{{Kind: "KNOWN", Provider: "test"}}}}, time.Now())
 	first, _ := store.Get(hostID)
 	first.Executions[0].Ownership.DeviceIDs[0] = identity.DeviceID{}
+	first.UnmanagedProcesses[0].DeviceIDs[0] = identity.DeviceID{}
+	first.UnmanagedProcesses[0].Evidence[0].Provider = "mutated"
 	second, _ := store.Get(hostID)
 	if second.Executions[0].Ownership.DeviceIDs[0] != deviceID {
 		t.Fatal("caller mutated stored observation")
+	}
+	if second.UnmanagedProcesses[0].DeviceIDs[0] != deviceID || second.UnmanagedProcesses[0].Evidence[0].Provider != "test" {
+		t.Fatal("caller mutated stored process observation")
 	}
 }
 
@@ -110,6 +120,7 @@ func TestObservationExpiresWithoutCurrentEpochRefreshAndCanRecover(t *testing.T)
 	store.Connect(agentID, hostID, 1)
 	store.SetExecutions(hostID, 1, nil, now, 0)
 	store.SetInventory(hostID, 1, model.Inventory{Host: model.Host{HostID: hostID}})
+	store.SetUnmanagedProcesses(hostID, 1, nil, now)
 	store.SetAgentState(hostID, 1, model.AgentStateIdle)
 	if !store.MarkReady(hostID, 1) {
 		t.Fatal("bootstrap observation did not become ready")

@@ -24,6 +24,8 @@ message ControllerHello {
   string farm_id = 4;
   bytes agent_certificate_der = 5;
   bytes farm_ca_certificate_der = 6;
+  bool maintenance_hold_active = 7;
+  uint64 maintenance_hold_revision = 8;
 }
 
 message Heartbeat {
@@ -99,6 +101,11 @@ message StartExecution { ExecutionPlan plan = 1; }
 message StopExecution { string execution_id = 1; }
 message RestartExecution { string execution_id = 1; }
 message GetExecutions {}
+message GetUnmanagedProcesses {}
+message SetMaintenanceHold {
+  bool active = 1;
+  uint64 revision = 2;
+}
 message Execution {
   string execution_id = 1;
   string state = 2;
@@ -140,6 +147,29 @@ message MinerTelemetry {
 }
 message ExecutionResult { Execution execution = 1; string message = 2; }
 message Executions { repeated Execution executions = 1; }
+
+message ProcessEvidence {
+  string kind = 1;
+  string provider = 2;
+  string detail = 3;
+}
+message UnmanagedProcess {
+  int64 pid = 1;
+  string executable = 2;
+  string process_instance = 3;
+  bool cpu_relevant = 4;
+  bool gpu_relevant = 5;
+  string resource_scope = 6;
+  bool cpu = 7;
+  repeated string device_ids = 8;
+  repeated ProcessEvidence evidence = 9;
+  google.protobuf.Timestamp observed_at = 10;
+}
+message UnmanagedProcesses { repeated UnmanagedProcess processes = 1; }
+message MaintenanceHoldState {
+  bool active = 1;
+  uint64 revision = 2;
+}
 
 // The agent state vocabulary is not yet defined in M0.2.
 message Status {
@@ -188,6 +218,8 @@ message CommandEnvelope {
     StopExecution stop_execution = 6;
     RestartExecution restart_execution = 7;
     GetExecutions get_executions = 8;
+    GetUnmanagedProcesses get_unmanaged_processes = 9;
+    SetMaintenanceHold set_maintenance_hold = 10;
   }
 }
 
@@ -200,6 +232,8 @@ message CommandResult {
     TypedError error = 5;
     ExecutionResult execution = 6;
     Executions executions = 7;
+    UnmanagedProcesses unmanaged_processes = 8;
+    MaintenanceHoldState maintenance_hold = 9;
   }
 }
 
