@@ -165,9 +165,92 @@ func TestFreshHardwareValidationFailsClosedWithoutClamping(t *testing.T) {
 
 func TestUnsupportedTypedTuningFailsClosed(t *testing.T) {
 	inputs, resolver := fixture(t)
-	resolver.Catalog, _ = packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: inputs.Profile.Package, AdapterIDs: []string{inputs.Profile.AdapterID}}})
+	resolver.Catalog, _ = packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: inputs.Profile.Package, AdapterIDs: []string{inputs.Profile.AdapterID}, Runtime: farmmodel.RuntimeCapabilities{CPU: true}}})
 	_, err := resolver.Resolve(context.Background(), inputs)
 	assertCode(t, err, farmerr.CONFIG_CONFLICT)
+}
+
+func TestGPUResolutionUsesStableDeviceIdentity(t *testing.T) {
+	inputs, resolver, first, second := gpuFixture(t)
+	inventory := model.Inventory{Host: model.Host{HostID: inputs.Workload.HostID}, GPUs: []model.GPU{
+		{DeviceID: second, UUID: "gpu-b", PCIBusID: "02:00.0", Vendor: "nvidia", Model: "RTX 5090"},
+		{DeviceID: first, UUID: "gpu-a", PCIBusID: "01:00.0", Vendor: "nvidia", Model: "RTX 4080"},
+	}}
+	resolved, err := resolver.ResolveAndValidate(context.Background(), inputs, inventory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved.Content.GPUAssignments) != 2 || resolved.Content.GPUAssignments[0].DeviceID != first || resolved.Content.GPUAssignments[1].DeviceID != second {
+		t.Fatalf("assignments=%+v", resolved.Content.GPUAssignments)
+	}
+	reordered := inventory
+	reordered.GPUs = []model.GPU{inventory.GPUs[1], inventory.GPUs[0]}
+	again, err := resolver.ResolveAndValidate(context.Background(), inputs, reordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Hash != resolved.Hash {
+		t.Fatalf("inventory order changed hash: %s != %s", again.Hash, resolved.Hash)
+	}
+
+	moved := inventory
+	moved.GPUs = append([]model.GPU(nil), inventory.GPUs...)
+	moved.GPUs[1].PCIBusID = "03:00.0"
+	inputs.GPUAssignments = append([]model.GPUAssignment(nil), resolved.Content.GPUAssignments...)
+	changed, err := resolver.ResolveAndValidate(context.Background(), inputs, moved)
+	if err != nil || changed.Hash == resolved.Hash {
+		t.Fatalf("runtime selector change did not change ResolvedHash: hash=%s err=%v", changed.Hash, err)
+	}
+	moved.GPUs[1].UUID = "replacement-at-same-ordinal"
+	_, err = resolver.ResolveAndValidate(context.Background(), inputs, moved)
+	assertCode(t, err, farmerr.INCOMPATIBLE_HARDWARE)
+}
+
+func TestGPUResolutionFailsClosedWithoutSubstitution(t *testing.T) {
+	inputs, resolver, requested, other := gpuFixture(t)
+	inputs.Workload.Resources.DeviceIDs = []identity.DeviceID{requested}
+	_, err := resolver.ResolveAndValidate(context.Background(), inputs, model.Inventory{Host: model.Host{HostID: inputs.Workload.HostID}, GPUs: []model.GPU{{DeviceID: other, UUID: "other", PCIBusID: "02:00.0", Vendor: "nvidia"}}})
+	assertCode(t, err, farmerr.INCOMPATIBLE_HARDWARE)
+}
+
+func TestGPUResolutionRejectsUnsupportedShapes(t *testing.T) {
+	inputs, resolver, first, second := gpuFixture(t)
+	inventory := model.Inventory{Host: model.Host{HostID: inputs.Workload.HostID}, GPUs: []model.GPU{
+		{DeviceID: first, UUID: "gpu-a", PCIBusID: "01:00.0", Vendor: "amd"},
+		{DeviceID: second, UUID: "gpu-b", PCIBusID: "02:00.0", Vendor: "amd"},
+	}}
+	release := farmmodel.PackageRelease{Ref: inputs.Profile.Package, AdapterIDs: []string{inputs.Profile.AdapterID}, Runtime: farmmodel.RuntimeCapabilities{GPU: true, GPUVendors: []string{"nvidia"}}}
+	resolver.Catalog, _ = packagecatalog.NewStatic([]farmmodel.PackageRelease{release})
+	_, err := resolver.ResolveAndValidate(context.Background(), inputs, inventory)
+	assertCode(t, err, farmerr.CONFIG_CONFLICT)
+
+	release.Runtime.MultiGPUSingleProcess = true
+	resolver.Catalog, _ = packagecatalog.NewStatic([]farmmodel.PackageRelease{release})
+	_, err = resolver.ResolveAndValidate(context.Background(), inputs, inventory)
+	assertCode(t, err, farmerr.INCOMPATIBLE_HARDWARE)
+
+	inputs.Workload.Resources.CPU = true
+	_, err = resolver.Resolve(context.Background(), inputs)
+	assertCode(t, err, farmerr.CONFIG_CONFLICT)
+}
+
+func gpuFixture(t *testing.T) (Inputs, Resolver, identity.DeviceID, identity.DeviceID) {
+	inputs, _ := fixture(t)
+	first, err := identity.ParseDeviceID("device_00000000000000000000000000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := identity.ParseDeviceID("device_00000000000000000000000000000002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs.Workload.Resources = farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{second, first}}
+	inputs.Profile.CPUThreads, inputs.Profile.HugePages, inputs.Profile.MSR = nil, nil, nil
+	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: inputs.Profile.Package, AdapterIDs: []string{inputs.Profile.AdapterID}, Runtime: farmmodel.RuntimeCapabilities{GPU: true, MultiGPUSingleProcess: true, GPUVendors: []string{"nvidia"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inputs, Resolver{Catalog: catalog}, first, second
 }
 
 func fixture(t *testing.T) (Inputs, Resolver) {
@@ -186,7 +269,7 @@ func fixture(t *testing.T) (Inputs, Resolver) {
 
 func catalog(t *testing.T, ref farmmodel.PackageRef) farmmodel.PackageCatalog {
 	t.Helper()
-	value, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: ref, AdapterIDs: []string{"miner"}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}}})
+	value, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: ref, AdapterIDs: []string{"miner"}, Runtime: farmmodel.RuntimeCapabilities{CPU: true}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -312,6 +312,17 @@ type PackageRelease struct {
 	Ref        PackageRef
 	AdapterIDs []string
 	Tuning     TuningCapabilities
+	Runtime    RuntimeCapabilities
+}
+
+// RuntimeCapabilities declare the resource shapes accepted by a Package and
+// Adapter pair. M6 supports multiple GPUs only in one verified process; the
+// future per-GPU fan-out topology remains a separate extension.
+type RuntimeCapabilities struct {
+	CPU                   bool
+	GPU                   bool
+	MultiGPUSingleProcess bool
+	GPUVendors            []string
 }
 
 // TuningCapabilities are Controller-side declarations for the narrow typed

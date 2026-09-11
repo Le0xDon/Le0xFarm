@@ -143,3 +143,70 @@ func TestOSReleaseQuoting(t *testing.T) {
 		t.Fatal("invalid field retained")
 	}
 }
+
+func TestGPUDiscoveryDerivesStableDeviceIDNotOrdinal(t *testing.T) {
+	files := fstest.MapFS{
+		"sys/bus/pci/devices/0000:02:00.0/class":     {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:02:00.0/vendor":    {Data: []byte("0x10de\n")},
+		"sys/bus/pci/devices/0000:02:00.0/device":    {Data: []byte("0x2b85\n")},
+		"sys/bus/pci/devices/0000:02:00.0/unique_id": {Data: []byte("GPU-STABLE-A\n")},
+		"sys/bus/pci/devices/0000:01:00.0/class":     {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:01:00.0/vendor":    {Data: []byte("0x1002\n")},
+		"sys/bus/pci/devices/0000:01:00.0/device":    {Data: []byte("0x744c\n")},
+		"sys/bus/pci/devices/0000:01:00.0/gpu_uuid":  {Data: []byte("GPU-STABLE-B\n")},
+	}
+	gpus, err := discoverGPUs(files)
+	if err != nil || len(gpus) != 2 {
+		t.Fatalf("gpus=%+v err=%v", gpus, err)
+	}
+	byUUID := map[string]struct {
+		id  identity.DeviceID
+		pci string
+	}{
+		gpus[0].UUID: {gpus[0].DeviceID, gpus[0].PCIBusID},
+		gpus[1].UUID: {gpus[1].DeviceID, gpus[1].PCIBusID},
+	}
+
+	// The same physical identity moved to another PCI slot retains DeviceID;
+	// the selector changes and will force runtime re-resolution.
+	moved := fstest.MapFS{
+		"sys/bus/pci/devices/0000:03:00.0/class":     {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:03:00.0/vendor":    {Data: []byte("0x10de\n")},
+		"sys/bus/pci/devices/0000:03:00.0/device":    {Data: []byte("0x2b85\n")},
+		"sys/bus/pci/devices/0000:03:00.0/unique_id": {Data: []byte("gpu-stable-a\n")},
+	}
+	again, err := discoverGPUs(moved)
+	if err != nil || len(again) != 1 {
+		t.Fatalf("moved=%+v err=%v", again, err)
+	}
+	original := byUUID["gpu-stable-a"]
+	if again[0].DeviceID != original.id || again[0].PCIBusID == original.pci {
+		t.Fatalf("stable identity depended on ordinal/slot: original=%+v moved=%+v", original, again[0])
+	}
+}
+
+func TestGPUDiscoveryFailsClosedForMissingOrDuplicateStableIdentity(t *testing.T) {
+	missing := fstest.MapFS{
+		"sys/bus/pci/devices/0000:01:00.0/class":  {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:01:00.0/vendor": {Data: []byte("0x10de\n")},
+	}
+	if _, err := discoverGPUs(missing); err == nil {
+		t.Fatal("GPU without stable identity was accepted")
+	}
+	duplicate := fstest.MapFS{
+		"sys/bus/pci/devices/0000:01:00.0/class":     {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:01:00.0/unique_id": {Data: []byte("same")},
+		"sys/bus/pci/devices/0000:02:00.0/class":     {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:02:00.0/unique_id": {Data: []byte("SAME")},
+	}
+	if _, err := discoverGPUs(duplicate); err == nil {
+		t.Fatal("ambiguous GPU identity was accepted")
+	}
+	placeholder := fstest.MapFS{
+		"sys/bus/pci/devices/0000:01:00.0/class":     {Data: []byte("0x030000\n")},
+		"sys/bus/pci/devices/0000:01:00.0/unique_id": {Data: []byte("0000000000000000\n")},
+	}
+	if _, err := discoverGPUs(placeholder); err == nil {
+		t.Fatal("placeholder GPU identity was accepted")
+	}
+}

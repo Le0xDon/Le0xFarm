@@ -430,6 +430,9 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 		result.Result = &le0xv1.CommandResult_Status{Status: &le0xv1.Status{AgentState: string(state)}}
 	case command.GetGetInventory() != nil:
 		facts, _ := config.Inventory.Discover(config.HostID)
+		if config.MinerRuntime != nil {
+			config.MinerRuntime.SetInventory(facts)
+		}
 		result.Result = &le0xv1.CommandResult_Inventory{Inventory: wiremap.Inventory(facts)}
 	case command.GetStartExecution() != nil:
 		if config.Supervisor == nil && config.MinerRuntime == nil {
@@ -459,6 +462,12 @@ func handleCommand(stream le0xv1.AgentControl_ConnectClient, command *le0xv1.Com
 			break
 		}
 		if config.MinerRuntime != nil {
+			// Re-discover at the execution boundary so a Controller plan bound to
+			// an earlier ordinal/physical device cannot slip through after a hot
+			// replacement. Manager validates before preparation and again under a
+			// final pre-exec inventory lease after preparation completes.
+			facts, _ := config.Inventory.Discover(config.HostID)
+			config.MinerRuntime.SetInventory(facts)
 			observation, msg, err := config.MinerRuntime.Start(stream.Context(), plan)
 			if err != nil {
 				result.Result = errorResult(err)
@@ -576,11 +585,22 @@ func parsePlanForHost(in *le0xv1.ExecutionPlan, expectedHost identity.HostID) (m
 			}
 			devices = append(devices, device)
 		}
+		assignments := make([]model.GPUAssignment, 0, len(wire.GpuAssignments))
+		for _, value := range wire.GpuAssignments {
+			if value == nil {
+				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid nil GPU assignment"}
+			}
+			device, err := identity.ParseDeviceID(value.DeviceId)
+			if err != nil {
+				return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "invalid GPU assignment DeviceID"}
+			}
+			assignments = append(assignments, model.GPUAssignment{DeviceID: device, HardwareIdentity: value.HardwareIdentity, RuntimeSelector: value.RuntimeSelector})
+		}
 		var endpoint *model.MiningEndpoint
 		if value := wire.GetEndpoint(); value != nil {
 			endpoint = &model.MiningEndpoint{Address: value.Address, TLS: value.Tls, User: value.User, Password: value.Password, Worker: value.Worker}
 		}
-		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, Endpoint: endpoint, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
+		plan.Miner = &model.MinerSpec{AdapterID: wire.AdapterId, SpecVersion: wire.SpecVersion, PackageID: packageID, PackageVersion: wire.PackageVersion, Mode: model.MinerMode(wire.Mode), Coin: wire.Coin, Algorithm: wire.Algorithm, Endpoint: endpoint, CPUThreads: wire.CpuThreads, GPUDeviceIDs: devices, GPUAssignments: assignments, HugePages: wire.HugePages, MSR: wire.Msr, Options: maps.Clone(wire.Options)}
 		if !slices.Equal(devices, ownership.DeviceIDs) {
 			return model.ExecutionPlan{}, farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "miner DeviceIDs do not match ownership ResourceClaim"}
 		}

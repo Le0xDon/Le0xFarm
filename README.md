@@ -19,7 +19,7 @@ Controller-to-Agent package distribution и systemd не реализованы.
 
 Controller применяет persistent `DesiredWorkload` через level-triggered reconciler: desired
 state остаётся авторитетным намерением, fresh Agent observation — фактом, а START/STOP — только
-средством сходимости. ProtocolVersion 3 передаёт adapter-neutral ownership tuple
+средством сходимости. ProtocolVersion 4 передаёт adapter-neutral ownership tuple
 `ExecutionID`/`WorkloadID`/`DesiredGeneration`/`ResolvedHash`, target `HostID` и точный CPU/GPU
 `ResourceClaim`. Agent валидирует и возвращает эти поля без интерпретации profile/pool/wallet
 policy; Controller не определяет ownership по PID, hostname, command line или miner adapter.
@@ -282,8 +282,9 @@ ID имеет вид `<type>_<32 lowercase hex digits>`. Каждый из дв�
 Совпадение hostname не влияет на идентичность хостов; вероятность случайной коллизии
 пренебрежимо мала, но математическая гарантия уникальности без реестра не заявляется.
 Новый ID следует создавать один раз и сохранять для дальнейшего использования.
-Стабильность DeviceID между сканированиями должна обеспечиваться будущим хранением и
-сопоставлением оборудования; GPU discovery в M1.1 отсутствует.
+С M6 GPU discovery создаёт DeviceID из нормализованной stable hardware UUID/unique identity,
+а не из ordinal или PCI slot. Сканирование GPU без надёжной identity возвращает явное
+предупреждение; такое устройство не может быть разрешено для runtime START.
 
 IDs — сравнимые структуры с закрытым значением. Доступны FarmID, ControllerID,
 HostID, AgentID, NodaID, DeviceID, ProfileID, ExecutionID, ServiceID, WalletID,
@@ -325,9 +326,9 @@ resolved executable, argv, environment, working directory и restart policy.
 ObservedState и ExecutionObservation сохраняют наблюдения по ExecutionID.
 
 ProtocolVersion — версия взаимодействия компонентов; SchemaVersion — версия структуры
-документов. Текущие значения равны 2 и 1 соответственно; ProtocolVersion повышен для
-M3.5 resolved MiningEndpoint, чтобы M3 и M3.5 peers не смешивали несовместимые runtime
-commands. Типы и дальнейшее изменение остаются независимыми.
+документов. Текущие значения равны 4 и 1 соответственно; ProtocolVersion 4 добавляет
+к resolved runtime plan точную stable-DeviceID GPU binding и fail-closed отклоняет старых peers,
+которые её не понимают. Типы и дальнейшее изменение остаются независимыми.
 Версия сборки `0.0.0-dev` хранится отдельно.
 
 ## M0.2 — protocol contracts
@@ -421,8 +422,10 @@ CPU Threads — число логических процессоров, види
 пары physical id/core id; Sockets — уникальные physical id. Это видимая ядру топология,
 в VM — виртуальное оборудование. Неизвестные counts равны 0 и сопровождаются warnings.
 MemTotal переводится из Linux kB (1024 байта) в байты. Недоступные факты дают частичный
-отчёт и warnings. GPUs — пустой массив: GPU discovery ещё не выполнен, это не утверждение
-об отсутствии видеокарт. Discovery не меняет DeviceConfig и права использования ресурсов.
+отчёт и warnings. Linux Agent обнаруживает GPU только при наличии надёжной hardware
+UUID/unique identity и создаёт stable DeviceID из неё, а не из PCI address/runtime selector.
+GPU без надёжной unique identity отклоняется fail-closed без создания фиктивного stable
+DeviceID. Discovery не меняет DeviceConfig и права использования ресурсов.
 
 Для локальной проверки внутри репозитория:
 

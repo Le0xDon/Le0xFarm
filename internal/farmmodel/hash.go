@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"unicode/utf8"
+
+	"github.com/le0xdon/le0xfarm/internal/model"
 )
 
 // ContentHash uses Le0xFarm's constrained deterministic JSON representation.
@@ -80,15 +82,35 @@ func DesiredWorkloadHash(content DesiredWorkloadContent) (string, error) {
 
 func ResolvedRuntimeHash(content ResolvedRuntimeContent) (string, error) {
 	claim := NormalizeResourceClaim(content.Resources)
-	return ContentHash(map[string]any{
+	value := map[string]any{
 		"run_state": string(content.RunState), "host_id": content.HostID.String(),
 		"profile_id": content.ProfileID.String(),
 		"resources":  resourceClaimHashValue(claim), "adapter_id": content.AdapterID,
 		"package": map[string]any{"package_id": content.Package.PackageID.String(), "version": content.Package.Version},
 		"mode":    string(content.Mode), "coin": content.Coin, "algorithm": content.Algorithm,
 		"endpoint":    map[string]any{"address": content.Endpoint.Address, "tls": content.Endpoint.TLS, "user": content.Endpoint.User, "password": content.Endpoint.Password, "worker": content.Endpoint.Worker},
-		"cpu_threads": optionalUint32(content.CPUThreads), "huge_pages": optionalBool(content.HugePages), "msr": optionalBool(content.MSR),
-	})
+		"cpu_threads": optionalUint32(content.CPUThreads),
+		"huge_pages":  optionalBool(content.HugePages), "msr": optionalBool(content.MSR),
+	}
+	// Preserve the committed M4/M5 hash representation for CPU-only and old
+	// unresolved snapshots. A hardware-resolved GPU plan always has bindings.
+	if len(content.GPUAssignments) != 0 {
+		value["gpu_assignments"] = gpuAssignmentHashValue(content.GPUAssignments)
+	}
+	return ContentHash(value)
+}
+
+func gpuAssignmentHashValue(assignments []model.GPUAssignment) []any {
+	canonical := append([]model.GPUAssignment(nil), assignments...)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].DeviceID.String() < canonical[j].DeviceID.String() })
+	values := make([]any, len(canonical))
+	for i, assignment := range canonical {
+		values[i] = map[string]any{
+			"device_id": assignment.DeviceID.String(), "hardware_identity": assignment.HardwareIdentity,
+			"runtime_selector": assignment.RuntimeSelector,
+		}
+	}
+	return values
 }
 
 func resourceClaimHashValue(claim ResourceClaim) map[string]any {

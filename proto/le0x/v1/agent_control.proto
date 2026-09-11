@@ -79,6 +79,12 @@ message MinerSpec {
   optional bool msr = 14;
   map<string, string> options = 15;
   MiningEndpoint endpoint = 18;
+  repeated GPUAssignment gpu_assignments = 19;
+}
+message GPUAssignment {
+  string device_id = 1;
+  string hardware_identity = 2;
+  string runtime_selector = 3;
 }
 // Resolved transient pool connection data. Password is potentially sensitive
 // and must never be logged or persisted by the command transport.

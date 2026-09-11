@@ -12,6 +12,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/model"
 )
 
 func TestDesiredWorkloadCRUDSnapshotAndReopen(t *testing.T) {
@@ -247,6 +248,15 @@ func TestResourceClaimConflicts(t *testing.T) {
 			db, service := newService(t, t.TempDir(), Options{})
 			defer db.Close()
 			_, _, profile := baseObjects(t, service)
+			if len(test.first.DeviceIDs) != 0 || len(test.second.DeviceIDs) != 0 {
+				content := profile.MiningProfileContent
+				content.CPUThreads, content.HugePages, content.MSR = nil, nil, nil
+				var err error
+				profile, err = service.UpdateMiningProfile(context.Background(), profile.ProfileID, profile.Meta.Revision, content)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			if _, err := service.CreateDesiredWorkload(context.Background(), workloadContent(profile.ProfileID, test.firstHost, test.firstState, test.first)); err != nil {
 				t.Fatal(err)
 			}
@@ -563,6 +573,151 @@ func TestConcurrentConflictingClaimsAllowOneRunningWorkload(t *testing.T) {
 	if success != 1 || conflicts != 1 {
 		t.Fatalf("success=%d conflicts=%d", success, conflicts)
 	}
+}
+
+func TestGPUResolvedSnapshotRequiresFreshInventoryAndPersists(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "controller")
+	db, service := newService(t, dir, Options{})
+	_, _, profile := baseObjects(t, service)
+	profile = gpuProfile(t, service, profile)
+	device := deviceID(1)
+	workload, err := service.CreateDesiredWorkload(ctx, workloadContent(profile.ProfileID, hostID(1), farmmodel.DesiredRunning, farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{device}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID); code(err) != farmerr.NOT_FOUND {
+		t.Fatalf("GPU snapshot created without fresh inventory: %v", err)
+	}
+	inventory := gpuInventory(hostID(1), model.GPU{DeviceID: device, UUID: "gpu-a", PCIBusID: "01:00.0", Vendor: "nvidia", Model: "RTX 5090"})
+	if err := service.RefreshResolvedSnapshotForInventory(ctx, workload.WorkloadID, inventory); err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.DesiredGeneration != 1 || len(first.Plan.Miner.GPUAssignments) != 1 || first.Plan.Miner.GPUAssignments[0].HardwareIdentity != "gpu-a" {
+		t.Fatalf("first snapshot=%+v", first)
+	}
+	if err := service.ValidateResolvedSnapshotForStart(ctx, first, inventory); err != nil {
+		t.Fatalf("fresh exact GPU binding rejected: %v", err)
+	}
+	replacedAtSameSelector := gpuInventory(hostID(1), model.GPU{DeviceID: device, UUID: "gpu-replacement", PCIBusID: "01:00.0", Vendor: "nvidia", Model: "RTX 5090"})
+	if err := service.ValidateResolvedSnapshotForStart(ctx, first, replacedAtSameSelector); code(err) != farmerr.INCOMPATIBLE_HARDWARE {
+		t.Fatalf("physical replacement passed pre-dispatch validation: %v", err)
+	}
+	if err := service.RefreshResolvedSnapshotForInventory(ctx, workload.WorkloadID, replacedAtSameSelector); code(err) != farmerr.INCOMPATIBLE_HARDWARE {
+		t.Fatalf("physical replacement inherited DeviceID during re-resolution: %v", err)
+	}
+	unchanged, _ := service.GetDesiredWorkload(ctx, workload.WorkloadID)
+	if unchanged.DesiredGeneration != 1 {
+		t.Fatalf("rejected identity mutation advanced generation: %+v", unchanged)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, service = newService(t, dir, Options{})
+	defer db.Close()
+	if err := service.RefreshResolvedSnapshotForInventory(ctx, workload.WorkloadID, inventory); err != nil {
+		t.Fatal(err)
+	}
+	same, err := service.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID)
+	if err != nil || same.ExecutionID != first.ExecutionID || same.ResolvedHash != first.ResolvedHash {
+		t.Fatalf("equivalent refresh restarted: snapshot=%+v err=%v", same, err)
+	}
+
+	moved := gpuInventory(hostID(1), model.GPU{DeviceID: device, UUID: "gpu-a", PCIBusID: "02:00.0", Vendor: "nvidia", Model: "RTX 5090"})
+	if err := service.RefreshResolvedSnapshotForInventory(ctx, workload.WorkloadID, moved); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.DesiredGeneration != 2 || second.ExecutionID == first.ExecutionID || second.ResolvedHash == first.ResolvedHash || second.Plan.Miner.GPUAssignments[0].RuntimeSelector != "02:00.0" {
+		t.Fatalf("runtime selector change did not create immutable replacement: %+v", second)
+	}
+	history, err := service.ListResolvedSnapshots(ctx, workload.WorkloadID)
+	if err != nil || len(history) != 2 || history[0].Plan.Miner.GPUAssignments[0].RuntimeSelector != "01:00.0" {
+		t.Fatalf("history mutated: %+v err=%v", history, err)
+	}
+}
+
+func TestGPURefreshFailsClosedForMissingOrReplacedDevice(t *testing.T) {
+	db, service := newService(t, t.TempDir(), Options{})
+	defer db.Close()
+	_, _, profile := baseObjects(t, service)
+	profile = gpuProfile(t, service, profile)
+	claimed := deviceID(1)
+	workload, err := service.CreateDesiredWorkload(context.Background(), workloadContent(profile.ProfileID, hostID(1), farmmodel.DesiredRunning, farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{claimed}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := model.GPU{DeviceID: deviceID(2), UUID: "new-physical-gpu", PCIBusID: "01:00.0", Vendor: "nvidia"}
+	err = service.RefreshResolvedSnapshotForInventory(context.Background(), workload.WorkloadID, gpuInventory(hostID(1), replacement))
+	if code(err) != farmerr.INCOMPATIBLE_HARDWARE {
+		t.Fatalf("replacement was substituted: %v", err)
+	}
+	loaded, _ := service.GetDesiredWorkload(context.Background(), workload.WorkloadID)
+	if loaded.DesiredGeneration != 1 {
+		t.Fatalf("failed validation mutated generation: %+v", loaded)
+	}
+	if _, err := service.GetCurrentResolvedSnapshot(context.Background(), workload.WorkloadID); code(err) != farmerr.NOT_FOUND {
+		t.Fatalf("failed validation created snapshot: %v", err)
+	}
+}
+
+func TestConcurrentGPURefreshCreatesOneGeneration(t *testing.T) {
+	db, service := newService(t, t.TempDir(), Options{})
+	defer db.Close()
+	_, _, profile := baseObjects(t, service)
+	profile = gpuProfile(t, service, profile)
+	device := deviceID(1)
+	workload, err := service.CreateDesiredWorkload(context.Background(), workloadContent(profile.ProfileID, hostID(1), farmmodel.DesiredRunning, farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{device}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory := gpuInventory(hostID(1), model.GPU{DeviceID: device, UUID: "gpu-a", PCIBusID: "01:00.0", Vendor: "nvidia"})
+	start := make(chan struct{})
+	errors := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			errors <- service.RefreshResolvedSnapshotForInventory(context.Background(), workload.WorkloadID, inventory)
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded, _ := service.GetDesiredWorkload(context.Background(), workload.WorkloadID)
+	history, _ := service.ListResolvedSnapshots(context.Background(), workload.WorkloadID)
+	if loaded.DesiredGeneration != 1 || len(history) != 1 {
+		t.Fatalf("concurrent refresh duplicated generation: workload=%+v history=%d", loaded, len(history))
+	}
+}
+
+func gpuProfile(t *testing.T, service *Service, profile farmmodel.MiningProfile) farmmodel.MiningProfile {
+	t.Helper()
+	content := profile.MiningProfileContent
+	content.CPUThreads, content.HugePages, content.MSR = nil, nil, nil
+	updated, err := service.UpdateMiningProfile(context.Background(), profile.ProfileID, profile.Meta.Revision, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return updated
+}
+
+func gpuInventory(host identity.HostID, gpus ...model.GPU) model.Inventory {
+	return model.Inventory{Host: model.Host{HostID: host}, GPUs: gpus}
 }
 
 func baseObjects(t *testing.T, service *Service) (farmmodel.Pool, farmmodel.WalletRef, farmmodel.MiningProfile) {

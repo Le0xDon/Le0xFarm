@@ -348,6 +348,41 @@ func TestHostSettingsReplacementStopsOldBeforeStartingNew(t *testing.T) {
 	}
 }
 
+func TestGPUAssignmentChangeStopsOldBeforeStartingNew(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	oldDevice, newDevice := testDevice(1), testDevice(2)
+	old := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{oldDevice}})
+	current := testSnapshot(workloadID, host, 2, testExecution(2), farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{newDevice}})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 2, current.Resources), old, current)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, []model.ExecutionObservation{observedExecution(old, model.ExecutionRunning)})
+	// Current inventory contains only the explicitly selected replacement GPU;
+	// it is never substituted for the old claim by the planner.
+	observed.SetInventory(host, commander.info.ConnectionEpoch, model.Inventory{Host: model.Host{HostID: host}, GPUs: []model.GPU{{DeviceID: newDevice, UUID: "gpu-new", PCIBusID: "02:00.0"}}})
+	coordinator.ReconcileHost(context.Background(), host)
+	requests := commander.requestsCopy()
+	if len(requests) != 1 || requests[0].Kind != controllernet.RuntimeStop || requests[0].ExecutionID != old.ExecutionID {
+		t.Fatalf("GPU replacement did not STOP old exactly: %+v", requests)
+	}
+	for range 20 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if len(commander.requestsCopy()) != 1 {
+		t.Fatal("GPU replacement overlapped unresolved old STOP")
+	}
+	stopped := observedExecution(old, model.ExecutionStopped)
+	coordinator.RuntimeResult(commander.info, requests[0], &stopped, nil)
+	coordinator.ExecutionsObserved(commander.info, nil, requests[0].DispatchSequence)
+	waitRequests(t, commander, 2)
+	requests = commander.requestsCopy()
+	if requests[1].Kind != controllernet.RuntimeStart || requests[1].ExecutionID != current.ExecutionID {
+		t.Fatalf("confirmed GPU absence did not START new exactly: %+v", requests)
+	}
+}
+
 func TestFreshHostValidationBlocksAndCanRecover(t *testing.T) {
 	host := testHost(1)
 	workloadID := testWorkload(1)
@@ -783,6 +818,9 @@ func (store *fakeStore) GetCurrentResolvedSnapshot(_ context.Context, id identit
 		}
 	}
 	return farmmodel.ResolvedExecutionSnapshot{}, farmerr.Error{Code: farmerr.NOT_FOUND}
+}
+func (store *fakeStore) RefreshResolvedSnapshotForInventory(_ context.Context, _ identity.WorkloadID, _ model.Inventory) error {
+	return nil
 }
 func (store *fakeStore) ListResolvedSnapshots(_ context.Context, id identity.WorkloadID) ([]farmmodel.ResolvedExecutionSnapshot, error) {
 	store.mu.Lock()

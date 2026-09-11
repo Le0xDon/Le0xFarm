@@ -14,7 +14,7 @@ import (
 func TestStaticCatalogLookup(t *testing.T) {
 	id, _ := identity.ParsePackageID("package_11111111111111111111111111111111")
 	ref := farmmodel.PackageRef{PackageID: id, Version: "1.0"}
-	catalog, err := NewStatic([]farmmodel.PackageRelease{{Ref: ref, AdapterIDs: []string{"miner"}}})
+	catalog, err := NewStatic([]farmmodel.PackageRelease{{Ref: ref, AdapterIDs: []string{"miner"}, Runtime: farmmodel.RuntimeCapabilities{GPU: true, GPUVendors: []string{"nvidia"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,8 +22,13 @@ func TestStaticCatalogLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if release.Ref != ref || len(release.AdapterIDs) != 1 {
+	if release.Ref != ref || len(release.AdapterIDs) != 1 || !release.Runtime.GPU || !slices.Equal(release.Runtime.GPUVendors, []string{"nvidia"}) {
 		t.Fatalf("unexpected release: %+v", release)
+	}
+	release.Runtime.GPUVendors[0] = "mutated"
+	again, err := catalog.Lookup(context.Background(), ref)
+	if err != nil || !slices.Equal(again.Runtime.GPUVendors, []string{"nvidia"}) {
+		t.Fatal("catalog returned mutable runtime capability storage")
 	}
 	_, err = catalog.Lookup(context.Background(), farmmodel.PackageRef{PackageID: id, Version: "2.0"})
 	if code, _ := farmerr.CodeOf(err); code != farmerr.NOT_FOUND {

@@ -44,10 +44,11 @@ type Snapshot struct {
 	Stderr       string
 }
 type Supervisor struct {
-	mu         sync.Mutex
-	cfg        Config
-	executions map[identity.ExecutionID]*execution
-	closed     bool
+	mu             sync.Mutex
+	cfg            Config
+	executions     map[identity.ExecutionID]*execution
+	startValidator func(model.ExecutionPlan) (release func(), err error)
+	closed         bool
 }
 type execution struct {
 	plan           model.ExecutionPlan
@@ -109,6 +110,18 @@ func New(cfg Config) *Supervisor {
 		cfg.After = time.After
 	}
 	return &Supervisor{cfg: cfg, executions: map[identity.ExecutionID]*execution{}}
+}
+
+// SetStartValidator installs the Agent runtime's fail-closed validation for
+// every actual process start, including watchdog and explicit restarts. The
+// validator runs after adapter preparation and outside the Supervisor lock.
+// Its release function, when non-nil, is held until cmd.Start returns so an
+// inventory publication cannot invalidate the checked binding between the
+// final validation and process creation.
+func (s *Supervisor) SetStartValidator(validate func(model.ExecutionPlan) (release func(), err error)) {
+	s.mu.Lock()
+	s.startValidator = validate
+	s.mu.Unlock()
 }
 func validate(p model.ExecutionPlan) error {
 	if err := p.ExecutionID.Validate(); err != nil {
@@ -203,6 +216,41 @@ func (s *Supervisor) startExisting(e *execution, gen uint64, msg string) (Snapsh
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	s.mu.Lock()
 	if !e.desired || e.generation != gen {
+		snap := snapshot(e)
+		s.mu.Unlock()
+		return snap, "stopped", nil
+	}
+	validator := s.startValidator
+	plan := e.plan
+	s.mu.Unlock()
+
+	var release func()
+	if validator != nil {
+		var err error
+		release, err = validator(plan)
+		if err != nil {
+			if release != nil {
+				release()
+			}
+			s.mu.Lock()
+			if e.desired && e.generation == gen && !s.closed {
+				e.desired = false
+				e.state = model.ExecutionFailed
+				e.lastErr = err.Error()
+			}
+			snap := snapshot(e)
+			s.mu.Unlock()
+			return snap, "", err
+		}
+	}
+	if release != nil {
+		defer release()
+	}
+
+	// Revalidate execution authority after the potentially blocking hardware
+	// check. The validation lease remains held across this check and cmd.Start.
+	s.mu.Lock()
+	if !e.desired || e.generation != gen || s.closed {
 		snap := snapshot(e)
 		s.mu.Unlock()
 		return snap, "stopped", nil
@@ -328,9 +376,10 @@ func (s *Supervisor) wait(e *execution, cmd *exec.Cmd, gen uint64) {
 		}
 		ok := e.desired && e.generation == next && !s.closed
 		s.mu.Unlock()
-		if ok {
-			_, _, _ = s.startExisting(e, next, "watchdog restart")
+		if !ok {
+			return
 		}
+		_, _, _ = s.startExisting(e, next, "watchdog restart")
 	}()
 }
 func (s *Supervisor) Stop(id identity.ExecutionID) (Snapshot, string, error) {

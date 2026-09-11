@@ -23,6 +23,7 @@ func Builtin() (*Static, error) {
 		Ref:        farmmodel.PackageRef{PackageID: manifest.PackageID, Version: manifest.Version},
 		AdapterIDs: []string{xmrig.AdapterID},
 		Tuning:     farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true},
+		Runtime:    farmmodel.RuntimeCapabilities{CPU: true},
 	}})
 }
 
@@ -38,6 +39,7 @@ func NewStatic(releases []farmmodel.PackageRelease) (*Static, error) {
 		}
 		copyRelease := release
 		copyRelease.AdapterIDs = append([]string(nil), release.AdapterIDs...)
+		copyRelease.Runtime.GPUVendors = append([]string(nil), release.Runtime.GPUVendors...)
 		catalog.releases[key] = copyRelease
 	}
 	return catalog, nil
@@ -54,6 +56,7 @@ func (catalog *Static) Lookup(_ context.Context, ref farmmodel.PackageRef) (farm
 		return farmmodel.PackageRelease{}, farmerr.Error{Code: farmerr.NOT_FOUND, HumanMessage: "package release is not present in the Controller catalog"}
 	}
 	release.AdapterIDs = append([]string(nil), release.AdapterIDs...)
+	release.Runtime.GPUVendors = append([]string(nil), release.Runtime.GPUVendors...)
 	return release, nil
 }
 

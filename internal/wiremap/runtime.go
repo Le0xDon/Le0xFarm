@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/gpuresource"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
@@ -25,10 +26,20 @@ func ExecutionPlan(plan model.ExecutionPlan) (*le0xv1.ExecutionPlan, error) {
 		if !slices.Equal(spec.GPUDeviceIDs, plan.Ownership.DeviceIDs) {
 			return nil, typed(farmerr.CONFIG_CONFLICT, "miner DeviceIDs do not match ownership ResourceClaim")
 		}
+		if len(spec.GPUDeviceIDs) != 0 {
+			if err := gpuresource.ValidateBindings(spec.GPUDeviceIDs, spec.GPUAssignments); err != nil {
+				return nil, typed(farmerr.CONFIG_CONFLICT, "invalid resolved GPU assignments")
+			}
+		} else if len(spec.GPUAssignments) != 0 {
+			return nil, typed(farmerr.CONFIG_CONFLICT, "CPU plan contains GPU assignments")
+		}
 		miner := &le0xv1.MinerSpec{AdapterId: spec.AdapterID, SpecVersion: spec.SpecVersion, PackageId: spec.PackageID.String(), PackageVersion: spec.PackageVersion, Mode: string(spec.Mode), Coin: spec.Coin, Algorithm: spec.Algorithm,
 			CpuThreads: cloneUint32(spec.CPUThreads), HugePages: cloneBool(spec.HugePages), Msr: cloneBool(spec.MSR), Options: maps.Clone(spec.Options)}
 		for _, id := range spec.GPUDeviceIDs {
 			miner.GpuDeviceIds = append(miner.GpuDeviceIds, id.String())
+		}
+		for _, assignment := range spec.GPUAssignments {
+			miner.GpuAssignments = append(miner.GpuAssignments, &le0xv1.GPUAssignment{DeviceId: assignment.DeviceID.String(), HardwareIdentity: assignment.HardwareIdentity, RuntimeSelector: assignment.RuntimeSelector})
 		}
 		if endpoint := spec.Endpoint; endpoint != nil {
 			miner.Endpoint = &le0xv1.MiningEndpoint{Address: endpoint.Address, Tls: endpoint.TLS, User: endpoint.User, Password: endpoint.Password, Worker: endpoint.Worker}

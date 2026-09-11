@@ -367,7 +367,7 @@ func TestLiveSessionRequiresFreshExecutionsAndChangesEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 3, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
+		if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 4, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}}}); err != nil {
 			t.Fatal(err)
 		}
 		if hello, err := stream.Recv(); err != nil || hello.GetHello() == nil {
@@ -616,7 +616,7 @@ func TestReadySessionRefreshesExecutionsInventoryAndStatusOnHeartbeat(t *testing
 		t.Fatal(err)
 	}
 	host := "host_0123456789abcdef0123456789abcdef"
-	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 3, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
+	if err := stream.Send(&le0xv1.AgentMessage{Payload: &le0xv1.AgentMessage_Hello{Hello: &le0xv1.AgentHello{ProtocolVersion: 4, SchemaVersion: 1, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: host}}}); err != nil {
 		t.Fatal(err)
 	}
 	if message, err := stream.Recv(); err != nil || message.GetHello() == nil {
@@ -833,7 +833,7 @@ func TestControllerRejectsInvalidTrustBoundaryData(t *testing.T) {
 	}{
 		{"agent", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "bad", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.CONFIG_CONFLICT},
 		{"host", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "bad"}, farmerr.CONFIG_CONFLICT},
-		{"v2-agent-v3-controller", &le0xv1.AgentHello{ProtocolVersion: 2, SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.PROTOCOL_VERSION_MISMATCH},
+		{"v3-agent-v4-controller", &le0xv1.AgentHello{ProtocolVersion: 3, SchemaVersion: uint32(protocol.CurrentSchemaVersion), AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.PROTOCOL_VERSION_MISMATCH},
 		{"schema", &le0xv1.AgentHello{ProtocolVersion: uint32(protocol.CurrentProtocolVersion), SchemaVersion: 999, AgentId: "agent_0123456789abcdef0123456789abcdef", HostId: "host_0123456789abcdef0123456789abcdef"}, farmerr.SCHEMA_VERSION_MISMATCH},
 	}
 	for _, tc := range cases {

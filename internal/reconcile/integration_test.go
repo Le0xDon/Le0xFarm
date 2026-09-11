@@ -2,10 +2,14 @@ package reconcile
 
 import (
 	"context"
+	"io"
+	"io/fs"
+	"log"
 	"net"
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/agentnet"
@@ -45,7 +49,7 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	if err := agenttrust.Save(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
 		t.Fatal(err)
 	}
-	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "1"}, AdapterIDs: []string{integrationAdapterID}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}}})
+	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "1"}, AdapterIDs: []string{integrationAdapterID}, Runtime: farmmodel.RuntimeCapabilities{CPU: true}, Tuning: farmmodel.TuningCapabilities{CPUThreads: true, HugePages: true, MSR: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +253,259 @@ func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	}
 }
 
+func TestGPUDesiredRuntimeFullPathAndHardwareInvalidation(t *testing.T) {
+	controllerID, _ := identity.NewControllerID()
+	farmID, _ := identity.NewFarmID()
+	agentID := testAgent(2)
+	hostID := testHost(2)
+	trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := trust.Pair(agentID, hostID); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := t.TempDir()
+	if err := agenttrust.Save(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
+		t.Fatal(err)
+	}
+
+	files := newMutableGPUFS("0000:01:00.0", "gpu-a")
+	inventorySource := inventory.Source{Files: files, Hostname: func() (string, error) { return "duplicate-hostnames-are-valid", nil }, Architecture: "amd64"}
+	initialInventory, _ := inventorySource.Discover(hostID)
+	if len(initialInventory.GPUs) != 1 {
+		t.Fatalf("synthetic GPU discovery=%+v", initialInventory.GPUs)
+	}
+	deviceA := initialInventory.GPUs[0].DeviceID
+
+	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{
+		Ref:        farmmodel.PackageRef{PackageID: integrationPackageID, Version: "gpu-1"},
+		AdapterIDs: []string{integrationGPUAdapterID},
+		Runtime:    farmmodel.RuntimeCapabilities{GPU: true, GPUVendors: []string{"nvidia"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	databaseDir := filepath.Join(t.TempDir(), "controller")
+	db, err := controllerdb.Open(context.Background(), databaseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := farmconfig.New(db, catalog, farmconfig.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.CreatePool(context.Background(), farmmodel.PoolContent{Name: "synthetic", Address: "127.0.0.1:1", Auth: farmmodel.PoolAuth{Kind: farmmodel.PoolAuthNone}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wallet, err := store.CreateWalletRef(context.Background(), farmmodel.WalletRefContent{Name: "synthetic", Coin: "TEST", Address: "synthetic-public-payout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := store.CreateMiningProfile(context.Background(), farmmodel.MiningProfileContent{Name: "gpu-safe", AdapterID: integrationGPUAdapterID, Package: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "gpu-1"}, Mode: farmmodel.ProfileModeMining, Coin: "TEST", PoolID: pool.PoolID, WalletID: wallet.WalletID, LoginPolicy: farmmodel.LoginPolicy{UserTemplate: "${wallet}", WorkerPlacement: farmmodel.WorkerNone}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workload, err := store.CreateDesiredWorkload(context.Background(), farmmodel.DesiredWorkloadContent{Name: "gpu-safe", HostID: hostID, ProfileID: profile.ProfileID, RunState: farmmodel.DesiredRunning, Resources: farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{deviceA}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := supervisor.New(supervisor.Config{StopGrace: 100 * time.Millisecond})
+	adapter := &gpuIntegrationAdapter{}
+	registry := minerruntime.NewRegistry()
+	if err := registry.Register(adapter); err != nil {
+		t.Fatal(err)
+	}
+	minerRuntime := minerruntime.New(runtime, registry, agentDir, nil, initialInventory, minerruntime.Config{PollInterval: 10 * time.Millisecond, RefreshInventory: func() model.Inventory {
+		facts, _ := inventorySource.Discover(hostID)
+		return facts
+	}})
+	defer minerRuntime.Shutdown(context.Background())
+
+	dialer := &switchingBufDialer{}
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	defer stopAgent()
+	agentDone := make(chan error, 1)
+	go func() {
+		agentDone <- agentnet.Run(agentCtx, agentnet.Config{Target: "buf", InsecureDev: true, TrustDir: agentDir, AgentID: agentID, HostID: hostID, Inventory: inventorySource, Supervisor: runtime, MinerRuntime: minerRuntime, HeartbeatInterval: 10 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Output: log.New(io.Discard, "", 0), Dialer: func(context.Context, string) (net.Conn, error) { return dialer.Dial() }})
+	}()
+
+	listener := bufconn.Listen(1024 * 1024)
+	dialer.Set(listener)
+	server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, ShutdownGracePeriod: 20 * time.Millisecond, Output: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := &countingCommander{server: server}
+	observed := controllerstate.New()
+	coordinator := NewCoordinator(store, observed, commands, log.New(io.Discard, "", 0))
+	server.SetSessionHandler(coordinator)
+	controllerCtx, stopController := context.WithCancel(context.Background())
+	defer stopController()
+	serverDone := make(chan error, 1)
+	go coordinator.Run(controllerCtx, 5*time.Millisecond)
+	go func() { serverDone <- server.Serve(controllerCtx, listener) }()
+
+	waitSessionReady(t, server, hostID)
+	first := waitCurrentSnapshot(t, store, workload.WorkloadID, 1)
+	waitExecutionState(t, runtime, first.ExecutionID, model.ExecutionRunning)
+	prepared := adapter.waitPrepared(t, 1)
+	if len(prepared.Miner.GPUAssignments) != 1 || prepared.Miner.GPUAssignments[0].DeviceID != deviceA || prepared.Miner.GPUAssignments[0].RuntimeSelector != "0000:01:00.0" {
+		t.Fatalf("Agent adapter received wrong binding: %+v", prepared.Miner.GPUAssignments)
+	}
+	firstProcess := mustRuntimeSnapshot(t, runtime, first.ExecutionID)
+	if firstProcess.PID <= 0 || commands.Count(controllernet.RuntimeStart) != 1 {
+		t.Fatalf("initial GPU execution=%+v starts=%d", firstProcess, commands.Count(controllernet.RuntimeStart))
+	}
+
+	replacementSource := inventory.Source{Files: newMutableGPUFS("0000:02:00.0", "gpu-b"), Hostname: func() (string, error) { return "duplicate-hostnames-are-valid", nil }, Architecture: "amd64"}
+	replacementInventory, _ := replacementSource.Discover(hostID)
+	if len(replacementInventory.GPUs) != 1 {
+		t.Fatalf("replacement discovery=%+v", replacementInventory.GPUs)
+	}
+	deviceB := replacementInventory.GPUs[0].DeviceID
+	content := workload.DesiredWorkloadContent
+	content.Resources = farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{deviceB}}
+	workload, err = store.UpdateDesiredWorkload(context.Background(), workload.WorkloadID, workload.Meta.Revision, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitExecutionState(t, runtime, first.ExecutionID, model.ExecutionStopped)
+	waitObservedExecutionState(t, observed, hostID, first.ExecutionID, model.ExecutionStopped)
+	if commands.Count(controllernet.RuntimeStop) != 1 || commands.Count(controllernet.RuntimeStart) != 1 {
+		t.Fatalf("replacement did not stop old execution first: starts=%d stops=%d", commands.Count(controllernet.RuntimeStart), commands.Count(controllernet.RuntimeStop))
+	}
+	files.SetGPU("0000:02:00.0", "gpu-b")
+	replacementInventory, _ = inventorySource.Discover(hostID)
+	minerRuntime.SetInventory(replacementInventory)
+	session, ok := server.Session(hostID)
+	if !ok {
+		t.Fatal("Agent session disappeared")
+	}
+	coordinator.InventoryObserved(session, replacementInventory)
+	coordinator.ReconcileHost(context.Background(), hostID)
+	second := waitCurrentSnapshot(t, store, workload.WorkloadID, workload.DesiredGeneration)
+	waitExecutionState(t, runtime, second.ExecutionID, model.ExecutionRunning)
+	prepared = adapter.waitPrepared(t, 2)
+	if second.ExecutionID == first.ExecutionID || len(prepared.Miner.GPUAssignments) != 1 || prepared.Miner.GPUAssignments[0].DeviceID != deviceB || prepared.Miner.GPUAssignments[0].RuntimeSelector != "0000:02:00.0" {
+		t.Fatalf("replacement binding=%+v first=%s second=%s", prepared.Miner.GPUAssignments, first.ExecutionID, second.ExecutionID)
+	}
+	if commands.Count(controllernet.RuntimeStart) != 2 || mustRuntimeSnapshot(t, runtime, first.ExecutionID).PID != 0 {
+		t.Fatal("replacement overlapped or did not start exactly once")
+	}
+
+	// A later authoritative inventory showing replacement hardware under the
+	// same selector invalidates and exactly stops the managed execution locally.
+	files.SetGPU("0000:02:00.0", "gpu-c")
+	invalidInventory, _ := inventorySource.Discover(hostID)
+	minerRuntime.SetInventory(invalidInventory)
+	waitExecutionState(t, runtime, second.ExecutionID, model.ExecutionStopped)
+	if mustRuntimeSnapshot(t, runtime, second.ExecutionID).PID != 0 {
+		t.Fatal("invalidated execution remained running")
+	}
+
+	content = workload.DesiredWorkloadContent
+	content.RunState = farmmodel.DesiredStopped
+	if _, err := store.UpdateDesiredWorkload(context.Background(), workload.WorkloadID, workload.Meta.Revision, content); err != nil {
+		t.Fatal(err)
+	}
+	stopController()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	stopAgent()
+	select {
+	case err := <-agentDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Agent did not stop")
+	}
+}
+
 type sleepRuntimeAdapter struct{}
+
+const integrationGPUAdapterID = "integration-gpu-sleep"
+
+type gpuIntegrationAdapter struct {
+	mu       sync.Mutex
+	prepared []model.ExecutionPlan
+}
+
+func (*gpuIntegrationAdapter) ID() string { return integrationGPUAdapterID }
+func (*gpuIntegrationAdapter) Capabilities() minerruntime.Capabilities {
+	return minerruntime.Capabilities{GPU: true, GPUVendors: []string{"nvidia"}}
+}
+func (*gpuIntegrationAdapter) Validate(model.MinerSpec, model.Inventory) ([]string, error) {
+	return nil, nil
+}
+func (adapter *gpuIntegrationAdapter) Prepare(_ context.Context, request minerruntime.PrepareRequest) (minerruntime.Prepared, error) {
+	plan := request.Plan
+	adapter.mu.Lock()
+	adapter.prepared = append(adapter.prepared, plan)
+	adapter.mu.Unlock()
+	plan.Executable = "/bin/sleep"
+	plan.Args = []string{"60"}
+	plan.RestartPolicy = model.RestartNever
+	return minerruntime.Prepared{Plan: plan, Telemetry: gpuHealthyTestTelemetry{}}, nil
+}
+
+func (adapter *gpuIntegrationAdapter) waitPrepared(t *testing.T, count int) model.ExecutionPlan {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		adapter.mu.Lock()
+		if len(adapter.prepared) >= count {
+			plan := adapter.prepared[count-1]
+			adapter.mu.Unlock()
+			return plan
+		}
+		adapter.mu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("adapter did not prepare execution %d", count)
+	return model.ExecutionPlan{}
+}
+
+type mutableGPUFS struct {
+	mu      sync.RWMutex
+	entries fstest.MapFS
+}
+
+func newMutableGPUFS(selector, hardwareIdentity string) *mutableGPUFS {
+	value := &mutableGPUFS{}
+	value.SetGPU(selector, hardwareIdentity)
+	return value
+}
+
+func (files *mutableGPUFS) SetGPU(selector, hardwareIdentity string) {
+	files.mu.Lock()
+	defer files.mu.Unlock()
+	base := "sys/bus/pci/devices/" + selector
+	files.entries = fstest.MapFS{
+		base:                &fstest.MapFile{Mode: fs.ModeDir | 0555},
+		base + "/class":     &fstest.MapFile{Data: []byte("0x030000\n")},
+		base + "/vendor":    &fstest.MapFile{Data: []byte("0x10de\n")},
+		base + "/device":    &fstest.MapFile{Data: []byte("0x2684\n")},
+		base + "/unique_id": &fstest.MapFile{Data: []byte(hardwareIdentity + "\n")},
+	}
+}
+
+func (files *mutableGPUFS) Open(name string) (fs.File, error) {
+	files.mu.RLock()
+	snapshot := make(fstest.MapFS, len(files.entries))
+	for path, entry := range files.entries {
+		copy := *entry
+		copy.Data = append([]byte(nil), entry.Data...)
+		snapshot[path] = &copy
+	}
+	files.mu.RUnlock()
+	return snapshot.Open(name)
+}
 
 func (sleepRuntimeAdapter) ID() string { return integrationAdapterID }
 func (sleepRuntimeAdapter) Capabilities() minerruntime.Capabilities {
@@ -270,6 +526,16 @@ type healthyTestTelemetry struct{}
 
 func (healthyTestTelemetry) Poll(context.Context) (*model.MinerTelemetry, error) {
 	return &model.MinerTelemetry{AdapterID: integrationAdapterID, Health: model.MinerHealthHealthy}, nil
+}
+
+type gpuHealthyTestTelemetry struct{}
+
+func (gpuHealthyTestTelemetry) Poll(context.Context) (*model.MinerTelemetry, error) {
+	return &model.MinerTelemetry{
+		AdapterID:   integrationGPUAdapterID,
+		CollectedAt: time.Now().UTC(),
+		Health:      model.MinerHealthHealthy,
+	}, nil
 }
 
 func mustIntegrationPackageID(value string) identity.PackageID {
@@ -357,4 +623,35 @@ func mustRuntimeSnapshot(t *testing.T, runtime *supervisor.Supervisor, execution
 		t.Fatalf("execution %s missing", executionID)
 	}
 	return snapshot
+}
+
+func waitCurrentSnapshot(t *testing.T, store *farmconfig.Service, workloadID identity.WorkloadID, generation uint64) farmmodel.ResolvedExecutionSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot, err := store.GetCurrentResolvedSnapshot(context.Background(), workloadID)
+		if err == nil && snapshot.DesiredGeneration == generation {
+			return snapshot
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("workload %s did not resolve generation %d", workloadID, generation)
+	return farmmodel.ResolvedExecutionSnapshot{}
+}
+
+func waitObservedExecutionState(t *testing.T, observed *controllerstate.Store, hostID identity.HostID, executionID identity.ExecutionID, state model.ExecutionStatus) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		current, ok := observed.Get(hostID)
+		if ok {
+			for _, execution := range current.Executions {
+				if execution.ExecutionID == executionID && execution.Status == state {
+					return
+				}
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("Controller did not observe execution %s in state %s", executionID, state)
 }

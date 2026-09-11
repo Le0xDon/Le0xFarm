@@ -4,12 +4,15 @@ package farmresolve
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
+	"github.com/le0xdon/le0xfarm/internal/gpuresource"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
@@ -23,6 +26,10 @@ type Inputs struct {
 	Settings *farmmodel.HostProfileSettings
 	Pool     farmmodel.Pool
 	Wallet   farmmodel.WalletRef
+	// GPUAssignments may carry the last immutable binding while configuration
+	// is edited offline. ResolveAndValidate always replaces it from fresh
+	// current-epoch inventory before a START is eligible.
+	GPUAssignments []model.GPUAssignment
 }
 
 type Result struct {
@@ -77,7 +84,19 @@ func (resolver Resolver) Resolve(ctx context.Context, inputs Inputs) (Result, er
 	if !found {
 		return Result{}, typed(farmerr.INVALID_REFERENCE, "package release does not support profile adapter")
 	}
+	if err := validateResourceShape(inputs.Workload.Resources, release.Runtime); err != nil {
+		return Result{}, err
+	}
 	cpuThreads, hugePages, msr := effectiveTuning(inputs.Profile, inputs.Settings)
+	if !inputs.Workload.Resources.CPU && (cpuThreads != nil || hugePages != nil || msr != nil) {
+		return Result{}, typed(farmerr.CONFIG_CONFLICT, "CPU tuning cannot be applied to a GPU-only workload")
+	}
+	assignments := normalizeAssignments(inputs.GPUAssignments)
+	if len(assignments) != 0 {
+		if err := gpuresource.ValidateBindings(farmmodel.NormalizeResourceClaim(inputs.Workload.Resources).DeviceIDs, assignments); err != nil {
+			return Result{}, err
+		}
+	}
 	if err := farmmodel.ValidateTuningCapabilities(cpuThreads, hugePages, msr, release.Tuning); err != nil {
 		return Result{}, err
 	}
@@ -87,7 +106,7 @@ func (resolver Resolver) Resolve(ctx context.Context, inputs Inputs) (Result, er
 	}
 	content := farmmodel.ResolvedRuntimeContent{
 		RunState: inputs.Workload.RunState, HostID: inputs.Workload.HostID, ProfileID: inputs.Profile.ProfileID,
-		Resources: farmmodel.NormalizeResourceClaim(inputs.Workload.Resources), AdapterID: inputs.Profile.AdapterID,
+		Resources: farmmodel.NormalizeResourceClaim(inputs.Workload.Resources), GPUAssignments: assignments, AdapterID: inputs.Profile.AdapterID,
 		Package: inputs.Profile.Package, Mode: inputs.Profile.Mode, Coin: inputs.Profile.Coin,
 		Algorithm: inputs.Profile.Algorithm, Endpoint: endpoint, CPUThreads: cpuThreads,
 		HugePages: hugePages, MSR: msr,
@@ -120,16 +139,57 @@ func (resolver Resolver) ResolveAndValidate(ctx context.Context, inputs Inputs, 
 			})
 		}
 	}
-	available := make(map[identity.DeviceID]struct{}, len(inventory.GPUs))
-	for _, gpu := range inventory.GPUs {
-		available[gpu.DeviceID] = struct{}{}
-	}
-	for _, deviceID := range result.Content.Resources.DeviceIDs {
-		if _, ok := available[deviceID]; !ok {
-			return Result{}, hardwareError(inputs, "requested DeviceID is absent from fresh inventory", map[string]string{"device_id": deviceID.String()})
+	if len(result.Content.Resources.DeviceIDs) != 0 {
+		release, err := resolver.Catalog.Lookup(ctx, result.Content.Package)
+		if err != nil {
+			return Result{}, typed(farmerr.INVALID_REFERENCE, "package release is unavailable")
+		}
+		assignments, err := gpuresource.Resolve(result.Content.Resources.DeviceIDs, inventory, release.Runtime.GPUVendors)
+		if err != nil {
+			var typedError farmerr.Error
+			if errors.As(err, &typedError) {
+				return Result{}, hardwareError(inputs, typedError.HumanMessage, typedError.Details)
+			}
+			return Result{}, hardwareError(inputs, "cannot resolve requested GPU resources", nil)
+		}
+		if len(inputs.GPUAssignments) != 0 {
+			if err := gpuresource.ValidateStableIdentities(result.Content.Resources.DeviceIDs, inputs.GPUAssignments, inventory, release.Runtime.GPUVendors); err != nil {
+				var typedError farmerr.Error
+				if errors.As(err, &typedError) {
+					return Result{}, hardwareError(inputs, typedError.HumanMessage, typedError.Details)
+				}
+				return Result{}, hardwareError(inputs, "GPU stable identity validation failed", nil)
+			}
+		}
+		result.Content.GPUAssignments = assignments
+		result.Hash, err = farmmodel.ResolvedRuntimeHash(result.Content)
+		if err != nil {
+			return Result{}, typed(farmerr.INTERNAL_ERROR, "cannot hash hardware-resolved runtime intent")
 		}
 	}
 	return result, nil
+}
+
+func validateResourceShape(claim farmmodel.ResourceClaim, capabilities farmmodel.RuntimeCapabilities) error {
+	if claim.CPU && len(claim.DeviceIDs) != 0 {
+		return typed(farmerr.CONFIG_CONFLICT, "combined CPU and GPU execution is not supported by the M6 runtime contract")
+	}
+	if claim.CPU && !capabilities.CPU {
+		return typed(farmerr.INCOMPATIBLE_HARDWARE, "package/adapter does not support CPU execution")
+	}
+	if len(claim.DeviceIDs) != 0 && !capabilities.GPU {
+		return typed(farmerr.INCOMPATIBLE_HARDWARE, "package/adapter does not support GPU execution")
+	}
+	if len(claim.DeviceIDs) > 1 && !capabilities.MultiGPUSingleProcess {
+		return typed(farmerr.CONFIG_CONFLICT, "package/adapter does not support one process claiming multiple GPUs")
+	}
+	return nil
+}
+
+func normalizeAssignments(values []model.GPUAssignment) []model.GPUAssignment {
+	result := append([]model.GPUAssignment(nil), values...)
+	slices.SortFunc(result, func(a, b model.GPUAssignment) int { return strings.Compare(a.DeviceID.String(), b.DeviceID.String()) })
+	return result
 }
 
 func effectiveTuning(profile farmmodel.MiningProfile, settings *farmmodel.HostProfileSettings) (*uint32, *bool, *bool) {
@@ -172,7 +232,7 @@ func (resolver Resolver) Snapshot(result Result, inputs Inputs, executionID iden
 		Miner: &model.MinerSpec{AdapterID: result.Content.AdapterID, SpecVersion: 1, PackageID: result.Content.Package.PackageID, PackageVersion: result.Content.Package.Version,
 			WalletID: &walletID, PoolID: &poolID, Mode: model.MinerModeMining, Coin: result.Content.Coin, Algorithm: result.Content.Algorithm,
 			Endpoint:   &model.MiningEndpoint{Address: result.Content.Endpoint.Address, TLS: result.Content.Endpoint.TLS, User: result.Content.Endpoint.User, Password: result.Content.Endpoint.Password, Worker: result.Content.Endpoint.Worker},
-			CPUThreads: cloneUint32(result.Content.CPUThreads), GPUDeviceIDs: append([]identity.DeviceID(nil), result.Content.Resources.DeviceIDs...), HugePages: cloneBool(result.Content.HugePages), MSR: cloneBool(result.Content.MSR)}}
+			CPUThreads: cloneUint32(result.Content.CPUThreads), GPUDeviceIDs: append([]identity.DeviceID(nil), result.Content.Resources.DeviceIDs...), GPUAssignments: append([]model.GPUAssignment(nil), result.Content.GPUAssignments...), HugePages: cloneBool(result.Content.HugePages), MSR: cloneBool(result.Content.MSR)}}
 	return farmmodel.ResolvedExecutionSnapshot{WorkloadID: inputs.Workload.WorkloadID, DesiredGeneration: generation, ExecutionID: executionID, HostID: inputs.Workload.HostID,
 		ProfileID: inputs.Profile.ProfileID, ProfileRevision: inputs.Profile.Meta.Revision, HostProfileSettingsRevision: settingsRevision(inputs.Settings), PoolID: inputs.Pool.PoolID, PoolRevision: inputs.Pool.Meta.Revision,
 		WalletID: inputs.Wallet.WalletID, WalletRevision: inputs.Wallet.Meta.Revision, Package: inputs.Profile.Package,

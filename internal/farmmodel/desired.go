@@ -54,19 +54,20 @@ type WorkloadRuntimeBinding struct {
 // deliberately excludes display names, source revisions and object IDs that do
 // not affect execution. Source provenance is retained separately in snapshots.
 type ResolvedRuntimeContent struct {
-	RunState   DesiredRunState
-	HostID     identity.HostID
-	ProfileID  identity.ProfileID
-	Resources  ResourceClaim
-	AdapterID  string
-	Package    PackageRef
-	Mode       ProfileMode
-	Coin       string
-	Algorithm  string
-	Endpoint   model.MiningEndpoint
-	CPUThreads *uint32
-	HugePages  *bool
-	MSR        *bool
+	RunState       DesiredRunState
+	HostID         identity.HostID
+	ProfileID      identity.ProfileID
+	Resources      ResourceClaim
+	GPUAssignments []model.GPUAssignment
+	AdapterID      string
+	Package        PackageRef
+	Mode           ProfileMode
+	Coin           string
+	Algorithm      string
+	Endpoint       model.MiningEndpoint
+	CPUThreads     *uint32
+	HugePages      *bool
+	MSR            *bool
 }
 
 type ResolvedExecutionSnapshot struct {

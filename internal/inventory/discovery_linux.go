@@ -3,12 +3,14 @@ package inventory
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -81,7 +83,114 @@ func (s Source) Discover(hostID identity.HostID) (model.Inventory, []string) {
 			warn("memory", err)
 		}
 	}
+	gpus, err := discoverGPUs(s.Files)
+	if err != nil {
+		warn("GPU", err)
+	} else {
+		result.GPUs = gpus
+	}
 	return result, warnings
+}
+
+func discoverGPUs(files fs.FS) ([]model.GPU, error) {
+	entries, err := fs.ReadDir(files, "sys/bus/pci/devices")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var result []model.GPU
+	seen := make(map[string]struct{})
+	for _, entry := range entries {
+		info, statErr := fs.Stat(files, "sys/bus/pci/devices/"+entry.Name())
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		pci := strings.ToLower(strings.TrimSpace(entry.Name()))
+		base := "sys/bus/pci/devices/" + entry.Name() + "/"
+		class, err := readTrimmed(files, base+"class")
+		if err != nil || !strings.HasPrefix(strings.ToLower(class), "0x03") {
+			continue
+		}
+		vendorID, _ := readTrimmed(files, base+"vendor")
+		modelID, _ := readTrimmed(files, base+"device")
+		uuid := ""
+		for _, name := range []string{"unique_id", "gpu_uuid"} {
+			if value, readErr := readTrimmed(files, base+name); readErr == nil && value != "" {
+				uuid = value
+				break
+			}
+		}
+		if uuid == "" {
+			if info, readErr := fs.ReadFile(files, "proc/driver/nvidia/gpus/"+entry.Name()+"/information"); readErr == nil {
+				uuid = parseNVIDIAUUID(string(info))
+			}
+		}
+		uuid = normalizeStableIdentity(uuid)
+		if !validStableIdentity(uuid) {
+			return nil, fmt.Errorf("GPU at %s has no stable UUID/unique identity", pci)
+		}
+		if _, duplicate := seen[uuid]; duplicate {
+			return nil, errors.New("GPU inventory contains duplicate stable identities")
+		}
+		seen[uuid] = struct{}{}
+		deviceID, err := deviceIDFromStableIdentity(uuid)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, model.GPU{DeviceID: deviceID, Vendor: gpuVendor(vendorID), Model: strings.ToLower(strings.TrimSpace(modelID)), PCIBusID: pci, UUID: uuid})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].DeviceID.String() < result[j].DeviceID.String() })
+	return result, nil
+}
+
+func readTrimmed(files fs.FS, name string) (string, error) {
+	value, err := fs.ReadFile(files, name)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(value)), nil
+}
+
+func parseNVIDIAUUID(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "GPU UUID") {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func normalizeStableIdentity(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(value), " "))
+}
+
+func validStableIdentity(value string) bool {
+	switch value {
+	case "", "unknown", "none", "n/a", "not available":
+		return false
+	}
+	return strings.Trim(value, "0-:._ ") != ""
+}
+
+func deviceIDFromStableIdentity(value string) (identity.DeviceID, error) {
+	sum := sha256.Sum256([]byte("gpu-identity-v1\x00" + value))
+	return identity.ParseDeviceID(fmt.Sprintf("device_%x", sum[:16]))
+}
+
+func gpuVendor(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0x10de":
+		return "nvidia"
+	case "0x1002":
+		return "amd"
+	case "0x8086":
+		return "intel"
+	default:
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
 }
 
 // os-release is data, never executed or expanded as shell input.

@@ -4,11 +4,14 @@ package minerruntime
 import (
 	"context"
 	"errors"
+	"maps"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/gpuresource"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/packages"
@@ -25,6 +28,7 @@ type Capabilities struct {
 	Benchmark             bool
 	Stress                bool
 	Algorithms            []string
+	GPUVendors            []string
 }
 
 type PrepareRequest struct {
@@ -91,22 +95,24 @@ type Observation struct {
 }
 
 type Config struct {
-	PollInterval time.Duration
-	StartupGrace time.Duration
-	StaleAfter   time.Duration
-	Now          func() time.Time
+	PollInterval     time.Duration
+	StartupGrace     time.Duration
+	StaleAfter       time.Duration
+	Now              func() time.Time
+	RefreshInventory func() model.Inventory
 }
 
 type Manager struct {
-	mu         sync.Mutex
-	pollWG     sync.WaitGroup
-	supervisor *supervisor.Supervisor
-	registry   *Registry
-	dataDir    string
-	packages   PackageResolver
-	inventory  model.Inventory
-	config     Config
-	executions map[identity.ExecutionID]*minerExecution
+	mu             sync.Mutex
+	bindingStartMu sync.Mutex
+	pollWG         sync.WaitGroup
+	supervisor     *supervisor.Supervisor
+	registry       *Registry
+	dataDir        string
+	packages       PackageResolver
+	inventory      model.Inventory
+	config         Config
+	executions     map[identity.ExecutionID]*minerExecution
 }
 
 type minerExecution struct {
@@ -115,6 +121,8 @@ type minerExecution struct {
 	warnings   []string
 	telemetry  *model.MinerTelemetry
 	pollCancel context.CancelFunc
+	starting   bool
+	invalid    bool
 }
 
 func New(supervisor *supervisor.Supervisor, registry *Registry, dataDir string, packageStore PackageResolver, inventory model.Inventory, config Config) *Manager {
@@ -130,7 +138,56 @@ func New(supervisor *supervisor.Supervisor, registry *Registry, dataDir string, 
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Manager{supervisor: supervisor, registry: registry, dataDir: dataDir, packages: packageStore, inventory: inventory, config: config, executions: make(map[identity.ExecutionID]*minerExecution)}
+	manager := &Manager{supervisor: supervisor, registry: registry, dataDir: dataDir, packages: packageStore, inventory: inventory, config: config, executions: make(map[identity.ExecutionID]*minerExecution)}
+	if supervisor != nil {
+		supervisor.SetStartValidator(manager.acquireFinalStartValidation)
+	}
+	return manager
+}
+
+// SetInventory publishes fresh physical facts and immediately invalidates only
+// exact Le0x-managed GPU executions whose immutable binding no longer matches.
+// It never selects a replacement device or targets an unmanaged process.
+func (m *Manager) SetInventory(inventory model.Inventory) {
+	m.bindingStartMu.Lock()
+	defer m.bindingStartMu.Unlock()
+	m.setInventoryAndInvalidateLocked(inventory)
+}
+
+func (m *Manager) setInventoryAndInvalidateLocked(inventory model.Inventory) {
+	type candidate struct {
+		executionID identity.ExecutionID
+		execution   *minerExecution
+		plan        model.ExecutionPlan
+	}
+	m.mu.Lock()
+	inventory = cloneInventory(inventory)
+	m.inventory = inventory
+	candidates := make([]candidate, 0)
+	for executionID, execution := range m.executions {
+		if execution.plan.Miner == nil || len(execution.plan.Ownership.DeviceIDs) == 0 {
+			continue
+		}
+		candidates = append(candidates, candidate{executionID: executionID, execution: execution, plan: execution.plan})
+	}
+	m.mu.Unlock()
+
+	invalid := make([]identity.ExecutionID, 0, len(candidates))
+	for _, candidate := range candidates {
+		if err := m.validatePlanAgainstInventory(candidate.plan, inventory); err != nil {
+			m.mu.Lock()
+			if m.executions[candidate.executionID] == candidate.execution {
+				candidate.execution.invalid = true
+				invalid = append(invalid, candidate.executionID)
+			}
+			m.mu.Unlock()
+		}
+	}
+	for _, executionID := range invalid {
+		// Stop uses the exact Controller-owned ExecutionID. If START has not yet
+		// reached Supervisor this is harmless; final validation will still fail.
+		_, _, _ = m.Stop(executionID)
+	}
 }
 
 func (m *Manager) Start(ctx context.Context, plan model.ExecutionPlan) (Observation, string, error) {
@@ -138,6 +195,8 @@ func (m *Manager) Start(ctx context.Context, plan model.ExecutionPlan) (Observat
 		snapshot, message, err := m.supervisor.Start(plan)
 		return Observation{Process: snapshot}, message, err
 	}
+	plan.Miner = cloneMinerSpec(plan.Miner)
+	inventory := m.inventoryForStart()
 	m.mu.Lock()
 	if existing := m.executions[plan.ExecutionID]; existing != nil {
 		if !plansEqual(existing.plan, plan) {
@@ -162,11 +221,16 @@ func (m *Manager) Start(ctx context.Context, plan model.ExecutionPlan) (Observat
 	if !ok {
 		return Observation{}, "", farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "unknown miner adapter"}
 	}
-	warnings, err := adapter.Validate(*plan.Miner, m.inventory)
+	if err := validateResourcePlan(plan, adapter.Capabilities(), inventory); err != nil {
+		return Observation{}, "", err
+	}
+	warnings, err := adapter.Validate(*plan.Miner, inventory)
 	if err != nil {
 		return Observation{}, "", err
 	}
-	prepared, err := adapter.Prepare(ctx, PrepareRequest{Plan: plan, AgentDataDir: m.dataDir, Packages: m.packages, Inventory: m.inventory})
+	preparePlan := plan
+	preparePlan.Miner = cloneMinerSpec(plan.Miner)
+	prepared, err := adapter.Prepare(ctx, PrepareRequest{Plan: preparePlan, AgentDataDir: m.dataDir, Packages: m.packages, Inventory: inventory})
 	if err != nil {
 		return Observation{}, "", err
 	}
@@ -183,25 +247,31 @@ func (m *Manager) Start(ctx context.Context, plan model.ExecutionPlan) (Observat
 	prepared.Plan.Ownership.DeviceIDs = append([]identity.DeviceID(nil), plan.Ownership.DeviceIDs...)
 	prepared.Plan.HostID = plan.HostID
 	prepared.Plan.DeviceIDs = append([]identity.DeviceID(nil), plan.DeviceIDs...)
+	prepared.Plan.Miner = cloneMinerSpec(plan.Miner)
+	entry := &minerExecution{plan: plan, prepared: prepared, warnings: warnings, telemetry: &model.MinerTelemetry{AdapterID: plan.Miner.AdapterID, Health: model.MinerHealthStarting}, starting: true}
+	m.mu.Lock()
+	m.executions[plan.ExecutionID] = entry
+	m.mu.Unlock()
 	snapshot, message, err := m.supervisor.Start(prepared.Plan)
 	if err != nil {
-		if prepared.Cleanup != nil {
-			_ = prepared.Cleanup()
+		m.mu.Lock()
+		if m.executions[plan.ExecutionID] == entry {
+			delete(m.executions, plan.ExecutionID)
 		}
+		m.mu.Unlock()
+		cleanupPrepared(entry)
 		return Observation{Process: snapshot}, "", err
 	}
-	pollCtx, cancel := context.WithCancel(context.Background())
-	entry := &minerExecution{plan: plan, prepared: prepared, warnings: warnings, telemetry: &model.MinerTelemetry{AdapterID: plan.Miner.AdapterID, Health: model.MinerHealthStarting}, pollCancel: cancel}
 	m.mu.Lock()
-	if old := m.executions[plan.ExecutionID]; old != nil {
-		if old.pollCancel != nil {
-			old.pollCancel()
-		}
-		if old.prepared.Cleanup != nil {
-			_ = old.prepared.Cleanup()
-		}
+	if entry.invalid {
+		entry.starting = false
+		m.mu.Unlock()
+		_, _, _ = m.Stop(plan.ExecutionID)
+		return Observation{Process: snapshot}, "", farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "GPU binding was invalidated during process start"}
 	}
-	m.executions[plan.ExecutionID] = entry
+	pollCtx, cancel := context.WithCancel(context.Background())
+	entry.pollCancel = cancel
+	entry.starting = false
 	observation := m.observationLocked(entry, snapshot)
 	m.mu.Unlock()
 	m.pollWG.Add(1)
@@ -210,6 +280,111 @@ func (m *Manager) Start(ctx context.Context, plan model.ExecutionPlan) (Observat
 		m.poll(pollCtx, plan.ExecutionID, entry)
 	}()
 	return observation, message, nil
+}
+
+func validateResourcePlan(plan model.ExecutionPlan, capabilities Capabilities, inventory model.Inventory) error {
+	if err := plan.Ownership.Validate(); err != nil || plan.HostID != inventory.Host.HostID || plan.HostID != plan.Ownership.HostID || !slices.Equal(plan.DeviceIDs, plan.Ownership.DeviceIDs) {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "miner plan ownership or Host inventory does not agree"}
+	}
+	claimCPU, devices := plan.Ownership.CPU, plan.Ownership.DeviceIDs
+	if claimCPU && len(devices) != 0 {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "combined CPU and GPU execution is not supported"}
+	}
+	if claimCPU && !capabilities.CPU {
+		return farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "miner adapter does not support CPU execution"}
+	}
+	if claimCPU {
+		if inventory.CPU.Threads == 0 {
+			return farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "fresh Agent inventory does not report logical CPU capacity"}
+		}
+		if plan.Miner.CPUThreads != nil && *plan.Miner.CPUThreads > inventory.CPU.Threads {
+			return farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "requested CPU threads exceed fresh Agent capacity"}
+		}
+	}
+	if len(devices) != 0 && !capabilities.GPU {
+		return farmerr.Error{Code: farmerr.INCOMPATIBLE_HARDWARE, HumanMessage: "miner adapter does not support GPU execution"}
+	}
+	if len(devices) > 1 && !capabilities.MultiGPUSingleProcess {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "miner adapter does not support one process claiming multiple GPUs"}
+	}
+	if !claimCPU && (plan.Miner.CPUThreads != nil || plan.Miner.HugePages != nil || plan.Miner.MSR != nil) {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "CPU tuning is invalid for a GPU-only execution"}
+	}
+	if !slices.Equal(plan.Miner.GPUDeviceIDs, devices) {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "miner GPU DeviceIDs do not match ownership"}
+	}
+	if len(devices) != 0 {
+		if err := gpuresource.ValidateCurrent(devices, plan.Miner.GPUAssignments, inventory, capabilities.GPUVendors); err != nil {
+			return err
+		}
+	} else if len(plan.Miner.GPUAssignments) != 0 {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "CPU execution contains GPU assignments"}
+	}
+	return nil
+}
+
+func (m *Manager) inventoryForStart() model.Inventory {
+	if m.config.RefreshInventory != nil {
+		inventory := m.config.RefreshInventory()
+		m.SetInventory(inventory)
+		return inventory
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneInventory(m.inventory)
+}
+
+// acquireFinalStartValidation serializes fresh binding validation with
+// inventory publication until the Supervisor has attempted cmd.Start. It is
+// called for every actual process creation after Adapter.Prepare.
+func (m *Manager) acquireFinalStartValidation(plan model.ExecutionPlan) (func(), error) {
+	m.bindingStartMu.Lock()
+	inventory := cloneInventory(m.inventory)
+	if m.config.RefreshInventory != nil {
+		inventory = m.config.RefreshInventory()
+		m.setInventoryAndInvalidateLocked(inventory)
+	}
+	err := m.validatePlanAgainstInventory(plan, inventory)
+	if err != nil {
+		m.bindingStartMu.Unlock()
+		return nil, err
+	}
+	return m.bindingStartMu.Unlock, nil
+}
+
+func (m *Manager) validatePlanAgainstInventory(plan model.ExecutionPlan, inventory model.Inventory) error {
+	if plan.Miner == nil {
+		return nil
+	}
+	adapter, ok := m.registry.Get(plan.Miner.AdapterID)
+	if !ok {
+		return farmerr.Error{Code: farmerr.CONFIG_CONFLICT, HumanMessage: "unknown miner adapter during process start"}
+	}
+	if err := validateResourcePlan(plan, adapter.Capabilities(), inventory); err != nil {
+		return err
+	}
+	_, err := adapter.Validate(*plan.Miner, inventory)
+	return err
+}
+
+func cloneInventory(value model.Inventory) model.Inventory {
+	value.GPUs = append([]model.GPU(nil), value.GPUs...)
+	return value
+}
+
+func cloneMinerSpec(value *model.MinerSpec) *model.MinerSpec {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	result.GPUDeviceIDs = append([]identity.DeviceID(nil), value.GPUDeviceIDs...)
+	result.GPUAssignments = append([]model.GPUAssignment(nil), value.GPUAssignments...)
+	result.Options = maps.Clone(value.Options)
+	if value.Endpoint != nil {
+		endpoint := *value.Endpoint
+		result.Endpoint = &endpoint
+	}
+	return &result
 }
 
 func (m *Manager) Stop(id identity.ExecutionID) (Observation, string, error) {
@@ -221,9 +396,8 @@ func (m *Manager) Stop(id identity.ExecutionID) (Observation, string, error) {
 			entry.pollCancel()
 			entry.pollCancel = nil
 		}
-		if entry.prepared.Cleanup != nil {
-			_ = entry.prepared.Cleanup()
-			entry.prepared.Cleanup = nil
+		if !entry.starting {
+			cleanupPrepared(entry)
 		}
 	}
 	observation := m.observationLocked(entry, snapshot)
@@ -232,12 +406,22 @@ func (m *Manager) Stop(id identity.ExecutionID) (Observation, string, error) {
 }
 
 func (m *Manager) Restart(id identity.ExecutionID) (Observation, string, error) {
-	snapshot, message, err := m.supervisor.Restart(id)
 	m.mu.Lock()
 	entry := m.executions[id]
+	m.mu.Unlock()
+	snapshot, message, err := m.supervisor.Restart(id)
+	m.mu.Lock()
+	entry = m.executions[id]
 	observation := m.observationLocked(entry, snapshot)
 	m.mu.Unlock()
 	return observation, message, err
+}
+
+func cleanupPrepared(entry *minerExecution) {
+	if entry != nil && entry.prepared.Cleanup != nil {
+		_ = entry.prepared.Cleanup()
+		entry.prepared.Cleanup = nil
+	}
 }
 
 func (m *Manager) List() []Observation {

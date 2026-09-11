@@ -316,7 +316,7 @@ func TestCommandMappingPreservesNonce(t *testing.T) {
 	if !bytes.Equal(ping.GetPing().GetNonce(), nonce) {
 		t.Fatal("nonce changed")
 	}
-	if uint32(protocol.CurrentProtocolVersion) != 3 {
+	if uint32(protocol.CurrentProtocolVersion) != 4 {
 		t.Fatal("unexpected protocol test baseline")
 	}
 }

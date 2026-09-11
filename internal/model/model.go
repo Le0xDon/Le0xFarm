@@ -45,12 +45,23 @@ type CPU struct {
 }
 
 type GPU struct {
-	// DeviceID must be persisted by a future inventory implementation across scans.
+	// DeviceID is derived from a stable hardware identity, never an ordinal.
 	DeviceID identity.DeviceID
 	Vendor   string
 	Model    string
 	PCIBusID string
-	UUID     string // Optional vendor-provided GPU UUID.
+	UUID     string // Optional observation; M6 runtime selection requires it.
+}
+
+// GPUAssignment is the immutable Controller-resolved binding between a stable
+// DeviceID and the hardware identity/runtime selector observed for one START.
+// RuntimeSelector is currently a canonical PCI bus address; an Adapter that
+// requires another selector must translate from this binding against the same
+// current inventory and fail closed when it cannot do so unambiguously.
+type GPUAssignment struct {
+	DeviceID         identity.DeviceID
+	HardwareIdentity string
+	RuntimeSelector  string
 }
 
 type Memory struct{ TotalBytes uint64 }
@@ -263,6 +274,7 @@ type MinerSpec struct {
 	Endpoint       *MiningEndpoint
 	CPUThreads     *uint32
 	GPUDeviceIDs   []identity.DeviceID
+	GPUAssignments []GPUAssignment
 	HugePages      *bool
 	MSR            *bool
 	Options        map[string]string

@@ -30,6 +30,7 @@ type WorkloadStore interface {
 	GetWorkloadRuntimeBinding(context.Context, identity.WorkloadID) (farmmodel.WorkloadRuntimeBinding, bool, error)
 	RetryWorkload(context.Context, identity.WorkloadID, uint64) (farmmodel.DesiredWorkload, error)
 	ValidateResolvedSnapshotForStart(context.Context, farmmodel.ResolvedExecutionSnapshot, model.Inventory) error
+	RefreshResolvedSnapshotForInventory(context.Context, identity.WorkloadID, model.Inventory) error
 }
 
 type Commander interface {
@@ -161,6 +162,22 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 		if workload.HostID != hostID {
 			continue
 		}
+		if workload.RunState == farmmodel.DesiredRunning && len(workload.Resources.DeviceIDs) != 0 {
+			if !observed.InventoryFresh {
+				continue
+			}
+			if err := coordinator.store.RefreshResolvedSnapshotForInventory(ctx, workload.WorkloadID, observed.Inventory); err != nil {
+				code, _ := farmerr.CodeOf(err)
+				coordinator.output.Printf("RECONCILE: WorkloadID %s GPU resolution blocked code=%s", workload.WorkloadID, code)
+			} else {
+				// Hardware binding may have advanced the generation. Reload the
+				// authoritative workload before planning.
+				workload, err = coordinator.store.GetDesiredWorkload(ctx, workload.WorkloadID)
+				if err != nil {
+					continue
+				}
+			}
+		}
 		snapshots, err := coordinator.store.ListResolvedSnapshots(ctx, workload.WorkloadID)
 		if err != nil {
 			coordinator.output.Printf("RECONCILE: cannot load snapshots for WorkloadID %s", workload.WorkloadID)
@@ -170,10 +187,13 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 		if workload.RunState == farmmodel.DesiredRunning {
 			value, err := coordinator.store.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID)
 			if err != nil {
-				coordinator.output.Printf("RECONCILE: current snapshot unavailable for WorkloadID %s", workload.WorkloadID)
-				continue
+				if code, _ := farmerr.CodeOf(err); code != farmerr.NOT_FOUND {
+					coordinator.output.Printf("RECONCILE: current snapshot unavailable for WorkloadID %s", workload.WorkloadID)
+					continue
+				}
+			} else {
+				current = &value
 			}
-			current = &value
 		}
 		binding, blocked, err := coordinator.store.GetWorkloadRuntimeBinding(ctx, workload.WorkloadID)
 		if err != nil {

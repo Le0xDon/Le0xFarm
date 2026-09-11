@@ -13,6 +13,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/farmresolve"
+	"github.com/le0xdon/le0xfarm/internal/gpuresource"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 	"github.com/le0xdon/le0xfarm/internal/protocol"
@@ -58,7 +59,7 @@ func (service *Service) CreateDesiredWorkload(ctx context.Context, content farmm
 		if err = insertWorkloadDevices(ctx, tx, object.WorkloadID, object.Resources.DeviceIDs); err != nil {
 			return err
 		}
-		if object.RunState == farmmodel.DesiredRunning {
+		if object.RunState == farmmodel.DesiredRunning && configurationSnapshotReady(result.Content) {
 			return service.createSnapshot(ctx, tx, inputs, result, object.DesiredGeneration, now)
 		}
 		return nil
@@ -171,7 +172,7 @@ func (service *Service) UpdateDesiredWorkload(ctx context.Context, id identity.W
 		if err = insertWorkloadDevices(ctx, tx, id, updated.Resources.DeviceIDs); err != nil {
 			return err
 		}
-		if resolved.Hash != current.EffectiveHash && updated.RunState == farmmodel.DesiredRunning {
+		if resolved.Hash != current.EffectiveHash && updated.RunState == farmmodel.DesiredRunning && configurationSnapshotReady(resolved.Content) {
 			if err = service.createSnapshot(ctx, tx, inputs, resolved, updated.DesiredGeneration, updated.Meta.UpdatedAt); err != nil {
 				return err
 			}
@@ -335,6 +336,12 @@ func (service *Service) RetryWorkload(ctx context.Context, id identity.WorkloadI
 		next.Plan.Ownership.DesiredGeneration = workload.DesiredGeneration
 		next.Plan.Ownership.DeviceIDs = append([]identity.DeviceID(nil), previous.Plan.Ownership.DeviceIDs...)
 		next.Plan.DeviceIDs = append([]identity.DeviceID(nil), previous.Plan.DeviceIDs...)
+		if next.Plan.Miner != nil {
+			miner := *next.Plan.Miner
+			miner.GPUDeviceIDs = append([]identity.DeviceID(nil), previous.Plan.Miner.GPUDeviceIDs...)
+			miner.GPUAssignments = append([]model.GPUAssignment(nil), previous.Plan.Miner.GPUAssignments...)
+			next.Plan.Miner = &miner
+		}
 		if err := insertResolvedSnapshot(ctx, tx, next); err != nil {
 			return err
 		}
@@ -383,6 +390,18 @@ func (service *Service) ValidateResolvedSnapshotForStart(ctx context.Context, ca
 		if current.ExecutionID != candidate.ExecutionID || current.ResolvedHash != candidate.ResolvedHash {
 			return typed(farmerr.CONFIG_CONFLICT, "resolved snapshot identity is no longer current", nil)
 		}
+		if len(candidate.Resources.DeviceIDs) != 0 {
+			release, err := service.catalog.Lookup(ctx, candidate.Package)
+			if err != nil {
+				return typed(farmerr.INVALID_REFERENCE, "package release is unavailable", err)
+			}
+			if candidate.Plan.Miner == nil {
+				return typed(farmerr.CONFIG_CONFLICT, "GPU snapshot has no miner plan", nil)
+			}
+			if err := gpuresource.ValidateCurrent(candidate.Resources.DeviceIDs, candidate.Plan.Miner.GPUAssignments, inventory, release.Runtime.GPUVendors); err != nil {
+				return err
+			}
+		}
 		inputs, _, err := service.resolveWorkload(ctx, tx, workload)
 		if err != nil {
 			return err
@@ -395,6 +414,48 @@ func (service *Service) ValidateResolvedSnapshotForStart(ctx context.Context, ca
 			return typed(farmerr.CONFIG_CONFLICT, "freshly resolved runtime plan does not match immutable snapshot", nil)
 		}
 		return nil
+	})
+}
+
+// RefreshResolvedSnapshotForInventory binds GPU DeviceIDs to the fresh
+// current-epoch hardware identity and runtime selector before planning. It is
+// idempotent for equivalent inventory and never mutates an old snapshot.
+func (service *Service) RefreshResolvedSnapshotForInventory(ctx context.Context, id identity.WorkloadID, inventory model.Inventory) error {
+	if err := id.Validate(); err != nil {
+		return typed(farmerr.CONFIG_CONFLICT, "invalid WorkloadID", err)
+	}
+	return service.writeTx(ctx, func(tx *sql.Tx) error {
+		workload, err := service.loadWorkloadTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if workload.RunState != farmmodel.DesiredRunning || len(workload.Resources.DeviceIDs) == 0 {
+			return nil
+		}
+		inputs, _, err := service.resolveWorkload(ctx, tx, workload)
+		if err != nil {
+			return err
+		}
+		resolved, err := service.resolver.ResolveAndValidate(ctx, inputs, inventory)
+		if err != nil {
+			return err
+		}
+		current, err := service.getSnapshot(ctx, tx, id, workload.DesiredGeneration)
+		if err == nil {
+			if current.ResolvedHash == resolved.Hash {
+				return nil
+			}
+			workload.DesiredGeneration++
+		} else if code, _ := farmerr.CodeOf(err); code != farmerr.NOT_FOUND {
+			return err
+		}
+		workload.EffectiveHash = resolved.Hash
+		if _, err := tx.ExecContext(ctx, "UPDATE desired_workloads SET desired_generation=?,effective_hash=? WHERE workload_id=?", workload.DesiredGeneration, workload.EffectiveHash, id.String()); err != nil {
+			return err
+		}
+		inputs.Workload = workload
+		inputs.GPUAssignments = append([]model.GPUAssignment(nil), resolved.Content.GPUAssignments...)
+		return service.createSnapshot(ctx, tx, inputs, resolved, workload.DesiredGeneration, service.clock().UTC())
 	})
 }
 
@@ -484,6 +545,10 @@ func (service *Service) resolveWorkload(ctx context.Context, tx *sql.Tx, workloa
 		return farmresolve.Inputs{}, farmresolve.Result{}, err
 	}
 	inputs := farmresolve.Inputs{Workload: workload, Profile: profile, Settings: settingsPtr, Pool: pool, Wallet: wallet}
+	inputs.GPUAssignments, err = service.latestGPUAssignments(ctx, tx, workload)
+	if err != nil {
+		return farmresolve.Inputs{}, farmresolve.Result{}, err
+	}
 	resolved, err := service.resolver.Resolve(ctx, inputs)
 	return inputs, resolved, err
 }
@@ -618,13 +683,42 @@ func (service *Service) propagateWorkloadIDs(ctx context.Context, tx *sql.Tx, wo
 		if _, err = tx.ExecContext(ctx, "UPDATE desired_workloads SET desired_generation=?,effective_hash=? WHERE workload_id=?", workload.DesiredGeneration, workload.EffectiveHash, id.String()); err != nil {
 			return err
 		}
-		if workload.RunState == farmmodel.DesiredRunning {
+		if workload.RunState == farmmodel.DesiredRunning && configurationSnapshotReady(resolved.Content) {
 			if err = service.createSnapshot(ctx, tx, inputs, resolved, workload.DesiredGeneration, service.clock().UTC()); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func configurationSnapshotReady(content farmmodel.ResolvedRuntimeContent) bool {
+	// GPU bindings are facts from fresh current-epoch inventory. Configuration
+	// mutations persist intent and generation but leave snapshot creation to
+	// RefreshResolvedSnapshotForInventory under the Host reconcile lock.
+	return len(content.Resources.DeviceIDs) == 0
+}
+
+func (service *Service) latestGPUAssignments(ctx context.Context, tx *sql.Tx, workload farmmodel.DesiredWorkload) ([]model.GPUAssignment, error) {
+	if len(workload.Resources.DeviceIDs) == 0 {
+		return nil, nil
+	}
+	var generation uint64
+	err := tx.QueryRowContext(ctx, "SELECT desired_generation FROM resolved_execution_snapshots WHERE workload_id=? ORDER BY desired_generation DESC LIMIT 1", workload.WorkloadID.String()).Scan(&generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	snapshot, err := service.getSnapshot(ctx, tx, workload.WorkloadID, generation)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.Equal(snapshot.Resources.DeviceIDs, farmmodel.NormalizeResourceClaim(workload.Resources).DeviceIDs) || snapshot.Plan.Miner == nil {
+		return nil, nil
+	}
+	return append([]model.GPUAssignment(nil), snapshot.Plan.Miner.GPUAssignments...), nil
 }
 
 func (service *Service) checkResourceConflict(ctx context.Context, tx *sql.Tx, candidate farmmodel.DesiredWorkload, exclude identity.WorkloadID) error {
@@ -835,18 +929,23 @@ func validateSnapshot(s farmmodel.ResolvedExecutionSnapshot) error {
 	if err := farmmodel.ValidateResourceClaim(s.Resources); err != nil {
 		return corrupt("snapshot resource claim is invalid", err)
 	}
+	if s.Plan.Miner != nil && len(s.Plan.Miner.GPUAssignments) != 0 {
+		if err := gpuresource.ValidateBindings(s.Resources.DeviceIDs, s.Plan.Miner.GPUAssignments); err != nil {
+			return corrupt("snapshot GPU assignments are invalid", err)
+		}
+	}
 	ownership := s.Plan.Ownership
 	if ownership.Validate() != nil || ownership.WorkloadID != s.WorkloadID || ownership.DesiredGeneration != s.DesiredGeneration || ownership.ResolvedHash != s.ResolvedHash || ownership.HostID != s.HostID || ownership.CPU != s.Resources.CPU || !slices.Equal(ownership.DeviceIDs, s.Resources.DeviceIDs) ||
 		s.Plan.SchemaVersion != protocol.CurrentSchemaVersion || s.Plan.ExecutionID != s.ExecutionID || s.Plan.HostID != s.HostID || s.Plan.ProfileID != s.ProfileID ||
 		s.Plan.Executable != "" || len(s.Plan.Args) != 0 || len(s.Plan.Environment) != 0 || s.Plan.WorkingDirectory != "" || s.Plan.RestartPolicy != model.RestartOnFailure ||
 		s.Plan.Miner == nil || s.Plan.Miner.SpecVersion != 1 || s.Plan.Miner.Mode != model.MinerModeMining || s.Plan.Miner.Endpoint == nil || len(s.Plan.Miner.Options) != 0 ||
 		s.Plan.Miner.PackageID != s.Package.PackageID || s.Plan.Miner.PackageVersion != s.Package.Version || s.Plan.Miner.PoolID == nil || *s.Plan.Miner.PoolID != s.PoolID || s.Plan.Miner.WalletID == nil || *s.Plan.Miner.WalletID != s.WalletID ||
-		!equalUint32(s.Plan.CPUThreads, s.Plan.Miner.CPUThreads) || !slices.Equal(s.Plan.DeviceIDs, s.Resources.DeviceIDs) {
+		!equalUint32(s.Plan.CPUThreads, s.Plan.Miner.CPUThreads) || !slices.Equal(s.Plan.DeviceIDs, s.Resources.DeviceIDs) || !slices.Equal(s.Plan.Miner.GPUDeviceIDs, s.Resources.DeviceIDs) {
 		return corrupt("snapshot ExecutionPlan identity does not match provenance", nil)
 	}
 	content := farmmodel.ResolvedRuntimeContent{RunState: farmmodel.DesiredRunning, HostID: s.HostID, ProfileID: s.ProfileID, Resources: s.Resources, AdapterID: s.Plan.Miner.AdapterID,
 		Package: s.Package, Mode: farmmodel.ProfileMode(s.Plan.Miner.Mode), Coin: s.Plan.Miner.Coin, Algorithm: s.Plan.Miner.Algorithm,
-		Endpoint: *s.Plan.Miner.Endpoint, CPUThreads: s.Plan.Miner.CPUThreads, HugePages: s.Plan.Miner.HugePages, MSR: s.Plan.Miner.MSR}
+		Endpoint: *s.Plan.Miner.Endpoint, CPUThreads: s.Plan.Miner.CPUThreads, GPUAssignments: append([]model.GPUAssignment(nil), s.Plan.Miner.GPUAssignments...), HugePages: s.Plan.Miner.HugePages, MSR: s.Plan.Miner.MSR}
 	hash, err := farmmodel.ResolvedRuntimeHash(content)
 	if err != nil || hash != s.ResolvedHash {
 		return corrupt("snapshot resolved hash does not match immutable plan", err)

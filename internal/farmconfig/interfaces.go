@@ -6,6 +6,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/model"
 )
 
 // Pools, WalletRefs and MiningProfiles are transport-independent application
@@ -55,6 +56,7 @@ type DesiredWorkloads interface {
 	BlockDesiredGeneration(context.Context, identity.WorkloadID, uint64, farmerr.Code, string) error
 	GetWorkloadRuntimeBinding(context.Context, identity.WorkloadID) (farmmodel.WorkloadRuntimeBinding, bool, error)
 	RetryWorkload(context.Context, identity.WorkloadID, uint64) (farmmodel.DesiredWorkload, error)
+	RefreshResolvedSnapshotForInventory(context.Context, identity.WorkloadID, model.Inventory) error
 }
 
 var _ interface {

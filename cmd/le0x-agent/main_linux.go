@@ -96,7 +96,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, *asJSON, err)
 	}
-	facts, warnings := inventory.Local().Discover(id.HostID)
+	inventorySource := inventory.Local()
+	facts, warnings := inventorySource.Discover(id.HostID)
 	if *controller != "" {
 		if *asJSON {
 			return fail(stderr, true, fmt.Errorf("--json cannot be combined with --controller"))
@@ -109,13 +110,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return fail(stderr, false, err)
 		}
 		packageStore := packages.New(dir)
-		minerRuntime := minerruntime.New(runtimeSupervisor, registry, dir, packageStore, facts, minerruntime.Config{})
+		minerRuntime := minerruntime.New(runtimeSupervisor, registry, dir, packageStore, facts, minerruntime.Config{RefreshInventory: func() model.Inventory {
+			refreshed, _ := inventorySource.Discover(id.HostID)
+			return refreshed
+		}})
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 			defer cancel()
 			_ = minerRuntime.Shutdown(shutdownCtx)
 		}()
-		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, AllowRawExecution: *allowRawExecution, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventory.Local(), Supervisor: runtimeSupervisor, MinerRuntime: minerRuntime, Output: log.New(stdout, "", 0)})
+		err := agentnet.Run(ctx, agentnet.Config{Target: *controller, InsecureDev: *insecureDev, AllowRawExecution: *allowRawExecution, EnrollmentToken: token, TLSFingerprint: *tlsFingerprint, TrustDir: dir, AgentID: id.AgentID, HostID: id.HostID, Hostname: facts.Host.Hostname, Inventory: inventorySource, Supervisor: runtimeSupervisor, MinerRuntime: minerRuntime, Output: log.New(stdout, "", 0)})
 		if err != nil {
 			return fail(stderr, false, err)
 		}
@@ -162,12 +166,17 @@ func present(out io.Writer, result report, asJSON bool) error {
 	if osName == "" {
 		osName = "unknown"
 	}
-	_, err := fmt.Fprintf(out, "Le0xAgent\nAgentID: %s\nHostID: %s\nHostname: %s\nOS: %s\nKernel: %s\nArch: %s\nCPU: %s (%s)\nSockets: %d\nCores: %d\nThreads: %d\nMemory: %d bytes (%.2f GiB)\nGPUs: discovery not implemented\n",
+	_, err := fmt.Fprintf(out, "Le0xAgent\nAgentID: %s\nHostID: %s\nHostname: %s\nOS: %s\nKernel: %s\nArch: %s\nCPU: %s (%s)\nSockets: %d\nCores: %d\nThreads: %d\nMemory: %d bytes (%.2f GiB)\nGPUs: %d\n",
 		result.AgentID, result.HostID, facts.Host.Hostname, osName, facts.Host.OS.Kernel, facts.Host.Architecture,
 		facts.CPU.Model, facts.CPU.Vendor, facts.CPU.Sockets, facts.CPU.Cores, facts.CPU.Threads,
-		facts.Memory.TotalBytes, float64(facts.Memory.TotalBytes)/(1<<30))
+		facts.Memory.TotalBytes, float64(facts.Memory.TotalBytes)/(1<<30), len(facts.GPUs))
 	if err != nil {
 		return err
+	}
+	for _, gpu := range facts.GPUs {
+		if _, err := fmt.Fprintf(out, "GPU: %s %s DeviceID=%s PCI=%s\n", gpu.Vendor, gpu.Model, gpu.DeviceID, gpu.PCIBusID); err != nil {
+			return err
+		}
 	}
 	for _, warning := range result.Warnings {
 		if _, err := fmt.Fprintln(out, "Warning:", warning); err != nil {

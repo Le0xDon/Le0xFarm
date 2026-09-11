@@ -61,3 +61,26 @@ func TestInventoryRequiresUniqueHostDevices(t *testing.T) {
 		t.Fatal("duplicate inventory DeviceID accepted")
 	}
 }
+
+func TestExecutionPlanCarriesExactGPUAssignmentAndRejectsMalformedBinding(t *testing.T) {
+	host, _ := identity.ParseHostID("host_0123456789abcdef0123456789abcdef")
+	workload, _ := identity.ParseWorkloadID("workload_0123456789abcdef0123456789abcdef")
+	execution, _ := identity.ParseExecutionID("execution_0123456789abcdef0123456789abcdef")
+	packageID, _ := identity.ParsePackageID("package_0123456789abcdef0123456789abcdef")
+	device, _ := identity.ParseDeviceID("device_0123456789abcdef0123456789abcdef")
+	assignment := model.GPUAssignment{DeviceID: device, HardwareIdentity: "gpu-stable", RuntimeSelector: "01:00.0"}
+	owner := model.WorkloadOwnership{WorkloadID: workload, DesiredGeneration: 1, ResolvedHash: "sha256:" + strings.Repeat("b", 64), HostID: host, DeviceIDs: []identity.DeviceID{device}}
+	plan := model.ExecutionPlan{ExecutionID: execution, Ownership: owner, HostID: host, DeviceIDs: []identity.DeviceID{device}, Miner: &model.MinerSpec{AdapterID: "gpu-test", SpecVersion: 1, PackageID: packageID, PackageVersion: "1", Mode: model.MinerModeMining, GPUDeviceIDs: []identity.DeviceID{device}, GPUAssignments: []model.GPUAssignment{assignment}}}
+	wire, err := ExecutionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := wire.GetMiner().GetGpuAssignments()
+	if len(got) != 1 || got[0].GetDeviceId() != device.String() || got[0].GetHardwareIdentity() != "gpu-stable" || got[0].GetRuntimeSelector() != "01:00.0" {
+		t.Fatalf("GPU binding lost: %+v", got)
+	}
+	plan.Miner.GPUAssignments[0].RuntimeSelector = "GPU0"
+	if _, err := ExecutionPlan(plan); err == nil {
+		t.Fatal("ordinal-only GPU selector accepted")
+	}
+}
