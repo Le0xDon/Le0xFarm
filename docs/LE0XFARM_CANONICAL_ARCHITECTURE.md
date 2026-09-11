@@ -2334,6 +2334,40 @@ Coin/miner-specific logic не размазывается по core.
 
 ---
 
+## 47A. Platform portability — FROZEN / ENGINEERING REQUIREMENT
+
+Le0xFarm сейчас **Ubuntu-first**. Для текущего TECHNICAL MVP только Ubuntu Linux требуется, реализуется, тестируется и принимается, пока отдельный milestone явно не расширит support matrix. Windows и другие Linux distributions не являются текущими MVP requirements, и отсутствие их backends не является дефектом.
+
+При этом будущая поддержка других operating systems должна оставаться возможной без переписывания platform-neutral Core architecture.
+
+Platform-neutral Core/domain code не зависит напрямую от:
+
+- `/proc`, `/sys`, systemd или Linux-specific filesystem paths;
+- Unix signals и Linux-specific process APIs;
+- `chmod`, POSIX ownership, UID/GID assumptions;
+- DRM/sysfs implementation details;
+- Linux PCI/runtime-selector mechanics.
+
+Platform-specific behavior находится за явными interfaces/platform implementations. Когда реализуемая functionality действительно зависит от OS, предпочтительны обычные Go boundaries: `*_linux.go` и будущие `*_windows.go`. Спекулятивные abstractions только ради гипотетических platforms не добавляются.
+
+Platform-neutral contracts включают как минимум:
+
+- HostID, DeviceID и ExecutionID;
+- Desired/Observed, ResourceClaim и resolved execution contracts;
+- useful-work/telemetry evidence и protocol/wire semantics;
+- resolver, planner и reconciliation policy;
+- Controller ownership и safety rules.
+
+OS-specific runtime implementations переводят эти contracts в platform mechanisms. Linux backend может использовать `/proc`/`/sys` discovery, Unix process lifecycle, systemd и Linux GPU/runtime-selector mapping. Будущий Windows backend может использовать Windows process/device/GPU APIs, Windows Services и Windows ACL/security mechanisms. Backend обязан сохранять одинаковый Core meaning и safety semantics, а не менять их в зависимости от OS.
+
+Controller остаётся platform-neutral везде, где это разумно; основная host-OS-specific implementation ожидается в Agent.
+
+Каждый будущий milestone проверяется на accidental platform leakage. Отсутствие Windows support само по себе не является finding. Architecture-significant finding существует, если новая functionality встраивает Linux semantics в platform-neutral Core/domain/protocol/reconciliation так, что другой OS потребует переписать Core вместо добавления backend.
+
+Ubuntu/Linux остаётся authoritative acceptance и dogfood platform текущего TECHNICAL MVP. Future portability не должна ослаблять Ubuntu safety или задерживать TECHNICAL MVP ради theoretical cross-platform support. Преждевременно реализовывать Windows support нельзя.
+
+---
+
 ## 48. Versioned evolution / testability — FROZEN
 
 Нужны:
