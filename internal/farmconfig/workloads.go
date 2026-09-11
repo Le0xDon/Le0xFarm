@@ -208,6 +208,9 @@ func (service *Service) DeleteDesiredWorkload(ctx context.Context, id identity.W
 		if current.RunState != farmmodel.DesiredStopped || snapshots != 0 {
 			return typed(farmerr.REFERENCE_IN_USE, "DesiredWorkload may still own a runtime execution; fresh retirement proof is required", nil)
 		}
+		if err := service.resolveDeletedWorkloadIncidentsTx(ctx, tx, id); err != nil {
+			return err
+		}
 		_, err = tx.ExecContext(ctx, "DELETE FROM desired_workloads WHERE workload_id=?", id.String())
 		return err
 	})
@@ -233,6 +236,9 @@ func (service *Service) FinalizeRetiredDesiredWorkloadDeletion(ctx context.Conte
 		}
 		if current.RunState != farmmodel.DesiredStopped {
 			return typed(farmerr.REFERENCE_IN_USE, "DesiredWorkload must be STOPPED before deletion", nil)
+		}
+		if err := service.resolveDeletedWorkloadIncidentsTx(ctx, tx, id); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, "DELETE FROM desired_workloads WHERE workload_id=?", id.String())
 		return err

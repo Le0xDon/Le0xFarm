@@ -366,6 +366,28 @@ func (id WorkloadID) MarshalText() ([]byte, error) {
 	return []byte(id.value), nil
 }
 
+// IncidentID identifies one deterministic logical incident across repeated
+// Controller evaluations. Unlike process identity it is never derived from a
+// PID or another transient host fact.
+type IncidentID struct{ value string }
+
+func ParseIncidentID(value string) (IncidentID, error) {
+	if err := validate(value, "incident"); err != nil {
+		return IncidentID{}, err
+	}
+	return IncidentID{value: value}, nil
+}
+
+func (id IncidentID) String() string  { return id.value }
+func (id IncidentID) Validate() error { return validate(id.value, "incident") }
+
+func (id IncidentID) MarshalText() ([]byte, error) {
+	if err := id.Validate(); err != nil {
+		return nil, err
+	}
+	return []byte(id.value), nil
+}
+
 // UnmarshalText replaces the ID only after successful validation.
 func (id *FarmID) UnmarshalText(text []byte) error {
 	parsed, err := ParseFarmID(string(text))
@@ -489,6 +511,16 @@ func (id *PackageID) UnmarshalText(text []byte) error {
 // UnmarshalText replaces the ID only after successful validation.
 func (id *WorkloadID) UnmarshalText(text []byte) error {
 	parsed, err := ParseWorkloadID(string(text))
+	if err != nil {
+		return err
+	}
+	*id = parsed
+	return nil
+}
+
+// UnmarshalText replaces the ID only after successful validation.
+func (id *IncidentID) UnmarshalText(text []byte) error {
+	parsed, err := ParseIncidentID(string(text))
 	if err != nil {
 		return err
 	}

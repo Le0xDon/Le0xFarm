@@ -306,22 +306,7 @@ func safeEvidenceText(value string, limit int) bool {
 }
 
 func validFarmErrorCode(code farmerr.Code) bool {
-	switch code {
-	case "", farmerr.MISSING_DEPENDENCY, farmerr.MISSING_COMMAND, farmerr.MISSING_WALLET, farmerr.MISSING_POOL,
-		farmerr.PACKAGE_NOT_INSTALLED, farmerr.PACKAGE_HASH_MISMATCH, farmerr.INCOMPATIBLE_HARDWARE, farmerr.INSUFFICIENT_DISK,
-		farmerr.SERVICE_NOT_READY, farmerr.RPC_UNREACHABLE, farmerr.TELEMETRY_UNAVAILABLE, farmerr.TELEMETRY_STALE,
-		farmerr.USEFUL_WORK_NOT_CONFIRMED, farmerr.POOL_UNREACHABLE, farmerr.STARTUP_TIMEOUT, farmerr.ZERO_HASHRATE,
-		farmerr.TOO_MANY_REJECTS, farmerr.PERMISSION_DENIED, farmerr.PORT_CONFLICT, farmerr.PROCESS_CRASHED,
-		farmerr.MAINTENANCE_HOLD, farmerr.UNMANAGED_PROCESS_CONFLICT, farmerr.UNMANAGED_OBSERVATION_FAILED,
-		farmerr.CONFIG_CONFLICT, farmerr.SIGNATURE_INVALID, farmerr.PROTOCOL_VERSION_MISMATCH, farmerr.SCHEMA_VERSION_MISMATCH,
-		farmerr.PAIRING_REQUIRED, farmerr.PAIRING_TOKEN_INVALID, farmerr.PAIRING_TOKEN_EXPIRED,
-		farmerr.CONTROLLER_IDENTITY_MISMATCH, farmerr.TLS_CREDENTIALS_REQUIRED, farmerr.TLS_FINGERPRINT_MISMATCH,
-		farmerr.TLS_IDENTITY_MISMATCH, farmerr.CERTIFICATE_EXPIRED, farmerr.NOT_FOUND, farmerr.ALREADY_EXISTS,
-		farmerr.REVISION_CONFLICT, farmerr.REFERENCE_IN_USE, farmerr.INVALID_REFERENCE, farmerr.INTERNAL_ERROR:
-		return true
-	default:
-		return false
-	}
+	return farmerr.ValidCode(code)
 }
 
 func ParseInventory(in *le0xv1.Inventory, expectedHost identity.HostID) (model.Inventory, error) {

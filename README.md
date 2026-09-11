@@ -8,7 +8,7 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Текущий этап — **M7 Unmanaged Miner Scan + Maintenance Hold**. Существующий M1 transport использует
+Текущий этап — **M9 Local Alerts, Incidents and Diagnostics**. Существующий M1 transport использует
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
 может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
@@ -45,6 +45,18 @@ PID+instance; конфликтующий unmanaged process блокирует ST
 останавливается Le0xFarm. Persistent per-Host Maintenance Hold exact-останавливает только managed
 executions, сохраняет Desired RUNNING и подавляет reconcile/watchdog START до explicit выхода и
 нового полного observation. Это software-состояние, а не electrical isolation.
+
+M9 сохраняет в Controller SQLite типизированные локальные incidents с детерминированным
+`IncidentID`: повторная оценка одного условия обновляет одну ACTIVE запись, а fresh
+authoritative recovery переводит её в RESOLVED. Offline или stale monitoring не считаются
+доказательством восстановления и не закрывают прежние incidents. Local Core API позволяет
+перечислить active и recent/resolved incidents без Brain или внешней доставки. В incidents
+хранятся только тип, severity, стабильный target scope, typed reason/source и timestamps —
+не raw logs, argv, environment, endpoints или произвольный remote text. Maintenance Hold
+остаётся видимым INFO-состоянием и подавляет ложные workload-stop incidents, но не скрывает
+независимые unmanaged/hardware/configuration conflicts или потерю мониторинга. UNKNOWN,
+UNAVAILABLE, STALE и explicit zero сохраняются как разные diagnostics. Notification delivery,
+acknowledgement/suppression policy и incident-driven auto-recovery не реализованы.
 
 Terminal `FAILED` и definite non-transient START rejection блокируют только текущую generation в
 минимальной persistent runtime binding. Явный `RetryWorkload` увеличивает revision и generation,
@@ -279,6 +291,7 @@ Controller поддерживает тот же флаг `--insecure-dev` для
 - `internal/controllernet/` — Controller gRPC stream handling and command correlation.
 - `internal/wiremap/` — преобразование domain inventory в protobuf wire model.
 - `internal/inventory/` — Linux discovery с подменяемыми источниками для тестов.
+- `internal/incidents/` — platform-neutral evaluation локальных typed incidents.
 - `internal/identity/` — типобезопасные идентификаторы.
 - `internal/model/` — доменные модели без исполняющей логики.
 - `internal/farmerr/` — коды и структура ошибок.
@@ -289,8 +302,9 @@ Controller поддерживает тот же флаг `--insecure-dev` для
 
 ## Решения M0
 
-ID имеет вид `<type>_<32 lowercase hex digits>`. Каждый из двенадцати типов имеет
-`New<Type>ID()`, `Parse<Type>ID(string)`, `String()` и `Validate()`.
+ID имеет вид `<type>_<32 lowercase hex digits>`. Persistent object IDs имеют
+`New<Type>ID()`, `Parse<Type>ID(string)`, `String()` и `Validate()`; IncidentID
+детерминированно выводится из typed incident scope и не генерируется случайно.
 Генерация использует 128 бит `crypto/rand` и не принимает hostname.
 Совпадение hostname не влияет на идентичность хостов; вероятность случайной коллизии
 пренебрежимо мала, но математическая гарантия уникальности без реестра не заявляется.
@@ -301,7 +315,7 @@ ID имеет вид `<type>_<32 lowercase hex digits>`. Каждый из дв�
 
 IDs — сравнимые структуры с закрытым значением. Доступны FarmID, ControllerID,
 HostID, AgentID, NodaID, DeviceID, ProfileID, ExecutionID, ServiceID, WalletID,
-PoolID и PackageID. Нулевое значение невалидно. Parse отклоняет другой префикс,
+PoolID, PackageID, WorkloadID и IncidentID. Нулевое значение невалидно. Parse отклоняет другой префикс,
 неверную длину и неканонический hex.
 
 MarshalText и UnmarshalText обеспечивают text и JSON round trip, включая ключи map.

@@ -65,6 +65,13 @@ type MaintenanceHolds interface {
 	SetMaintenanceHold(context.Context, identity.HostID, uint64, bool, string) (farmmodel.MaintenanceHold, error)
 }
 
+type Incidents interface {
+	IncidentAuthority(context.Context, identity.HostID) (string, error)
+	ReconcileIncidents(context.Context, identity.HostID, string, []farmmodel.IncidentCondition, map[farmmodel.IncidentType]bool) error
+	ListActiveIncidents(context.Context) ([]farmmodel.Incident, error)
+	ListIncidents(context.Context, farmmodel.IncidentQuery) ([]farmmodel.Incident, error)
+}
+
 var _ interface {
 	Pools
 	WalletRefs
@@ -72,4 +79,5 @@ var _ interface {
 	HostProfileSettings
 	DesiredWorkloads
 	MaintenanceHolds
+	Incidents
 } = (*Service)(nil)

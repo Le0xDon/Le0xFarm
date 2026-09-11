@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"reflect"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/incidents"
 	"github.com/le0xdon/le0xfarm/internal/model"
 )
 
@@ -48,28 +50,50 @@ type maintenanceAuthority interface {
 	AcquireMaintenanceAuthority(identity.HostID) func()
 }
 
+type incidentStore interface {
+	IncidentAuthority(context.Context, identity.HostID) (string, error)
+	ReconcileIncidents(context.Context, identity.HostID, string, []farmmodel.IncidentCondition, map[farmmodel.IncidentType]bool) error
+}
+
+type maintenanceLister interface {
+	ListMaintenanceHolds(context.Context) ([]farmmodel.MaintenanceHold, error)
+}
+
 type inFlightAction struct {
 	dispatchSequence uint64
 }
 
 type Coordinator struct {
-	store       WorkloadStore
-	observed    *controllerstate.Store
-	commander   Commander
-	output      *log.Logger
-	mu          sync.Mutex
-	inFlight    map[ActionKey]inFlightAction
-	hostLocksMu sync.Mutex
-	hostLocks   map[identity.HostID]*sync.Mutex
-	authorityMu sync.Mutex
-	authority   map[identity.HostID]*sync.RWMutex
+	store           WorkloadStore
+	observed        *controllerstate.Store
+	commander       Commander
+	output          *log.Logger
+	mu              sync.Mutex
+	inFlight        map[ActionKey]inFlightAction
+	hostLocksMu     sync.Mutex
+	hostLocks       map[identity.HostID]*sync.Mutex
+	authorityMu     sync.Mutex
+	authority       map[identity.HostID]*sync.RWMutex
+	incidentMu      sync.Mutex
+	incidentRunning map[identity.HostID]bool
+	incidentPending map[identity.HostID]bool
+	// Identical level-triggered evaluations are idempotent and must not turn a
+	// fast reconcile interval into continuous SQLite writes.
+	incidentEvaluations map[identity.HostID]incidentEvaluationCache
 }
+
+type incidentEvaluationCache struct {
+	signature   string
+	persistedAt time.Time
+}
+
+const incidentTouchInterval = 30 * time.Second
 
 func NewCoordinator(store WorkloadStore, observed *controllerstate.Store, commander Commander, output *log.Logger) *Coordinator {
 	if output == nil {
 		output = log.Default()
 	}
-	return &Coordinator{store: store, observed: observed, commander: commander, output: output, inFlight: make(map[ActionKey]inFlightAction), hostLocks: make(map[identity.HostID]*sync.Mutex), authority: make(map[identity.HostID]*sync.RWMutex)}
+	return &Coordinator{store: store, observed: observed, commander: commander, output: output, inFlight: make(map[ActionKey]inFlightAction), hostLocks: make(map[identity.HostID]*sync.Mutex), authority: make(map[identity.HostID]*sync.RWMutex), incidentRunning: make(map[identity.HostID]bool), incidentPending: make(map[identity.HostID]bool), incidentEvaluations: make(map[identity.HostID]incidentEvaluationCache)}
 }
 
 func (coordinator *Coordinator) Run(ctx context.Context, interval time.Duration) {
@@ -99,6 +123,18 @@ func (coordinator *Coordinator) ReconcileAll(ctx context.Context) {
 	for _, workload := range workloads {
 		hosts[workload.HostID] = struct{}{}
 	}
+	if store, ok := coordinator.store.(maintenanceLister); ok {
+		holds, listErr := store.ListMaintenanceHolds(ctx)
+		if listErr != nil {
+			coordinator.output.Printf("INCIDENT: cannot load Maintenance Hold hosts")
+		} else {
+			for _, hold := range holds {
+				if hold.Active {
+					hosts[hold.HostID] = struct{}{}
+				}
+			}
+		}
+	}
 	for hostID := range hosts {
 		hostID := hostID
 		go coordinator.ReconcileHost(ctx, hostID)
@@ -106,6 +142,7 @@ func (coordinator *Coordinator) ReconcileAll(ctx context.Context) {
 }
 
 func (coordinator *Coordinator) ReconcileHost(ctx context.Context, hostID identity.HostID) {
+	coordinator.queueIncidentEvaluation(hostID)
 	authority := coordinator.authorityLock(hostID)
 	authority.RLock()
 	defer authority.RUnlock()
@@ -135,6 +172,176 @@ func (coordinator *Coordinator) ReconcileHost(ctx context.Context, hostID identi
 	lock.Lock()
 	coordinator.setDispatchSequence(dispatch.action.Key, sequence)
 	lock.Unlock()
+}
+
+func (coordinator *Coordinator) queueIncidentEvaluation(hostID identity.HostID) {
+	if _, ok := coordinator.store.(incidentStore); !ok {
+		return
+	}
+	coordinator.incidentMu.Lock()
+	coordinator.incidentPending[hostID] = true
+	if coordinator.incidentRunning[hostID] {
+		coordinator.incidentMu.Unlock()
+		return
+	}
+	coordinator.incidentRunning[hostID] = true
+	coordinator.incidentMu.Unlock()
+	go func() {
+		for {
+			coordinator.incidentMu.Lock()
+			coordinator.incidentPending[hostID] = false
+			coordinator.incidentMu.Unlock()
+			coordinator.evaluateIncidents(context.Background(), hostID)
+			coordinator.incidentMu.Lock()
+			if !coordinator.incidentPending[hostID] {
+				delete(coordinator.incidentRunning, hostID)
+				coordinator.incidentMu.Unlock()
+				return
+			}
+			coordinator.incidentMu.Unlock()
+		}
+	}()
+}
+
+func (coordinator *Coordinator) evaluateIncidents(ctx context.Context, hostID identity.HostID) {
+	store, ok := coordinator.store.(incidentStore)
+	if !ok {
+		return
+	}
+	authority, err := store.IncidentAuthority(ctx, hostID)
+	if err != nil {
+		coordinator.output.Printf("INCIDENT: cannot load persistent authority for HostID %s", hostID)
+		return
+	}
+	workloads, err := coordinator.store.ListDesiredWorkloads(ctx)
+	if err != nil {
+		coordinator.output.Printf("INCIDENT: cannot load Desired state for HostID %s", hostID)
+		return
+	}
+	allSnapshots, err := coordinator.store.ListAllResolvedSnapshots(ctx)
+	if err != nil {
+		coordinator.output.Printf("INCIDENT: cannot load resolved state for HostID %s", hostID)
+		return
+	}
+	facts := make([]incidents.WorkloadFacts, 0)
+	for _, workload := range workloads {
+		if workload.HostID != hostID {
+			continue
+		}
+		item := incidents.WorkloadFacts{Workload: workload}
+		if snapshot, snapshotErr := coordinator.store.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID); snapshotErr == nil {
+			item.Current = &snapshot
+		} else if code, _ := farmerr.CodeOf(snapshotErr); code != farmerr.NOT_FOUND {
+			coordinator.output.Printf("INCIDENT: cannot load current execution for WorkloadID %s", workload.WorkloadID)
+			return
+		}
+		if binding, blocked, bindingErr := coordinator.store.GetWorkloadRuntimeBinding(ctx, workload.WorkloadID); bindingErr != nil {
+			coordinator.output.Printf("INCIDENT: cannot load runtime binding for WorkloadID %s", workload.WorkloadID)
+			return
+		} else if blocked {
+			item.Binding = &binding
+		}
+		facts = append(facts, item)
+	}
+	hold, hasHold, err := coordinator.store.GetMaintenanceHold(ctx, hostID)
+	if err != nil {
+		coordinator.output.Printf("INCIDENT: cannot load Maintenance Hold for HostID %s", hostID)
+		return
+	}
+	var holdPtr *farmmodel.MaintenanceHold
+	if hasHold {
+		holdPtr = &hold
+	}
+	currentAuthority, err := store.IncidentAuthority(ctx, hostID)
+	if err != nil {
+		coordinator.output.Printf("INCIDENT: cannot revalidate persistent authority for HostID %s", hostID)
+		return
+	}
+	if currentAuthority != authority {
+		coordinator.queueIncidentEvaluation(hostID)
+		return
+	}
+	observed, hasObserved := coordinator.observed.Get(hostID)
+	evaluation := incidents.Evaluate(incidents.Input{HostID: hostID, Workloads: facts, AllSnapshots: allSnapshots, Hold: holdPtr, Observed: observed, HasObserved: hasObserved})
+	signature := incidentEvaluationSignature(evaluation)
+	now := time.Now()
+	coordinator.incidentMu.Lock()
+	cached := coordinator.incidentEvaluations[hostID]
+	if cached.signature == signature && now.Sub(cached.persistedAt) < incidentTouchInterval {
+		coordinator.incidentMu.Unlock()
+		return
+	}
+	coordinator.incidentMu.Unlock()
+	// Serialize only the final authority proof and durable transition with Host
+	// session/Hold changes. Slow evaluation queries never delay runtime dispatch.
+	lock := coordinator.hostLock(hostID)
+	lock.Lock()
+	defer lock.Unlock()
+	currentObserved, currentHasObserved := coordinator.observed.Get(hostID)
+	if observationAuthoritySignature(observed, hasObserved) != observationAuthoritySignature(currentObserved, currentHasObserved) {
+		coordinator.queueIncidentEvaluation(hostID)
+		return
+	}
+	currentHold, currentHasHold, err := coordinator.store.GetMaintenanceHold(ctx, hostID)
+	if err != nil || currentHasHold != hasHold || currentHasHold && (currentHold.Revision != hold.Revision || currentHold.Active != hold.Active) {
+		coordinator.queueIncidentEvaluation(hostID)
+		return
+	}
+	if err := store.ReconcileIncidents(ctx, hostID, authority, evaluation.Conditions, evaluation.ResolvableTypes); err != nil {
+		if code, _ := farmerr.CodeOf(err); code == farmerr.REVISION_CONFLICT {
+			coordinator.queueIncidentEvaluation(hostID)
+			return
+		}
+		coordinator.output.Printf("INCIDENT: cannot persist evaluation for HostID %s", hostID)
+		return
+	}
+	coordinator.incidentMu.Lock()
+	coordinator.incidentEvaluations[hostID] = incidentEvaluationCache{signature: signature, persistedAt: now}
+	coordinator.incidentMu.Unlock()
+}
+
+func incidentEvaluationSignature(evaluation incidents.Evaluation) string {
+	var builder strings.Builder
+	for _, condition := range evaluation.Conditions {
+		builder.WriteString(condition.IncidentID.String())
+		builder.WriteByte('|')
+		builder.WriteString(string(condition.Severity))
+		builder.WriteByte(';')
+	}
+	for _, kind := range []farmmodel.IncidentType{farmmodel.IncidentAgentOffline, farmmodel.IncidentMonitoringStale, farmmodel.IncidentDesiredRunningNotExecuting, farmmodel.IncidentRuntimeError, farmmodel.IncidentUsefulWorkDegraded, farmmodel.IncidentTelemetryUnknown, farmmodel.IncidentTelemetryUnavailable, farmmodel.IncidentIncompatibleHardware, farmmodel.IncidentUnmanagedProcessConflict, farmmodel.IncidentResourceConflict, farmmodel.IncidentMaintenanceHold, farmmodel.IncidentConfigurationBlocked} {
+		if evaluation.ResolvableTypes[kind] {
+			builder.WriteString(string(kind))
+			builder.WriteByte(';')
+		}
+	}
+	return builder.String()
+}
+
+func observationAuthoritySignature(observed controllerstate.HostObservation, exists bool) string {
+	if !exists {
+		return "absent"
+	}
+	var builder strings.Builder
+	builder.WriteString(observed.HostID.String())
+	builder.WriteString("|")
+	builder.WriteString(observed.AgentID.String())
+	builder.WriteString("|")
+	fmt.Fprintf(&builder, "%d|%t|%t|%t|%t|%t|%d", observed.ConnectionEpoch, observed.Connected, observed.Ready, observed.Fresh, observed.InventoryFresh, observed.ProcessesFresh, observed.Revision)
+	for _, execution := range observed.Executions {
+		builder.WriteString("|")
+		builder.WriteString(execution.ExecutionID.String())
+		builder.WriteString("|")
+		builder.WriteString(string(execution.Status))
+		if execution.UsefulWork != nil {
+			builder.WriteString("|")
+			builder.WriteString(string(execution.UsefulWork.Availability))
+			builder.WriteString("|")
+			builder.WriteString(string(execution.UsefulWork.UsefulWork))
+			builder.WriteString("|")
+			builder.WriteString(string(execution.UsefulWork.ReasonCode))
+		}
+	}
+	return builder.String()
 }
 
 type preparedDispatch struct {
@@ -319,15 +526,17 @@ func sameExecutionFacts(left, right []model.ExecutionObservation) bool {
 func (coordinator *Coordinator) SessionConnected(info controllernet.SessionInfo) {
 	lock := coordinator.hostLock(info.HostID)
 	lock.Lock()
-	defer lock.Unlock()
-	coordinator.observed.Connect(info.AgentID, info.HostID, info.ConnectionEpoch)
+	updated := coordinator.observed.Connect(info.AgentID, info.HostID, info.ConnectionEpoch)
+	lock.Unlock()
+	if updated {
+		go coordinator.ReconcileHost(context.Background(), info.HostID)
+	}
 }
 
 func (coordinator *Coordinator) SessionDisconnected(info controllernet.SessionInfo) {
 	lock := coordinator.hostLock(info.HostID)
 	lock.Lock()
-	defer lock.Unlock()
-	coordinator.observed.Disconnect(info.HostID, info.ConnectionEpoch)
+	updated := coordinator.observed.Disconnect(info.HostID, info.ConnectionEpoch)
 	coordinator.mu.Lock()
 	for key := range coordinator.inFlight {
 		if key.HostID == info.HostID && key.ConnectionEpoch == info.ConnectionEpoch {
@@ -335,6 +544,10 @@ func (coordinator *Coordinator) SessionDisconnected(info controllernet.SessionIn
 		}
 	}
 	coordinator.mu.Unlock()
+	lock.Unlock()
+	if updated {
+		go coordinator.ReconcileHost(context.Background(), info.HostID)
+	}
 }
 
 func (coordinator *Coordinator) ExecutionsObserved(info controllernet.SessionInfo, executions []model.ExecutionObservation, runtimeSequence uint64) {

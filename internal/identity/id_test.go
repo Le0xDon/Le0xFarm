@@ -136,3 +136,22 @@ func TestSameHostnameHasIndependentHostIDs(t *testing.T) {
 		t.Fatal("accepted another ID type")
 	}
 }
+
+func TestDeterministicIncidentIDTextRoundTrip(t *testing.T) {
+	value := "incident_0123456789abcdef0123456789abcdef"
+	id, err := identity.ParseIncidentID(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded identity.IncidentID
+	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded != id {
+		t.Fatalf("round trip=%s err=%v", decoded, err)
+	}
+	if err := json.Unmarshal([]byte(`"incident_BAD"`), &decoded); err == nil || decoded != id {
+		t.Fatal("invalid IncidentID mutated value")
+	}
+}
