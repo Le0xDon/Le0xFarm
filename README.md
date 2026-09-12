@@ -8,7 +8,7 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Текущий этап — **M9 Local Alerts, Incidents and Diagnostics**. Существующий M1 transport использует
+Текущий этап — **M10 Controller Backup / Safe Restore**. Существующий M1 transport использует
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
 может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
@@ -57,6 +57,33 @@ authoritative recovery переводит её в RESOLVED. Offline или stale
 независимые unmanaged/hardware/configuration conflicts или потерю мониторинга. UNKNOWN,
 UNAVAILABLE, STALE и explicit zero сохраняются как разные diagnostics. Notification delivery,
 acknowledgement/suppression policy и incident-driven auto-recovery не реализованы.
+
+M10 создаёт SQLite-consistent локальные Controller backups примерно раз в час, только когда
+persistent configuration/Desired/snapshots/bindings/Holds/incident lifecycle изменились.
+Автоматическая retention сохраняет объединение 24 новейших hourly points и 7 UTC-day-separated
+daily points; manual и pre-restore safety backups автоматически не удаляются. Неудачная pruning
+попытка сохраняется как durable retention debt и повторяется без создания duplicate unchanged
+backup. Versioned manifest содержит public ControllerID/FarmID и SHA-256 fingerprint Farm CA,
+schema/revision, размер и SHA-256, а verification сверяет manifest с embedded DB provenance,
+полным migration ledger и SQLite integrity. Обычный backup включает только
+`farm.db`: identity/PKI/trust files, private/recovery keys, Agent package cache и in-memory
+Observed/telemetry исключены.
+
+Локальные offline-команды Controller: `--backup-action create`, `list`, `verify --backup-id ...`
+и explicit `restore --backup-id ...`. Linux Controller/restore exclusivity обеспечивается
+kernel-held abstract Unix-socket leases для configured path и открытого data-directory object,
+поэтому rename/replacement `DataDir` или legacy `controller.lock` не создаёт вторую authority.
+Restore сначала проверяет backup и создаёт отдельный pre-restore safety point, затем связывает
+точно проверенный anonymous `O_TMPFILE` с `farm.db` через descriptor-bound `linkat`; durable
+recovery record покрывает промежуточные crash states. Устанавливаемая DB уже содержит durable
+per-Host restore barrier. Поэтому restored Desired RUNNING не вызывает
+START/STOP до нового полного current-epoch Agent bootstrap и сравнения с Actual. Exact matching
+managed execution не запускается повторно; несовпадающая/newer physical reality блокируется с
+`RESTORE_RECONCILIATION_REQUIRED`, а normal validation после barrier по-прежнему проверяет hardware,
+stable DeviceID, unmanaged conflicts и Maintenance Hold. Backup другого ControllerID/FarmID или
+другого/отсутствующего Farm CA trust fingerprint отклоняется как `RESTORE_IDENTITY_MISMATCH`:
+private identity keys не клонируются, и для новой Controller identity требуется manual
+stop/re-enroll/start recovery.
 
 Terminal `FAILED` и definite non-transient START rejection блокируют только текущую generation в
 минимальной persistent runtime binding. Явный `RetryWorkload` увеличивает revision и generation,

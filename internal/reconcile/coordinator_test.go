@@ -136,6 +136,133 @@ func TestMaintenanceHoldSuppressesInitialAndReconnectReconcile(t *testing.T) {
 	}
 }
 
+func TestRestoreBarrierRequiresFreshBootstrapBeforeNormalStart(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	store.restoreBarriers[host] = testRestoreBarrier(host)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	coordinator.SessionConnected(commander.info)
+	coordinator.ReconcileHost(context.Background(), host)
+	if len(commander.requestsCopy()) != 0 {
+		t.Fatal("restore dispatched before fresh bootstrap")
+	}
+	if _, exists := store.restoreBarrier(host); !exists {
+		t.Fatal("incomplete bootstrap cleared restore barrier")
+	}
+	readyStore(observed, commander.info, nil)
+	coordinator.ReconcileHost(context.Background(), host)
+	waitRequests(t, commander, 1)
+	if got := commander.requestsCopy()[0]; got.Kind != controllernet.RuntimeStart || got.ExecutionID != snapshot.ExecutionID {
+		t.Fatalf("safe post-comparison reconcile=%+v", got)
+	}
+}
+
+func TestRestoreBarrierExactCurrentExecutionAvoidsDuplicateStart(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	store.restoreBarriers[host] = testRestoreBarrier(host)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, []model.ExecutionObservation{observedExecution(snapshot, model.ExecutionRunning)})
+	coordinator.ReconcileHost(context.Background(), host)
+	if _, exists := store.restoreBarrier(host); exists {
+		t.Fatal("exact current execution did not clear restore barrier")
+	}
+	for range 10 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if got := commander.requestsCopy(); len(got) != 0 {
+		t.Fatalf("exact current execution was duplicate-started: %+v", got)
+	}
+}
+
+func TestRestoreBarrierNewerPhysicalRealityBlocksWithoutStopOrStart(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	restored := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	newer := testSnapshot(workloadID, host, 2, testExecution(2), farmmodel.ResourceClaim{CPU: true})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, restored.Resources), restored)
+	store.restoreBarriers[host] = testRestoreBarrier(host)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	readyStore(observed, commander.info, []model.ExecutionObservation{observedExecution(newer, model.ExecutionRunning)})
+	coordinator.ReconcileHost(context.Background(), host)
+	barrier, _ := store.restoreBarrier(host)
+	if barrier.Status != farmmodel.RestoreBarrierConflict || barrier.ReasonCode != farmerr.RESTORE_RECONCILIATION_REQUIRED {
+		t.Fatalf("newer physical reality barrier=%+v", barrier)
+	}
+	if got := commander.requestsCopy(); len(got) != 0 {
+		t.Fatalf("restore touched newer physical reality: %+v", got)
+	}
+}
+
+func TestRestoreBarrierPreservesHoldAndUnmanagedStartSafety(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*fakeStore, *controllerstate.Store, identity.HostID)
+	}{
+		{"maintenance-hold", func(store *fakeStore, _ *controllerstate.Store, host identity.HostID) {
+			store.holds[host] = farmmodel.MaintenanceHold{HostID: host, Active: true, Revision: 1}
+		}},
+		{"unmanaged-conflict", func(_ *fakeStore, observed *controllerstate.Store, host identity.HostID) {
+			observed.SetUnmanagedProcesses(host, 1, []model.UnmanagedProcessObservation{{PID: 40, Executable: "known-miner", ProcessInstance: "instance:1", CPURelevant: true, CPU: true, ResourceScope: model.ProcessResourcesExact}}, time.Now().UTC())
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			host := testHost(1)
+			workloadID := testWorkload(1)
+			snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+			store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+			store.restoreBarriers[host] = testRestoreBarrier(host)
+			observed := controllerstate.New()
+			commander := newFakeCommander(host, 1)
+			readyStore(observed, commander.info, nil)
+			test.configure(store, observed, host)
+			coordinator := NewCoordinator(store, observed, commander, nil)
+			for range 5 {
+				coordinator.ReconcileHost(context.Background(), host)
+			}
+			if _, exists := store.restoreBarrier(host); exists {
+				t.Fatal("safe comparison did not clear restore barrier")
+			}
+			if got := commander.requestsCopy(); len(got) != 0 {
+				t.Fatalf("restored safety condition allowed START: %+v", got)
+			}
+		})
+	}
+}
+
+func TestRestoreBarrierDoesNotMigrateMissingGPU(t *testing.T) {
+	host := testHost(1)
+	device, _ := identity.ParseDeviceID("device_0123456789abcdef0123456789abcdef")
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{DeviceIDs: []identity.DeviceID{device}})
+	store := newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot)
+	store.restoreBarriers[host] = testRestoreBarrier(host)
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	readyStoreWithInventory(observed, commander.info, nil, model.Inventory{Host: model.Host{HostID: host}})
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	for range 5 {
+		coordinator.ReconcileHost(context.Background(), host)
+	}
+	if got := commander.requestsCopy(); len(got) != 0 {
+		t.Fatalf("missing restored DeviceID was silently migrated or started: %+v", got)
+	}
+}
+
+func testRestoreBarrier(host identity.HostID) farmmodel.RestoreHostBarrier {
+	return farmmodel.RestoreHostBarrier{HostID: host, BackupID: "backup_0123456789abcdef0123456789abcdef", Revision: 1, Status: farmmodel.RestoreBarrierPending, ReasonCode: farmerr.RESTORE_RECONCILIATION_REQUIRED, UpdatedAt: time.Now().UTC()}
+}
+
 func TestRuntimeResultTransitionKeepsHostIneligibleUntilBlockPersists(t *testing.T) {
 	host := testHost(1)
 	workloadID := testWorkload(1)
@@ -878,19 +1005,20 @@ func (commander *fakeCommander) holdsCopy() []fakeHoldCommand {
 }
 
 type fakeStore struct {
-	mu             sync.Mutex
-	workloads      map[identity.WorkloadID]farmmodel.DesiredWorkload
-	snapshots      []farmmodel.ResolvedExecutionSnapshot
-	bindings       map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding
-	blockEntered   chan struct{}
-	blockRelease   chan struct{}
-	validationErr  error
-	validationFunc func(model.Inventory) error
-	holds          map[identity.HostID]farmmodel.MaintenanceHold
+	mu              sync.Mutex
+	workloads       map[identity.WorkloadID]farmmodel.DesiredWorkload
+	snapshots       []farmmodel.ResolvedExecutionSnapshot
+	bindings        map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding
+	blockEntered    chan struct{}
+	blockRelease    chan struct{}
+	validationErr   error
+	validationFunc  func(model.Inventory) error
+	holds           map[identity.HostID]farmmodel.MaintenanceHold
+	restoreBarriers map[identity.HostID]farmmodel.RestoreHostBarrier
 }
 
 func newFakeStore(workload farmmodel.DesiredWorkload, snapshots ...farmmodel.ResolvedExecutionSnapshot) *fakeStore {
-	return &fakeStore{workloads: map[identity.WorkloadID]farmmodel.DesiredWorkload{workload.WorkloadID: workload}, snapshots: append([]farmmodel.ResolvedExecutionSnapshot(nil), snapshots...), bindings: make(map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding), holds: make(map[identity.HostID]farmmodel.MaintenanceHold)}
+	return &fakeStore{workloads: map[identity.WorkloadID]farmmodel.DesiredWorkload{workload.WorkloadID: workload}, snapshots: append([]farmmodel.ResolvedExecutionSnapshot(nil), snapshots...), bindings: make(map[identity.WorkloadID]farmmodel.WorkloadRuntimeBinding), holds: make(map[identity.HostID]farmmodel.MaintenanceHold), restoreBarriers: make(map[identity.HostID]farmmodel.RestoreHostBarrier)}
 }
 func (store *fakeStore) replace(workload farmmodel.DesiredWorkload, snapshots ...farmmodel.ResolvedExecutionSnapshot) {
 	store.mu.Lock()
@@ -1011,6 +1139,52 @@ func (store *fakeStore) SetMaintenanceHold(_ context.Context, hostID identity.Ho
 	current.Active, current.Reason = active, reason
 	store.holds[hostID] = current
 	return current, nil
+}
+func (store *fakeStore) GetRestoreHostBarrier(_ context.Context, hostID identity.HostID) (farmmodel.RestoreHostBarrier, bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	barrier, ok := store.restoreBarriers[hostID]
+	return barrier, ok, nil
+}
+func (store *fakeStore) ListRestoreHostBarriers(context.Context) ([]farmmodel.RestoreHostBarrier, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	result := make([]farmmodel.RestoreHostBarrier, 0, len(store.restoreBarriers))
+	for _, barrier := range store.restoreBarriers {
+		result = append(result, barrier)
+	}
+	return result, nil
+}
+func (store *fakeStore) restoreBarrier(hostID identity.HostID) (farmmodel.RestoreHostBarrier, bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	barrier, ok := store.restoreBarriers[hostID]
+	return barrier, ok
+}
+func (store *fakeStore) MarkRestoreHostConflict(_ context.Context, hostID identity.HostID, backupID string, revision uint64) (farmmodel.RestoreHostBarrier, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	barrier, ok := store.restoreBarriers[hostID]
+	if !ok || barrier.BackupID != backupID || barrier.Revision != revision {
+		return farmmodel.RestoreHostBarrier{}, farmerr.Error{Code: farmerr.REVISION_CONFLICT}
+	}
+	if barrier.Status != farmmodel.RestoreBarrierConflict {
+		barrier.Status = farmmodel.RestoreBarrierConflict
+		barrier.ReasonCode = farmerr.RESTORE_RECONCILIATION_REQUIRED
+		barrier.Revision++
+		store.restoreBarriers[hostID] = barrier
+	}
+	return barrier, nil
+}
+func (store *fakeStore) ClearRestoreHostBarrier(_ context.Context, hostID identity.HostID, backupID string, revision uint64) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	barrier, ok := store.restoreBarriers[hostID]
+	if !ok || barrier.BackupID != backupID || barrier.Revision != revision {
+		return farmerr.Error{Code: farmerr.REVISION_CONFLICT}
+	}
+	delete(store.restoreBarriers, hostID)
+	return nil
 }
 func (store *fakeStore) isBlocked(id identity.WorkloadID, generation uint64) bool {
 	store.mu.Lock()

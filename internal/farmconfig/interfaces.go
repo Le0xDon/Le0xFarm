@@ -72,6 +72,14 @@ type Incidents interface {
 	ListIncidents(context.Context, farmmodel.IncidentQuery) ([]farmmodel.Incident, error)
 }
 
+type RestoreBarriers interface {
+	GetControllerRestoreState(context.Context) (farmmodel.ControllerRestoreState, error)
+	GetRestoreHostBarrier(context.Context, identity.HostID) (farmmodel.RestoreHostBarrier, bool, error)
+	ListRestoreHostBarriers(context.Context) ([]farmmodel.RestoreHostBarrier, error)
+	MarkRestoreHostConflict(context.Context, identity.HostID, string, uint64) (farmmodel.RestoreHostBarrier, error)
+	ClearRestoreHostBarrier(context.Context, identity.HostID, string, uint64) error
+}
+
 var _ interface {
 	Pools
 	WalletRefs
@@ -80,4 +88,5 @@ var _ interface {
 	DesiredWorkloads
 	MaintenanceHolds
 	Incidents
+	RestoreBarriers
 } = (*Service)(nil)

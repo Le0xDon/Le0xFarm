@@ -46,7 +46,7 @@ func TestOpenMigratesSecuresAndReopens(t *testing.T) {
 	if err := db.SQL().QueryRow("SELECT count(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 6 {
+	if count != SchemaVersion {
 		t.Fatalf("migration count %d", count)
 	}
 }
@@ -86,7 +86,7 @@ func TestOpenRejectsNewerMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = raw.Exec("INSERT INTO schema_migrations VALUES(7,'future','hash',0)")
+	_, err = raw.Exec("INSERT INTO schema_migrations VALUES(?,'future','hash',0)", SchemaVersion+1)
 	raw.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +131,7 @@ func TestExistingM4DatabaseMigratesForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	migrations, err := loadMigrations()
-	if err != nil || len(migrations) != 6 {
+	if err != nil || len(migrations) != SchemaVersion {
 		t.Fatalf("migrations=%d err=%v", len(migrations), err)
 	}
 	for _, migration := range migrations[:3] {
@@ -151,7 +151,7 @@ func TestExistingM4DatabaseMigratesForward(t *testing.T) {
 	}
 	defer db.Close()
 	var count int
-	if err := db.SQL().QueryRow("SELECT count(*) FROM schema_migrations").Scan(&count); err != nil || count != 6 {
+	if err := db.SQL().QueryRow("SELECT count(*) FROM schema_migrations").Scan(&count); err != nil || count != SchemaVersion {
 		t.Fatalf("migration count=%d err=%v", count, err)
 	}
 	if _, err := db.SQL().Exec("SELECT host_profile_settings_revision FROM resolved_execution_snapshots LIMIT 0"); err != nil {

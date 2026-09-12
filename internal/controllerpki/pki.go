@@ -154,6 +154,10 @@ func (p *PKI) TLSConfig(pairing bool) *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{p.ControllerTLS}, ClientCAs: pool, ClientAuth: auth}
 }
 func (p *PKI) CACertificateDER() []byte { return append([]byte(nil), p.CA.Raw...) }
+func (p *PKI) CAFingerprint() string {
+	sum := sha256.Sum256(p.CA.Raw)
+	return "SHA256:" + strings.ToUpper(hex.EncodeToString(sum[:]))
+}
 func (p *PKI) ServerFingerprint() string {
 	sum := sha256.Sum256(p.Controller.Raw)
 	return "SHA256:" + strings.ToUpper(hex.EncodeToString(sum[:]))

@@ -163,8 +163,9 @@
 
 ## Backup / recovery
 
-- Recovery backup runs at most once every 24 hours and only if useful state changed.
-- Keep last 3 successful recovery backups.
+- Automatic Controller backup runs approximately hourly when relevant persistent state changed.
+- Retain 24 hourly backups plus 7 day-separated daily backups.
+- Manual and pre-restore safety backup retention is separate and conservative until explicitly defined.
 - Recovery backup contains all non-reconstructable state.
 - Exclude blockchain data, downloadable artifacts/cache and temporary runtime data.
 - Controller can be restored from recovery backup.

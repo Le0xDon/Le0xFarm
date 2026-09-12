@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
+	"github.com/le0xdon/le0xfarm/internal/controllerpki"
+	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	le0xv1 "github.com/le0xdon/le0xfarm/proto/le0x/v1"
 )
@@ -65,6 +67,49 @@ func TestControllerOpensFarmDatabase(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("farm.db permissions %o", info.Mode().Perm())
+	}
+}
+
+func TestControllerLocalBackupCreateListAndVerify(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "controller")
+	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)
+	controllerIdentity, err := controlleridentity.Initialize(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controllerpki.Initialize(dir, controllerIdentity.ControllerID, controllerIdentity.FarmID); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--backup-action", "create"}, &out, &errOut); code != 0 {
+		t.Fatalf("create exit=%d stderr=%s", code, errOut.String())
+	}
+	var backupID string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.HasPrefix(line, "BackupID: ") {
+			backupID = strings.TrimPrefix(line, "BackupID: ")
+		}
+	}
+	if backupID == "" {
+		t.Fatalf("create output=%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"--backup-action", "list"}, &out, &errOut); code != 0 || !strings.Contains(out.String(), backupID) {
+		t.Fatalf("list exit=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"--backup-action", "verify", "--backup-id", backupID}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "Code: VERIFIED") {
+		t.Fatalf("verify exit=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if err := os.Rename(filepath.Join(dir, controllerpki.DirName), filepath.Join(dir, "pki-missing")); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"--backup-action", "restore", "--backup-id", backupID}, &out, &errOut); code != 1 || !strings.Contains(errOut.String(), string(farmerr.RESTORE_IDENTITY_MISMATCH)) {
+		t.Fatalf("restore without trust context exit=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
 	}
 }
 

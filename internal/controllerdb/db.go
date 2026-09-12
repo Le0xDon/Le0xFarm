@@ -23,6 +23,8 @@ import (
 
 const FileName = "farm.db"
 
+const SchemaVersion = 7
+
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
@@ -75,6 +77,43 @@ func Open(ctx context.Context, controllerDataDir string) (*DB, error) {
 func (db *DB) SQL() *sql.DB { return db.sql }
 func (db *DB) Path() string { return db.path }
 func (db *DB) Close() error { return db.sql.Close() }
+
+// ValidateSchema verifies the complete immutable migration ledger without
+// applying migrations. Backup verification uses it on a read-only database.
+func ValidateSchema(ctx context.Context, sqlDB *sql.DB) error {
+	migrations, err := loadMigrations()
+	if err != nil {
+		return typed(farmerr.INTERNAL_ERROR, "cannot load database migrations", err)
+	}
+	rows, err := sqlDB.QueryContext(ctx, "SELECT version,name,checksum FROM schema_migrations ORDER BY version")
+	if err != nil {
+		return typed(farmerr.CONFIG_CONFLICT, "backup database has no valid migration ledger", err)
+	}
+	defer rows.Close()
+	index := 0
+	for rows.Next() {
+		if index >= len(migrations) {
+			return typed(farmerr.CONFIG_CONFLICT, "backup database schema is newer than this Controller", nil)
+		}
+		var version int
+		var name, checksum string
+		if err := rows.Scan(&version, &name, &checksum); err != nil {
+			return typed(farmerr.CONFIG_CONFLICT, "backup migration ledger is malformed", err)
+		}
+		expected := migrations[index]
+		if version != expected.version || name != expected.name || checksum != expected.hash {
+			return typed(farmerr.CONFIG_CONFLICT, "backup migration ledger is incompatible", nil)
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		return typed(farmerr.CONFIG_CONFLICT, "backup migration ledger cannot be read", err)
+	}
+	if index != len(migrations) {
+		return typed(farmerr.CONFIG_CONFLICT, "backup database schema is older than this Controller", nil)
+	}
+	return nil
+}
 
 func (db *DB) migrate(ctx context.Context) error {
 	migrations, err := loadMigrations()

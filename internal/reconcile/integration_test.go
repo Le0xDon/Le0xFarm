@@ -14,7 +14,9 @@ import (
 
 	"github.com/le0xdon/le0xfarm/internal/agentnet"
 	"github.com/le0xdon/le0xfarm/internal/agenttrust"
+	"github.com/le0xdon/le0xfarm/internal/controllerbackup"
 	"github.com/le0xdon/le0xfarm/internal/controllerdb"
+	"github.com/le0xdon/le0xfarm/internal/controllerlock"
 	"github.com/le0xdon/le0xfarm/internal/controllernet"
 	"github.com/le0xdon/le0xfarm/internal/controllerstate"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
@@ -32,6 +34,340 @@ import (
 const integrationAdapterID = "integration-sleep"
 
 var integrationPackageID = mustIntegrationPackageID("package_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+func TestControllerBackupRestoreRequiresFreshActualBeforeReconcile(t *testing.T) {
+	ctx := context.Background()
+	controllerID, _ := identity.ParseControllerID("controller_0123456789abcdef0123456789abcdef")
+	farmID, _ := identity.ParseFarmID("farm_0123456789abcdef0123456789abcdef")
+	agentID := testAgent(1)
+	hostID := testHost(1)
+	trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := trust.Pair(agentID, hostID); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := t.TempDir()
+	if err := agenttrust.Save(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := packagecatalog.NewStatic([]farmmodel.PackageRelease{{Ref: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "1"}, AdapterIDs: []string{integrationAdapterID}, Runtime: farmmodel.RuntimeCapabilities{CPU: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(t.TempDir(), "controller")
+	db, err := controllerdb.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupLease, err := controllerlock.Acquire(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := farmconfig.New(db, catalog, farmconfig.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := service.CreatePool(ctx, farmmodel.PoolContent{Name: "pool", Address: "pool.example:1", Auth: farmmodel.PoolAuth{Kind: farmmodel.PoolAuthNone}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wallet, err := service.CreateWalletRef(ctx, farmmodel.WalletRefContent{Name: "wallet", Coin: "TEST", Address: "public-payout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := service.CreateMiningProfile(ctx, farmmodel.MiningProfileContent{Name: "profile", AdapterID: integrationAdapterID, Package: farmmodel.PackageRef{PackageID: integrationPackageID, Version: "1"}, Mode: farmmodel.ProfileModeMining, Coin: "TEST", PoolID: pool.PoolID, WalletID: wallet.WalletID, LoginPolicy: farmmodel.LoginPolicy{UserTemplate: "${wallet}", WorkerPlacement: farmmodel.WorkerNone}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workload, err := service.CreateDesiredWorkload(ctx, farmmodel.DesiredWorkloadContent{Name: "work", HostID: hostID, ProfileID: profile.ProfileID, RunState: farmmodel.DesiredRunning, Resources: farmmodel.ResourceClaim{CPU: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := service.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, ControllerID: controllerID, FarmID: farmID, TrustFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Lease: backupLease})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, err := manager.CreateManual(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := workload.DesiredWorkloadContent
+	stopped.RunState = farmmodel.DesiredStopped
+	if _, err := service.UpdateDesiredWorkload(ctx, workload.WorkloadID, workload.Meta.Revision, stopped); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupLease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := controllerlock.Acquire(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoreManager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, ControllerID: controllerID, FarmID: farmID, TrustFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Lease: lease})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreManager.Restore(ctx, backup.Manifest.BackupID, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconstruct the Controller after the offline restore and attach a real
+	// Agent through bufconn. Inventory blocks after Hello/execution publication,
+	// exposing the exact reconnect-before-complete-bootstrap safety window.
+	runtimeLease, err := controllerlock.Acquire(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err = controllerdb.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err = farmconfig.New(db, catalog, farmconfig.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := service.GetDesiredWorkload(ctx, workload.WorkloadID)
+	if err != nil || restored.RunState != farmmodel.DesiredRunning {
+		t.Fatalf("restored Desired=%+v err=%v", restored, err)
+	}
+	listener := bufconn.Listen(1024 * 1024)
+	server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, Maintenance: service, ShutdownGracePeriod: 20 * time.Millisecond, Output: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := &countingCommander{server: server}
+	observed := controllerstate.New()
+	coordinator := NewCoordinator(service, observed, commands, nil)
+	server.SetSessionHandler(coordinator)
+	controllerCtx, stopController := context.WithCancel(context.Background())
+	controllerDone := make(chan error, 1)
+	go func() { controllerDone <- server.Serve(controllerCtx, listener) }()
+
+	processes := supervisor.New(supervisor.Config{StopGrace: 100 * time.Millisecond})
+	registry := minerruntime.NewRegistry()
+	if err := registry.Register(sleepRuntimeAdapter{}); err != nil {
+		t.Fatal(err)
+	}
+	localInventory := inventory.Local()
+	blockInventory := &oneShotInventoryBarrier{base: localInventory.Files, entered: make(chan struct{}), release: make(chan struct{})}
+	localInventory.Files = blockInventory
+	facts, _ := inventory.Local().Discover(hostID)
+	minerRuntime := minerruntime.New(processes, registry, agentDir, nil, facts, minerruntime.Config{PollInterval: 10 * time.Millisecond})
+	defer minerRuntime.Shutdown(context.Background())
+	agentCtx, stopAgent := context.WithCancel(context.Background())
+	agentDone := make(chan error, 1)
+	go func() {
+		agentDone <- agentnet.Run(agentCtx, agentnet.Config{Target: "buf", InsecureDev: true, TrustDir: agentDir, AgentID: agentID, HostID: hostID, Inventory: localInventory, Supervisor: processes, MinerRuntime: minerRuntime, HeartbeatInterval: 20 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Dialer: func(context.Context, string) (net.Conn, error) { return listener.Dial() }, Output: log.New(io.Discard, "", 0)})
+	}()
+	select {
+	case <-blockInventory.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Agent did not reach the incomplete bootstrap barrier")
+	}
+	if session, ok := server.Session(hostID); !ok || session.Ready {
+		t.Fatalf("reconnect was not observable before bootstrap: %+v exists=%t", session, ok)
+	}
+	if commands.Count(controllernet.RuntimeStart) != 0 {
+		t.Fatal("restored Desired dispatched before fresh complete bootstrap")
+	}
+	if _, exists, err := service.GetRestoreHostBarrier(ctx, hostID); err != nil || !exists {
+		t.Fatalf("incomplete bootstrap cleared restore barrier exists=%t err=%v", exists, err)
+	}
+	close(blockInventory.release)
+	waitSessionReady(t, server, hostID)
+	waitExecutionState(t, processes, snapshot.ExecutionID, model.ExecutionRunning)
+	if commands.Count(controllernet.RuntimeStart) != 1 {
+		t.Fatalf("fresh compatible Actual START count=%d", commands.Count(controllernet.RuntimeStart))
+	}
+	if _, exists, err := service.GetRestoreHostBarrier(ctx, hostID); err != nil || exists {
+		t.Fatalf("fresh comparison did not clear restore barrier exists=%t err=%v", exists, err)
+	}
+	running := mustRuntimeSnapshot(t, processes, snapshot.ExecutionID)
+	if running.PID <= 0 || running.ProcessInstance == "" {
+		t.Fatalf("full restore path did not create a real managed process: %+v", running)
+	}
+
+	stopAgent()
+	select {
+	case <-agentDone:
+	case <-time.After(time.Second):
+		t.Fatal("restored Agent did not stop")
+	}
+	stopController()
+	if err := <-controllerDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeLease.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	type restoredControllerPhase struct {
+		lease       *controllerlock.Lease
+		db          *controllerdb.DB
+		service     *farmconfig.Service
+		server      *controllernet.Server
+		commands    *countingCommander
+		coordinator *Coordinator
+		listener    *bufconn.Listener
+		stop        context.CancelFunc
+		done        <-chan error
+	}
+	restoreAgain := func() {
+		lease, err := controllerlock.Acquire(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restoreManager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, ControllerID: controllerID, FarmID: farmID, TrustFingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Lease: lease})
+		if err != nil {
+			_ = lease.Close()
+			t.Fatal(err)
+		}
+		if _, err := restoreManager.Restore(ctx, backup.Manifest.BackupID, lease); err != nil {
+			_ = lease.Close()
+			t.Fatal(err)
+		}
+		if err := lease.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startRestoredController := func() restoredControllerPhase {
+		lease, err := controllerlock.Acquire(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db, err := controllerdb.Open(ctx, dataDir)
+		if err != nil {
+			_ = lease.Close()
+			t.Fatal(err)
+		}
+		service, err := farmconfig.New(db, catalog, farmconfig.Options{})
+		if err != nil {
+			_ = db.Close()
+			_ = lease.Close()
+			t.Fatal(err)
+		}
+		listener := bufconn.Listen(1024 * 1024)
+		server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, Maintenance: service, ShutdownGracePeriod: 20 * time.Millisecond, Output: log.New(io.Discard, "", 0)})
+		if err != nil {
+			_ = db.Close()
+			_ = lease.Close()
+			t.Fatal(err)
+		}
+		commands := &countingCommander{server: server}
+		coordinator := NewCoordinator(service, controllerstate.New(), commands, nil)
+		server.SetSessionHandler(coordinator)
+		phaseCtx, stop := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- server.Serve(phaseCtx, listener) }()
+		return restoredControllerPhase{lease: lease, db: db, service: service, server: server, commands: commands, coordinator: coordinator, listener: listener, stop: stop, done: done}
+	}
+	startAgent := func(listener *bufconn.Listener) (context.CancelFunc, <-chan error) {
+		agentCtx, stop := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- agentnet.Run(agentCtx, agentnet.Config{Target: "buf", InsecureDev: true, TrustDir: agentDir, AgentID: agentID, HostID: hostID, Inventory: inventory.Local(), Supervisor: processes, MinerRuntime: minerRuntime, HeartbeatInterval: 20 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Dialer: func(context.Context, string) (net.Conn, error) { return listener.Dial() }, Output: log.New(io.Discard, "", 0)})
+		}()
+		return stop, done
+	}
+	stopPhase := func(phase restoredControllerPhase, stopAgent context.CancelFunc, agentDone <-chan error) {
+		stopAgent()
+		select {
+		case <-agentDone:
+		case <-time.After(time.Second):
+			t.Fatal("Agent did not stop")
+		}
+		phase.stop()
+		if err := <-phase.done; err != nil {
+			t.Fatal(err)
+		}
+		if err := phase.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := phase.lease.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitBarrier := func(service *farmconfig.Service, want farmmodel.RestoreBarrierStatus, wantExists bool) {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			barrier, exists, err := service.GetRestoreHostBarrier(ctx, hostID)
+			if err == nil && exists == wantExists && (!exists || barrier.Status == want) {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("restore barrier did not reach exists=%t status=%s", wantExists, want)
+	}
+
+	// Restore the same backup while the exact managed execution survives.
+	// A real reconnect reports the full ownership tuple and must not duplicate it.
+	restoreAgain()
+	exactPhase := startRestoredController()
+	stopExactAgent, exactAgentDone := startAgent(exactPhase.listener)
+	waitSessionReady(t, exactPhase.server, hostID)
+	waitBarrier(exactPhase.service, "", false)
+	for range 10 {
+		exactPhase.coordinator.ReconcileHost(ctx, hostID)
+	}
+	if exactPhase.commands.Count(controllernet.RuntimeStart) != 0 || exactPhase.commands.Count(controllernet.RuntimeStop) != 0 {
+		t.Fatalf("exact restored execution was mutated starts=%d stops=%d", exactPhase.commands.Count(controllernet.RuntimeStart), exactPhase.commands.Count(controllernet.RuntimeStop))
+	}
+	exact := mustRuntimeSnapshot(t, processes, snapshot.ExecutionID)
+	if exact.PID != running.PID || exact.ProcessInstance != running.ProcessInstance || exact.State != model.ExecutionRunning {
+		t.Fatalf("exact execution continuity was lost: before=%+v after=%+v", running, exact)
+	}
+	stopPhase(exactPhase, stopExactAgent, exactAgentDone)
+
+	// Replace the physical execution outside the restored database, then restore
+	// T0 again. The current Agent truth is newer and must remain untouched while
+	// the durable barrier transitions to CONFLICT.
+	if _, _, err := minerRuntime.Stop(snapshot.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	newerID, err := identity.NewExecutionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerPlan := snapshot.Plan
+	newerPlan.ExecutionID = newerID
+	newerPlan.Ownership.DesiredGeneration = snapshot.DesiredGeneration + 1
+	newerPlan.Ownership.ResolvedHash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	newer, _, err := minerRuntime.Start(ctx, newerPlan)
+	if err != nil || newer.Process.PID <= 0 {
+		t.Fatalf("prepare newer physical reality=%+v err=%v", newer, err)
+	}
+	restoreAgain()
+	newerPhase := startRestoredController()
+	stopNewerAgent, newerAgentDone := startAgent(newerPhase.listener)
+	waitSessionReady(t, newerPhase.server, hostID)
+	waitBarrier(newerPhase.service, farmmodel.RestoreBarrierConflict, true)
+	for range 10 {
+		newerPhase.coordinator.ReconcileHost(ctx, hostID)
+	}
+	if newerPhase.commands.Count(controllernet.RuntimeStart) != 0 || newerPhase.commands.Count(controllernet.RuntimeStop) != 0 {
+		t.Fatalf("newer reality was mutated starts=%d stops=%d", newerPhase.commands.Count(controllernet.RuntimeStart), newerPhase.commands.Count(controllernet.RuntimeStop))
+	}
+	newerCurrent := mustRuntimeSnapshot(t, processes, newerID)
+	if newerCurrent.PID != newer.Process.PID || newerCurrent.State != model.ExecutionRunning {
+		t.Fatalf("newer execution did not survive restore comparison: before=%+v after=%+v", newer.Process, newerCurrent)
+	}
+	stopPhase(newerPhase, stopNewerAgent, newerAgentDone)
+}
 
 func TestDesiredRuntimeSurvivesControllerRestartEndToEnd(t *testing.T) {
 	controllerID, _ := identity.NewControllerID()
@@ -524,6 +860,21 @@ func newMutableGPUFS(selector, hardwareIdentity string) *mutableGPUFS {
 	value := &mutableGPUFS{}
 	value.SetGPU(selector, hardwareIdentity)
 	return value
+}
+
+type oneShotInventoryBarrier struct {
+	base    fs.FS
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (files *oneShotInventoryBarrier) Open(name string) (fs.File, error) {
+	files.once.Do(func() {
+		close(files.entered)
+		<-files.release
+	})
+	return files.base.Open(name)
 }
 
 func (files *mutableGPUFS) SetGPU(selector, hardwareIdentity string) {

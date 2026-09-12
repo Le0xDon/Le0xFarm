@@ -30,6 +30,16 @@ func TestInitializeLoadAndIssue(t *testing.T) {
 	if string(first) != string(loaded.CA.Raw) {
 		t.Fatal("CA changed")
 	}
+	if p.CAFingerprint() != loaded.CAFingerprint() || len(p.CAFingerprint()) != len("SHA256:")+64 {
+		t.Fatalf("CA fingerprint was not stable: initialized=%q loaded=%q", p.CAFingerprint(), loaded.CAFingerprint())
+	}
+	replaced, err := controllerpki.Initialize(t.TempDir(), cid, fid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced.CAFingerprint() == p.CAFingerprint() {
+		t.Fatal("different CA under the same public Controller/Farm IDs had the same fingerprint")
+	}
 	if _, err := controllerpki.Initialize(d, cid, fid); err == nil {
 		t.Fatal("repeated init accepted")
 	}

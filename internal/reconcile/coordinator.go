@@ -59,6 +59,16 @@ type maintenanceLister interface {
 	ListMaintenanceHolds(context.Context) ([]farmmodel.MaintenanceHold, error)
 }
 
+type restoreBarrierStore interface {
+	GetRestoreHostBarrier(context.Context, identity.HostID) (farmmodel.RestoreHostBarrier, bool, error)
+	MarkRestoreHostConflict(context.Context, identity.HostID, string, uint64) (farmmodel.RestoreHostBarrier, error)
+	ClearRestoreHostBarrier(context.Context, identity.HostID, string, uint64) error
+}
+
+type restoreBarrierLister interface {
+	ListRestoreHostBarriers(context.Context) ([]farmmodel.RestoreHostBarrier, error)
+}
+
 type inFlightAction struct {
 	dispatchSequence uint64
 }
@@ -132,6 +142,16 @@ func (coordinator *Coordinator) ReconcileAll(ctx context.Context) {
 				if hold.Active {
 					hosts[hold.HostID] = struct{}{}
 				}
+			}
+		}
+	}
+	if store, ok := coordinator.store.(restoreBarrierLister); ok {
+		barriers, listErr := store.ListRestoreHostBarriers(ctx)
+		if listErr != nil {
+			coordinator.output.Printf("RESTORE: cannot load restore barrier Hosts")
+		} else {
+			for _, barrier := range barriers {
+				hosts[barrier.HostID] = struct{}{}
 			}
 		}
 	}
@@ -358,6 +378,9 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 	if !ok || !observed.Connected || !observed.Ready || !observed.Fresh {
 		return preparedDispatch{}, false
 	}
+	if blocked := coordinator.applyRestoreBarrierLocked(ctx, hostID, observed); blocked {
+		return preparedDispatch{}, false
+	}
 	// M4.3 deliberately serializes runtime convergence per Host. In particular,
 	// a newer generation must not START while an older START outcome is unknown.
 	if coordinator.hostHasInFlight(hostID, observed.ConnectionEpoch) {
@@ -487,6 +510,11 @@ func (coordinator *Coordinator) prepareDispatchLocked(ctx context.Context, hostI
 }
 
 func (coordinator *Coordinator) actionStillCurrent(ctx context.Context, action Action, observed controllerstate.HostObservation) bool {
+	if restoreStore, ok := coordinator.store.(restoreBarrierStore); ok {
+		if _, exists, err := restoreStore.GetRestoreHostBarrier(ctx, action.Key.HostID); err != nil || exists {
+			return false
+		}
+	}
 	latest, err := coordinator.store.GetDesiredWorkload(ctx, action.Key.WorkloadID)
 	if err != nil || latest.HostID != action.Key.HostID {
 		return false
@@ -508,6 +536,72 @@ func (coordinator *Coordinator) actionStillCurrent(ctx context.Context, action A
 		snapshot, err := coordinator.store.GetCurrentResolvedSnapshot(ctx, latest.WorkloadID)
 		return err == nil && snapshot.ExecutionID == action.Key.ExecutionID && snapshot.ResolvedHash == action.Snapshot.ResolvedHash
 	}
+	return true
+}
+
+// applyRestoreBarrierLocked compares restored persistent intent with a complete,
+// fresh current-epoch bootstrap before normal reconciliation may mutate runtime.
+// It never emits START or STOP itself. A mismatched active execution is newer or
+// otherwise unprovable physical reality and remains blocked for manual recovery.
+func (coordinator *Coordinator) applyRestoreBarrierLocked(ctx context.Context, hostID identity.HostID, observed controllerstate.HostObservation) bool {
+	store, ok := coordinator.store.(restoreBarrierStore)
+	if !ok {
+		return false
+	}
+	barrier, exists, err := store.GetRestoreHostBarrier(ctx, hostID)
+	if err != nil {
+		coordinator.output.Printf("RESTORE: cannot load restore barrier for HostID %s", hostID)
+		return true
+	}
+	if !exists {
+		return false
+	}
+	if !observed.InventoryFresh || !observed.ProcessesFresh {
+		return true
+	}
+	workloads, err := coordinator.store.ListDesiredWorkloads(ctx)
+	if err != nil {
+		return true
+	}
+	current := make(map[identity.ExecutionID]farmmodel.ResolvedExecutionSnapshot)
+	for _, workload := range workloads {
+		if workload.HostID != hostID {
+			continue
+		}
+		snapshot, snapshotErr := coordinator.store.GetCurrentResolvedSnapshot(ctx, workload.WorkloadID)
+		if snapshotErr == nil {
+			current[snapshot.ExecutionID] = snapshot
+			continue
+		}
+		if code, _ := farmerr.CodeOf(snapshotErr); code != farmerr.NOT_FOUND {
+			return true
+		}
+	}
+	conflict := false
+	for _, execution := range observed.Executions {
+		if !holdsResources(execution.Status) {
+			continue
+		}
+		snapshot, known := current[execution.ExecutionID]
+		if !known || !ownershipMatchesSnapshot(execution.Ownership, snapshot) || !claimMatches(execution.Ownership, snapshot.Resources) {
+			conflict = true
+			break
+		}
+	}
+	if conflict {
+		if _, err := store.MarkRestoreHostConflict(ctx, hostID, barrier.BackupID, barrier.Revision); err != nil {
+			if code, _ := farmerr.CodeOf(err); code != farmerr.REVISION_CONFLICT {
+				coordinator.output.Printf("RESTORE: cannot persist reconciliation block for HostID %s", hostID)
+			}
+		}
+		return true
+	}
+	if err := store.ClearRestoreHostBarrier(ctx, hostID, barrier.BackupID, barrier.Revision); err != nil {
+		return true
+	}
+	// Force a separate level-triggered pass so clearing the durable barrier and
+	// dispatching a runtime mutation can never be one stale evaluation step.
+	go coordinator.ReconcileHost(context.Background(), hostID)
 	return true
 }
 

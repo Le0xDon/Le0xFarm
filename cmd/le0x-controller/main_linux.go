@@ -18,8 +18,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controllerbackup"
 	"github.com/le0xdon/le0xfarm/internal/controllerdb"
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
+	"github.com/le0xdon/le0xfarm/internal/controllerlock"
 	"github.com/le0xdon/le0xfarm/internal/controllernet"
 	"github.com/le0xdon/le0xfarm/internal/controllerpki"
 	"github.com/le0xdon/le0xfarm/internal/controllerstate"
@@ -56,6 +58,9 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	pairing := flags.Bool("pairing", false, "Enable temporary development enrollment pairing")
 	pairingTTL := flags.Duration("pairing-ttl", 15*time.Minute, "Enrollment token lifetime")
 	pairingTokenFile := flags.String("pairing-token-file", "", "Create a mode-0600 file containing the one-time enrollment token")
+	backupAction := flags.String("backup-action", "", "Local backup action: create, list, verify, or restore")
+	backupID := flags.String("backup-id", "", "BackupID for verify or restore")
+	backupDir := flags.String("backup-dir", "", "Optional local Controller backup directory")
 	runtimeAction := flags.String("dev-runtime-action", "", "Development/test runtime action: start, start-miner, stop, restart, or get")
 	runtimeTarget := flags.String("target-agent", "", "AgentID targeted by a development/test runtime action")
 	executionID := flags.String("execution-id", "", "ExecutionID for a development/test runtime action")
@@ -106,6 +111,14 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	if *initIdentity && *initPKI {
 		fmt.Fprintln(stderr, "--init and --init-pki cannot be combined")
+		return 2
+	}
+	if *backupAction == "" && (*backupID != "" || *backupDir != "") {
+		fmt.Fprintln(stderr, "--backup-id and --backup-dir require --backup-action")
+		return 2
+	}
+	if *backupAction != "" && (*initIdentity || *initPKI || *pairing || *runtimeAction != "" || *runtimeTarget != "") {
+		fmt.Fprintln(stderr, "backup actions cannot be combined with initialization, pairing, or runtime actions")
 		return 2
 	}
 	var runtimeCommand *le0xv1.CommandEnvelope
@@ -171,15 +184,41 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		printError(stderr, err)
 		return 1
 	}
-	var pki *controllerpki.PKI
-	if *initIdentity || *initPKI {
-		pki, err = controllerpki.Initialize(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
-	} else if !*insecureDev {
-		pki, err = controllerpki.Load(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
-	}
+	lease, err := controllerlock.Acquire(dataDir)
 	if err != nil {
 		printError(stderr, err)
 		return 1
+	}
+	defer lease.Close()
+	var pki *controllerpki.PKI
+	if *initIdentity || *initPKI {
+		pki, err = controllerpki.Initialize(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
+	} else if *backupAction != "" || !*insecureDev {
+		pki, err = controllerpki.Load(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
+	} else if existing, loadErr := controllerpki.Load(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID); loadErr == nil {
+		pki = existing
+	}
+	if err != nil {
+		if *backupAction == "restore" {
+			printError(stderr, farmerr.Error{Code: farmerr.RESTORE_IDENTITY_MISMATCH, HumanMessage: "restore requires the original Controller cryptographic trust context"})
+			return 1
+		}
+		printError(stderr, err)
+		return 1
+	}
+	// Recover or fail closed on an interrupted offline restore before any code
+	// opens farm.db. Public PKI provenance is loaded first so a crash recovery
+	// cannot accept a barriered database from a different trust context.
+	trustFingerprint := ""
+	if pki != nil {
+		trustFingerprint = pki.CAFingerprint()
+	}
+	if err := controllerbackup.RecoverInterruptedRestore(context.Background(), dataDir, lease, controllerIdentity.ControllerID, controllerIdentity.FarmID, trustFingerprint); err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	if *backupAction != "" {
+		return runBackupAction(*backupAction, *backupID, *backupDir, dataDir, controllerIdentity, trustFingerprint, lease, stdout, stderr)
 	}
 	trust, err := controllertrust.Open(dataDir, controllerIdentity.ControllerID, controllerIdentity.FarmID)
 	if err != nil {
@@ -252,12 +291,102 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if pki != nil {
+		backupManager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, TrustFingerprint: pki.CAFingerprint(), Lease: lease})
+		if err != nil {
+			printError(stderr, err)
+			return 1
+		}
+		go backupManager.Run(ctx, farmDB, time.Hour, func(code farmerr.Code) {
+			log.New(stdout, "", 0).Printf("BACKUP: code=%s", code)
+		})
+	} else {
+		log.New(stdout, "", 0).Printf("BACKUP: code=%s", farmerr.BACKUP_FAILED)
+	}
 	go coordinator.Run(ctx, time.Second)
 	if err := server.Serve(ctx, listener); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	return 0
+}
+
+func runBackupAction(action, idValue, backupDir, dataDir string, controllerIdentity controlleridentity.Identity, trustFingerprint string, lease *controllerlock.Lease, stdout, stderr io.Writer) int {
+	manager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, BackupDir: backupDir, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, TrustFingerprint: trustFingerprint, Lease: lease})
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	ctx := context.Background()
+	parseID := func() (controllerbackup.BackupID, bool) {
+		id, parseErr := controllerbackup.ParseBackupID(idValue)
+		if parseErr != nil {
+			fmt.Fprintln(stderr, "verify and restore require a valid --backup-id")
+			return "", false
+		}
+		return id, true
+	}
+	switch action {
+	case "create":
+		if idValue != "" {
+			fmt.Fprintln(stderr, "create does not accept --backup-id")
+			return 2
+		}
+		db, openErr := controllerdb.Open(ctx, dataDir)
+		if openErr != nil {
+			printError(stderr, openErr)
+			return 1
+		}
+		result, createErr := manager.CreateManual(ctx, db)
+		closeErr := db.Close()
+		if err := errors.Join(createErr, closeErr); err != nil {
+			printError(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Code: %s\nBackupID: %s\nCreated: %s\nClass: %s\nSchema: %d\n", result.Code, result.Manifest.BackupID, result.Manifest.CreatedAt.Format(time.RFC3339), result.Manifest.Class, result.Manifest.DatabaseSchema)
+		return 0
+	case "list":
+		if idValue != "" {
+			fmt.Fprintln(stderr, "list does not accept --backup-id")
+			return 2
+		}
+		values, listErr := manager.List(ctx)
+		if listErr != nil {
+			printError(stderr, listErr)
+			return 1
+		}
+		for _, item := range values {
+			fmt.Fprintf(stdout, "%s %s %s schema=%d bytes=%d\n", item.BackupID, item.Class, item.CreatedAt.Format(time.RFC3339), item.DatabaseSchema, item.DatabaseSize)
+		}
+		return 0
+	case "verify":
+		id, ok := parseID()
+		if !ok {
+			return 2
+		}
+		manifest, verifyErr := manager.Verify(ctx, id)
+		if verifyErr != nil {
+			printError(stderr, verifyErr)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Code: VERIFIED\nBackupID: %s\nChecksum: %s\nSchema: %d\n", manifest.BackupID, manifest.DatabaseSHA256, manifest.DatabaseSchema)
+		return 0
+	case "restore":
+		id, ok := parseID()
+		if !ok {
+			return 2
+		}
+		result, restoreErr := manager.Restore(ctx, id, lease)
+		if restoreErr != nil {
+			printError(stderr, restoreErr)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Code: %s\nBackupID: %s\nSafetyBackupID: %s\nHostBarriers: %d\nRestartRequired: %t\n", result.Code, result.Backup.BackupID, result.SafetyBackupID, result.HostBarriers, result.RestartRequired)
+		return 0
+	default:
+		fmt.Fprintln(stderr, "--backup-action must be create, list, verify, or restore")
+		return 2
+	}
 }
 
 func writeEnrollmentCredential(path, token string) error {
