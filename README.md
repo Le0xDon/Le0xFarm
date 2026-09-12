@@ -8,12 +8,105 @@ Le0xFarm — проект системы управления оборудова
 - **Le0xNoda** — компонент для работы с нодами и связанными сервисами.
 - **Le0xBrain** — будущая аналитика и автоматизация решений.
 
-Текущий этап — **M10 Controller Backup / Safe Restore**. Существующий M1 transport использует
+Текущий этап — **M11 Ubuntu Installer / Service Lifecycle**. Существующий M1 transport использует
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
 может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
-проверяемое локальное хранилище packages и первый adapter XMRig. Le0xNoda/Le0xBrain,
-Controller-to-Agent package distribution и systemd не реализованы.
+проверяемое локальное хранилище packages и первый adapter XMRig. Le0xNoda/Le0xBrain и
+Controller-to-Agent package distribution пока не реализованы.
+
+## M11 — Ubuntu Technical MVP installation
+
+Сборка создаёт три локальных бинарника (ничего не устанавливая в host):
+
+```sh
+make build
+```
+
+Ubuntu installer запускается администратором явно и поддерживает роли `controller`, `agent`
+и `both`. По умолчанию он только устанавливает файлы; enable/start требуют отдельных flags.
+
+```sh
+sudo ./bin/le0x-install --role controller \
+  --controller-binary ./bin/le0x-controller
+sudo ./bin/le0x-install --role agent \
+  --agent-binary ./bin/le0x-agent
+# После явной настройки/enrollment:
+sudo ./bin/le0x-install --role controller \
+  --controller-binary ./bin/le0x-controller --enable --start
+```
+
+Installer не скачивает код, не выполняет shell fragments и вызывает только фиксированные
+`useradd`/`usermod`/`systemctl` operations. Он создаёт либо строго проверяет no-login,
+password-locked system account `le0x` с dedicated primary group. Final layout:
+
+```text
+/usr/local/bin/le0x-controller
+/usr/local/bin/le0x-agent
+/etc/le0xfarm/controller.env
+/etc/le0xfarm/agent.env
+/etc/systemd/system/le0x-controller.service
+/etc/systemd/system/le0x-agent.service
+/var/lib/le0xfarm/controller/   # identity, PKI, farm.db, backups
+/var/lib/le0xfarm/agent/        # Agent identity/trust, packages/runtime data
+```
+
+State directories имеют mode `0700`; identities, PKI и DB сохраняют свои строгие file modes.
+Units запускаются как `le0x`, пишут stdout/stderr в journald, используют `Restart=on-failure`
+с `RestartSec=10s`, принимают graceful SIGTERM и не создают отдельный miner watchdog.
+Controller unit сохраняет M10 exclusive lease/restore recovery; при shutdown Controller
+отменяет и join-ит все порождённые reconcile/incident workers до закрытия DB. Agent unit
+использует `KillMode=process`: systemd надёжно останавливает главный Agent, но не выполняет
+broad cgroup SIGKILL оставшихся miner processes. Только Agent/Supervisor может остановить
+точно известный managed `ExecutionID`; недоказанный survivor остаётся для fresh process observation
+и conservative unmanaged/resource-conflict handling.
+
+При Agent install Linux preflight проверяет найденные `/dev/dri/renderD*`, `/dev/dri/card*`
+и `/dev/nvidia*`. CPU-only host не блокируется. Если GPU nodes требуют доступа через
+существующую owning group `render` и/или `video`, installer добавляет только эти membership.
+Недоступная GPU node с другой ownership/mode даёт явный install error; device mode не меняется.
+
+Перед первым Controller service start создайте identity/PKI явно:
+
+```sh
+sudo -u le0x env LE0X_CONTROLLER_DATA_DIR=/var/lib/le0xfarm/controller \
+  /usr/local/bin/le0x-controller --init --init-only
+```
+
+Затем настройте `/etc/le0xfarm/controller.env` и `/etc/le0xfarm/agent.env`, выполните существующий
+short-lived enrollment flow и только после этого enable/start Agent. Адреса в этих files не
+являются credentials; tokens/passwords нельзя помещать в unit или command line. Для remote Agent
+нужно явно заменить loopback `LE0X_AGENT_CONTROLLER`. Status/logs и обычный lifecycle:
+
+```sh
+sudo systemctl status le0x-controller le0x-agent
+sudo journalctl -u le0x-controller -u le0x-agent
+sudo systemctl stop le0x-agent
+sudo systemctl restart le0x-controller
+```
+
+Update повторяет `install` с новыми уже собранными binaries. Installer сначала
+проверяет inputs и сохраняет rollback copies всего replaceable artifact set: role binary,
+unit и generated config. При ошибке publication, `daemon-reload`, enable или start прежний
+полный набор файлов восстанавливается. Existing `farm.db`, identities, trust, backups,
+packages и `.env` не перезаписываются. DB migrations по-прежнему выполняет Controller startup.
+Backup/verify/restore используют M10 local commands; restore остаётся explicit offline
+operation и не выполняется installer-ом.
+
+Default uninstall удаляет только выбранные units/binaries и disable/stops их services:
+
+```sh
+sudo ./bin/le0x-install --action uninstall --role agent
+sudo ./bin/le0x-install --action uninstall --role controller
+```
+
+Он сохраняет `/var/lib/le0xfarm`, `/etc/le0xfarm`, Controller/Agent identities, PKI, trust,
+`farm.db` и backups. Автоматического purge нет. `systemctl stop` только останавливает service;
+uninstall дополнительно удаляет service infrastructure; уничтожение данных — отдельная ручная
+операция оператора и не является частью M11.
+
+Для безопасных packaging tests `--root /absolute/temp/root` создаёт тот же layout под test root,
+не вызывая host `useradd`, `chown` или systemd. Это staging mode, не отдельный runtime layout.
 
 ## M4.3 — Desired Runtime Reconciliation
 

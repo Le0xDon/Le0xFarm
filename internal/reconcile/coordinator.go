@@ -87,6 +87,12 @@ type Coordinator struct {
 	incidentMu      sync.Mutex
 	incidentRunning map[identity.HostID]bool
 	incidentPending map[identity.HostID]bool
+	lifetimeCtx     context.Context
+	lifetimeCancel  context.CancelFunc
+	workersMu       sync.Mutex
+	workers         sync.WaitGroup
+	closing         bool
+	shutdownOnce    sync.Once
 	// Identical level-triggered evaluations are idempotent and must not turn a
 	// fast reconcile interval into continuous SQLite writes.
 	incidentEvaluations map[identity.HostID]incidentEvaluationCache
@@ -103,7 +109,41 @@ func NewCoordinator(store WorkloadStore, observed *controllerstate.Store, comman
 	if output == nil {
 		output = log.Default()
 	}
-	return &Coordinator{store: store, observed: observed, commander: commander, output: output, inFlight: make(map[ActionKey]inFlightAction), hostLocks: make(map[identity.HostID]*sync.Mutex), authority: make(map[identity.HostID]*sync.RWMutex), incidentRunning: make(map[identity.HostID]bool), incidentPending: make(map[identity.HostID]bool), incidentEvaluations: make(map[identity.HostID]incidentEvaluationCache)}
+	lifetimeCtx, lifetimeCancel := context.WithCancel(context.Background())
+	return &Coordinator{store: store, observed: observed, commander: commander, output: output, inFlight: make(map[ActionKey]inFlightAction), hostLocks: make(map[identity.HostID]*sync.Mutex), authority: make(map[identity.HostID]*sync.RWMutex), incidentRunning: make(map[identity.HostID]bool), incidentPending: make(map[identity.HostID]bool), incidentEvaluations: make(map[identity.HostID]incidentEvaluationCache), lifetimeCtx: lifetimeCtx, lifetimeCancel: lifetimeCancel}
+}
+
+// Shutdown prevents new service-owned work, cancels admitted workers, and
+// waits for them before the Controller closes persistent state.
+func (coordinator *Coordinator) Shutdown() {
+	coordinator.shutdownOnce.Do(func() {
+		coordinator.workersMu.Lock()
+		coordinator.closing = true
+		coordinator.lifetimeCancel()
+		coordinator.workersMu.Unlock()
+	})
+	coordinator.workers.Wait()
+}
+
+func (coordinator *Coordinator) startWorker(work func(context.Context)) bool {
+	coordinator.workersMu.Lock()
+	if coordinator.closing {
+		coordinator.workersMu.Unlock()
+		return false
+	}
+	coordinator.workers.Add(1)
+	coordinator.workersMu.Unlock()
+	go func() {
+		defer coordinator.workers.Done()
+		work(coordinator.lifetimeCtx)
+	}()
+	return true
+}
+
+func (coordinator *Coordinator) scheduleReconcile(hostID identity.HostID) bool {
+	return coordinator.startWorker(func(ctx context.Context) {
+		coordinator.ReconcileHost(ctx, hostID)
+	})
 }
 
 func (coordinator *Coordinator) Run(ctx context.Context, interval time.Duration) {
@@ -156,8 +196,7 @@ func (coordinator *Coordinator) ReconcileAll(ctx context.Context) {
 		}
 	}
 	for hostID := range hosts {
-		hostID := hostID
-		go coordinator.ReconcileHost(ctx, hostID)
+		coordinator.scheduleReconcile(hostID)
 	}
 }
 
@@ -206,12 +245,19 @@ func (coordinator *Coordinator) queueIncidentEvaluation(hostID identity.HostID) 
 	}
 	coordinator.incidentRunning[hostID] = true
 	coordinator.incidentMu.Unlock()
-	go func() {
+	started := coordinator.startWorker(func(ctx context.Context) {
 		for {
+			if ctx.Err() != nil {
+				coordinator.incidentMu.Lock()
+				delete(coordinator.incidentRunning, hostID)
+				delete(coordinator.incidentPending, hostID)
+				coordinator.incidentMu.Unlock()
+				return
+			}
 			coordinator.incidentMu.Lock()
 			coordinator.incidentPending[hostID] = false
 			coordinator.incidentMu.Unlock()
-			coordinator.evaluateIncidents(context.Background(), hostID)
+			coordinator.evaluateIncidents(ctx, hostID)
 			coordinator.incidentMu.Lock()
 			if !coordinator.incidentPending[hostID] {
 				delete(coordinator.incidentRunning, hostID)
@@ -220,7 +266,13 @@ func (coordinator *Coordinator) queueIncidentEvaluation(hostID identity.HostID) 
 			}
 			coordinator.incidentMu.Unlock()
 		}
-	}()
+	})
+	if !started {
+		coordinator.incidentMu.Lock()
+		delete(coordinator.incidentRunning, hostID)
+		delete(coordinator.incidentPending, hostID)
+		coordinator.incidentMu.Unlock()
+	}
 }
 
 func (coordinator *Coordinator) evaluateIncidents(ctx context.Context, hostID identity.HostID) {
@@ -601,7 +653,7 @@ func (coordinator *Coordinator) applyRestoreBarrierLocked(ctx context.Context, h
 	}
 	// Force a separate level-triggered pass so clearing the durable barrier and
 	// dispatching a runtime mutation can never be one stale evaluation step.
-	go coordinator.ReconcileHost(context.Background(), hostID)
+	coordinator.scheduleReconcile(hostID)
 	return true
 }
 
@@ -623,7 +675,7 @@ func (coordinator *Coordinator) SessionConnected(info controllernet.SessionInfo)
 	updated := coordinator.observed.Connect(info.AgentID, info.HostID, info.ConnectionEpoch)
 	lock.Unlock()
 	if updated {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -640,7 +692,7 @@ func (coordinator *Coordinator) SessionDisconnected(info controllernet.SessionIn
 	coordinator.mu.Unlock()
 	lock.Unlock()
 	if updated {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -654,7 +706,7 @@ func (coordinator *Coordinator) ExecutionsObserved(info controllernet.SessionInf
 	ready := coordinator.observed.MarkReady(info.HostID, info.ConnectionEpoch)
 	lock.Unlock()
 	if updated || ready {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -666,7 +718,7 @@ func (coordinator *Coordinator) InventoryObserved(info controllernet.SessionInfo
 	current, _ := coordinator.observed.Get(info.HostID)
 	lock.Unlock()
 	if becameReady || (updated && current.Ready && current.ConnectionEpoch == info.ConnectionEpoch) {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -678,7 +730,7 @@ func (coordinator *Coordinator) ProcessesObserved(info controllernet.SessionInfo
 	current, _ := coordinator.observed.Get(info.HostID)
 	lock.Unlock()
 	if becameReady || (updated && current.Ready && current.ConnectionEpoch == info.ConnectionEpoch) {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -690,7 +742,7 @@ func (coordinator *Coordinator) StatusObserved(info controllernet.SessionInfo, s
 	current, _ := coordinator.observed.Get(info.HostID)
 	lock.Unlock()
 	if becameReady || (updated && current.Ready && current.ConnectionEpoch == info.ConnectionEpoch) {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -701,7 +753,7 @@ func (coordinator *Coordinator) SessionReady(info controllernet.SessionInfo) {
 	current, _ := coordinator.observed.Get(info.HostID)
 	lock.Unlock()
 	if current.Ready && current.ConnectionEpoch == info.ConnectionEpoch {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -720,8 +772,8 @@ func (coordinator *Coordinator) RuntimeResult(info controllernet.SessionInfo, re
 		return
 	}
 	if agentError != nil {
-		if request.Kind == controllernet.RuntimeStart && permanentRejection(agentError.Code) && coordinator.requestStillCurrent(context.Background(), request) {
-			if err := coordinator.store.BlockDesiredGeneration(context.Background(), request.WorkloadID, request.DesiredGeneration, agentError.Code, agentError.HumanMessage); err != nil {
+		if request.Kind == controllernet.RuntimeStart && permanentRejection(agentError.Code) && coordinator.requestStillCurrent(coordinator.lifetimeCtx, request) {
+			if err := coordinator.store.BlockDesiredGeneration(coordinator.lifetimeCtx, request.WorkloadID, request.DesiredGeneration, agentError.Code, agentError.HumanMessage); err != nil {
 				coordinator.output.Printf("RECONCILE: cannot persist rejected WorkloadID %s generation %d", request.WorkloadID, request.DesiredGeneration)
 				lock.Unlock()
 				return
@@ -744,8 +796,8 @@ func (coordinator *Coordinator) RuntimeResult(info controllernet.SessionInfo, re
 	}
 	updated := coordinator.observed.UpsertExecution(info.HostID, info.ConnectionEpoch, *execution, time.Now().UTC(), request.DispatchSequence)
 	if updated {
-		if request.Kind == controllernet.RuntimeStart && execution.Status == model.ExecutionFailed && coordinator.requestStillCurrent(context.Background(), request) {
-			if err := coordinator.store.BlockDesiredGeneration(context.Background(), request.WorkloadID, request.DesiredGeneration, farmerr.PROCESS_CRASHED, "execution reached terminal FAILED state"); err != nil {
+		if request.Kind == controllernet.RuntimeStart && execution.Status == model.ExecutionFailed && coordinator.requestStillCurrent(coordinator.lifetimeCtx, request) {
+			if err := coordinator.store.BlockDesiredGeneration(coordinator.lifetimeCtx, request.WorkloadID, request.DesiredGeneration, farmerr.PROCESS_CRASHED, "execution reached terminal FAILED state"); err != nil {
 				coordinator.output.Printf("RECONCILE: cannot persist failed WorkloadID %s generation %d", request.WorkloadID, request.DesiredGeneration)
 				lock.Unlock()
 				return
@@ -756,7 +808,7 @@ func (coordinator *Coordinator) RuntimeResult(info controllernet.SessionInfo, re
 	}
 	lock.Unlock()
 	if updated {
-		go coordinator.ReconcileHost(context.Background(), info.HostID)
+		coordinator.scheduleReconcile(info.HostID)
 	}
 }
 
@@ -784,7 +836,7 @@ func permanentRejection(code farmerr.Code) bool {
 func (coordinator *Coordinator) RetryWorkload(ctx context.Context, id identity.WorkloadID, expectedRevision uint64) (farmmodel.DesiredWorkload, error) {
 	workload, err := coordinator.store.RetryWorkload(ctx, id, expectedRevision)
 	if err == nil {
-		go coordinator.ReconcileHost(context.Background(), workload.HostID)
+		coordinator.scheduleReconcile(workload.HostID)
 	}
 	return workload, err
 }
@@ -825,7 +877,7 @@ func (coordinator *Coordinator) SetMaintenanceHold(ctx context.Context, hostID i
 	if err != nil {
 		return hold, err
 	}
-	go coordinator.ReconcileHost(context.Background(), hostID)
+	coordinator.scheduleReconcile(hostID)
 	return hold, nil
 }
 

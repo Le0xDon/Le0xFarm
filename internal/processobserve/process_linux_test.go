@@ -61,6 +61,27 @@ func TestObserveExactGPUWithoutReadingSensitiveArgvOrEnvironment(t *testing.T) {
 	}
 }
 
+func TestAgentRestartDoesNotAdoptSurvivingUnprovenProcess(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 301, "xmrig", 900, false, "")
+	source := Source{Root: root}
+	signatures := []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}
+	managed := []ManagedInstance{{PID: 301, ProcessInstance: "linux-proc-start-ticks:900"}}
+	before, err := source.Observe(model.Inventory{}, signatures, managed)
+	if err != nil || len(before) != 0 {
+		t.Fatalf("currently owned process classified as unmanaged: %+v %v", before, err)
+	}
+	// A reconstructed Agent/Supervisor has no in-memory proof tying the old
+	// process to its current execution. It observes rather than adopts or kills.
+	after, err := source.Observe(model.Inventory{}, signatures, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 || after[0].PID != 301 || after[0].ResourceScope != model.ProcessResourcesExact || !after[0].CPU {
+		t.Fatalf("surviving unproven process was not conservatively observed: %+v", after)
+	}
+}
+
 func makeProcess(t *testing.T, root string, pid int, executable string, startTicks uint64, gpu bool, pci string) {
 	t.Helper()
 	procDir := filepath.Join(root, "proc", fmt.Sprint(pid))

@@ -50,6 +50,33 @@ func TestControllerCLIInitializationFlag(t *testing.T) {
 	}
 }
 
+func TestControllerInitOnlyCreatesIdentityAndPKIWithoutServing(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "controller")
+	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--init-only"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "requires --init") {
+		t.Fatalf("unguarded init-only exit=%d stderr=%s", code, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := run([]string{"--init", "--init-only"}, &out, &errOut); code != 0 {
+		t.Fatalf("init-only exit=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if _, err := controlleridentity.Load(dir); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := controlleridentity.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controllerpki.Load(dir, identity.ControllerID, identity.FarmID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "farm.db")); !os.IsNotExist(err) {
+		t.Fatalf("init-only opened runtime database: %v", err)
+	}
+}
+
 func TestControllerOpensFarmDatabase(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "controller")
 	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)

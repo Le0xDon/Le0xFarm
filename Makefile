@@ -1,7 +1,13 @@
-.PHONY: test fmt vet check proto check-proto
+.PHONY: build test fmt vet check proto check-proto
 
 PROTO_FILES := $(wildcard proto/le0x/v1/*.proto)
 PROTO_FLAGS := --proto_path=. --go_opt=module=github.com/le0xdon/le0xfarm --go-grpc_opt=module=github.com/le0xdon/le0xfarm
+
+build:
+	mkdir -p bin
+	go build -o bin/le0x-controller ./cmd/le0x-controller
+	go build -o bin/le0x-agent ./cmd/le0x-agent
+	go build -o bin/le0x-install ./cmd/le0x-install
 
 test:
 	go test ./...

@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,135 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
 )
+
+func TestCoordinatorShutdownJoinsAdmittedWorkersAndRejectsNewWork(t *testing.T) {
+	coordinator := NewCoordinator(nil, nil, nil, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var exited atomic.Bool
+	if !coordinator.startWorker(func(ctx context.Context) {
+		close(entered)
+		<-release
+		if ctx.Err() == nil {
+			t.Error("Controller lifetime context was not cancelled")
+		}
+		exited.Store(true)
+	}) {
+		t.Fatal("initial worker was not admitted")
+	}
+	<-entered
+	done := make(chan struct{})
+	go func() {
+		coordinator.Shutdown()
+		close(done)
+	}()
+	deadline := time.After(time.Second)
+	for {
+		coordinator.workersMu.Lock()
+		closing := coordinator.closing
+		coordinator.workersMu.Unlock()
+		if closing {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("Shutdown did not close worker admission")
+		default:
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("Shutdown returned while an admitted worker was still running")
+	default:
+	}
+	if coordinator.startWorker(func(context.Context) { t.Error("worker ran after shutdown admission closed") }) {
+		t.Fatal("worker was admitted after shutdown began")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not join released worker")
+	}
+	if !exited.Load() {
+		t.Fatal("worker did not exit before Shutdown returned")
+	}
+	// The public shutdown operation is idempotent.
+	coordinator.Shutdown()
+}
+
+func TestCoordinatorWorkerAdmissionRacesShutdownSafely(t *testing.T) {
+	coordinator := NewCoordinator(nil, nil, nil, nil)
+	start := make(chan struct{})
+	var callers sync.WaitGroup
+	for range 100 {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			<-start
+			coordinator.startWorker(func(ctx context.Context) { <-ctx.Done() })
+		}()
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		<-start
+		coordinator.Shutdown()
+		close(shutdownDone)
+	}()
+	close(start)
+	callers.Wait()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent worker admission prevented shutdown drain")
+	}
+	if coordinator.startWorker(func(context.Context) {}) {
+		t.Fatal("worker admitted after concurrent shutdown")
+	}
+}
+
+type cancelReconcileStore struct {
+	*fakeStore
+	entered sync.Once
+	started chan struct{}
+	exited  chan struct{}
+}
+
+func (store *cancelReconcileStore) ListDesiredWorkloads(ctx context.Context) ([]farmmodel.DesiredWorkload, error) {
+	store.entered.Do(func() { close(store.started) })
+	<-ctx.Done()
+	close(store.exited)
+	return nil, ctx.Err()
+}
+
+func TestCoordinatorShutdownCancelsAndJoinsReconcileWorker(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := &cancelReconcileStore{
+		fakeStore: newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot),
+		started:   make(chan struct{}),
+		exited:    make(chan struct{}),
+	}
+	observed := controllerstate.New()
+	commander := newFakeCommander(host, 1)
+	readyStore(observed, commander.info, nil)
+	coordinator := NewCoordinator(store, observed, commander, nil)
+	if !coordinator.scheduleReconcile(host) {
+		t.Fatal("reconcile worker was not admitted")
+	}
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile worker did not enter persistent-state access")
+	}
+	coordinator.Shutdown()
+	select {
+	case <-store.exited:
+	default:
+		t.Fatal("Shutdown returned before reconcile persistent-state access exited")
+	}
+}
 
 func TestCoordinatorOneInFlightStartAndLostResultReconnect(t *testing.T) {
 	host := testHost(1)

@@ -297,6 +297,33 @@ func TestProcessGroupAndShutdownCleanup(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return processGone(childPID) })
 }
 
+func TestShutdownStopsOnlySupervisorOwnedExecution(t *testing.T) {
+	unmanaged := exec.Command("/bin/sleep", "60")
+	if err := unmanaged.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = unmanaged.Process.Kill()
+		_, _ = unmanaged.Process.Wait()
+	})
+
+	s := New(Config{StopGrace: 100 * time.Millisecond})
+	plan := sleepPlan(t)
+	managed, _, err := s.Start(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(managed.PID, 0); !errorsIsNoProcess(err) {
+		t.Fatalf("exact managed execution remains after Supervisor shutdown: %v", err)
+	}
+	if err := syscall.Kill(unmanaged.Process.Pid, 0); err != nil {
+		t.Fatalf("unmanaged process was affected by Supervisor shutdown: %v", err)
+	}
+}
+
 func TestMaintenanceHoldStopsOnlyManagedAndSuppressesStart(t *testing.T) {
 	unmanaged := exec.Command("/bin/sleep", "60")
 	if err := unmanaged.Start(); err != nil {

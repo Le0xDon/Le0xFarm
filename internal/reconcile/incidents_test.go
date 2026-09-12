@@ -215,6 +215,47 @@ type incidentEvaluationRecord struct {
 	calls      int
 }
 
+type cancelIncidentStore struct {
+	*fakeStore
+	entered chan struct{}
+	exited  chan struct{}
+}
+
+func (store *cancelIncidentStore) IncidentAuthority(context.Context, identity.HostID) (string, error) {
+	return "shutdown-authority", nil
+}
+
+func (store *cancelIncidentStore) ReconcileIncidents(ctx context.Context, _ identity.HostID, _ string, _ []farmmodel.IncidentCondition, _ map[farmmodel.IncidentType]bool) error {
+	close(store.entered)
+	<-ctx.Done()
+	close(store.exited)
+	return ctx.Err()
+}
+
+func TestCoordinatorShutdownCancelsAndJoinsIncidentWorker(t *testing.T) {
+	host := testHost(1)
+	workloadID := testWorkload(1)
+	snapshot := testSnapshot(workloadID, host, 1, testExecution(1), farmmodel.ResourceClaim{CPU: true})
+	store := &cancelIncidentStore{
+		fakeStore: newFakeStore(testWorkloadObject(workloadID, host, farmmodel.DesiredRunning, 1, snapshot.Resources), snapshot),
+		entered:   make(chan struct{}),
+		exited:    make(chan struct{}),
+	}
+	coordinator := NewCoordinator(store, controllerstate.New(), newFakeCommander(host, 1), nil)
+	coordinator.queueIncidentEvaluation(host)
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("incident worker did not reach persistence")
+	}
+	coordinator.Shutdown()
+	select {
+	case <-store.exited:
+	default:
+		t.Fatal("Shutdown returned before incident worker observed cancellation")
+	}
+}
+
 type incidentRecordingStore struct {
 	*fakeStore
 	incidentMu       sync.Mutex

@@ -1,0 +1,37 @@
+[Unit]
+Description=Le0xFarm Agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=le0x
+Group=le0x
+UMask=0077
+Environment=LE0X_DATA_DIR=/var/lib/le0xfarm/agent
+EnvironmentFile=-/etc/le0xfarm/agent.env
+ExecStart=/usr/local/bin/le0x-agent --controller=${LE0X_AGENT_CONTROLLER}
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+# Agent/Supervisor performs exact-ExecutionID shutdown. systemd terminates
+# only the Agent main process and must leave any no-longer-proven survivor
+# available for fresh unmanaged-process observation after restart.
+KillMode=process
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/le0xfarm/agent
+InaccessiblePaths=-/var/lib/le0xfarm/controller
+
+[Install]
+WantedBy=multi-user.target

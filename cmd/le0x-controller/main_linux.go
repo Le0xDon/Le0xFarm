@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,6 +55,7 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	listen := flags.String("listen", "127.0.0.1:50051", "TCP listen address")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
 	initIdentity := flags.Bool("init", false, "Initialize a new Controller/Farm identity")
+	initOnly := flags.Bool("init-only", false, "Initialize Controller identity/PKI and exit; requires --init")
 	initPKI := flags.Bool("init-pki", false, "Initialize PKI for an existing Controller identity")
 	pairing := flags.Bool("pairing", false, "Enable temporary development enrollment pairing")
 	pairingTTL := flags.Duration("pairing-ttl", 15*time.Minute, "Enrollment token lifetime")
@@ -113,11 +115,19 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		fmt.Fprintln(stderr, "--init and --init-pki cannot be combined")
 		return 2
 	}
+	if *initOnly && !*initIdentity {
+		fmt.Fprintln(stderr, "--init-only requires --init")
+		return 2
+	}
+	if *initOnly && (*pairing || *initPKI || *backupAction != "" || *runtimeAction != "" || *runtimeTarget != "") {
+		fmt.Fprintln(stderr, "--init-only cannot be combined with pairing, backup, or runtime actions")
+		return 2
+	}
 	if *backupAction == "" && (*backupID != "" || *backupDir != "") {
 		fmt.Fprintln(stderr, "--backup-id and --backup-dir require --backup-action")
 		return 2
 	}
-	if *backupAction != "" && (*initIdentity || *initPKI || *pairing || *runtimeAction != "" || *runtimeTarget != "") {
+	if *backupAction != "" && (*initIdentity || *initOnly || *initPKI || *pairing || *runtimeAction != "" || *runtimeTarget != "") {
 		fmt.Fprintln(stderr, "backup actions cannot be combined with initialization, pairing, or runtime actions")
 		return 2
 	}
@@ -206,6 +216,10 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		printError(stderr, err)
 		return 1
 	}
+	if *initOnly {
+		fmt.Fprintf(stdout, "Controller initialized\nControllerID: %s\nFarmID: %s\n", controllerIdentity.ControllerID, controllerIdentity.FarmID)
+		return 0
+	}
 	// Recover or fail closed on an interrupted offline restore before any code
 	// opens farm.db. Public PKI provenance is loaded first so a crash recovery
 	// cannot accept a barriered database from a different trust context.
@@ -289,23 +303,38 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 			fmt.Fprintf(stdout, "Pairing: ENABLED\nEnrollment credential file: %s\nTLS fingerprint: %s\nExpires: %s\n", *pairingTokenFile, pki.ServerFingerprint(), expiry.Format(time.RFC3339))
 		}
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
+	var background sync.WaitGroup
 	if pki != nil {
 		backupManager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, TrustFingerprint: pki.CAFingerprint(), Lease: lease})
 		if err != nil {
 			printError(stderr, err)
 			return 1
 		}
-		go backupManager.Run(ctx, farmDB, time.Hour, func(code farmerr.Code) {
-			log.New(stdout, "", 0).Printf("BACKUP: code=%s", code)
-		})
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			backupManager.Run(ctx, farmDB, time.Hour, func(code farmerr.Code) {
+				log.New(stdout, "", 0).Printf("BACKUP: code=%s", code)
+			})
+		}()
 	} else {
 		log.New(stdout, "", 0).Printf("BACKUP: code=%s", farmerr.BACKUP_FAILED)
 	}
-	go coordinator.Run(ctx, time.Second)
-	if err := server.Serve(ctx, listener); err != nil {
-		fmt.Fprintln(stderr, err)
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		coordinator.Run(ctx, time.Second)
+	}()
+	serveErr := server.Serve(ctx, listener)
+	cancel()
+	coordinator.Shutdown()
+	background.Wait()
+	if serveErr != nil {
+		fmt.Fprintln(stderr, serveErr)
 		return 1
 	}
 	return 0
