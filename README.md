@@ -12,8 +12,9 @@ Le0xFarm — проект системы управления оборудова
 persistent bidirectional gRPC через TLS 1.3 и mutual TLS; plaintext доступен только при
 явном `--insecure-dev`. Agent сохраняет identities и PKI, собирает Linux inventory и
 может выполнять resolved process plans. M3 добавляет generic miner adapter contract,
-проверяемое локальное хранилище packages и первый adapter XMRig. Le0xNoda/Le0xBrain и
-Controller-to-Agent package distribution пока не реализованы.
+проверяемое локальное хранилище packages и первый adapter XMRig. Для Technical MVP
+проверенный XMRig archive импортируется поддерживаемой локальной Agent command; сетевой
+Controller-to-Agent package distribution, Le0xNoda и Le0xBrain пока не реализованы.
 
 ## M11 — Ubuntu Technical MVP installation
 
@@ -76,7 +77,18 @@ sudo -u le0x env LE0X_CONTROLLER_DATA_DIR=/var/lib/le0xfarm/controller \
 Затем настройте `/etc/le0xfarm/controller.env` и `/etc/le0xfarm/agent.env`, выполните существующий
 short-lived enrollment flow и только после этого enable/start Agent. Адреса в этих files не
 являются credentials; tokens/passwords нельзя помещать в unit или command line. Для remote Agent
-нужно явно заменить loopback `LE0X_AGENT_CONTROLLER`. Status/logs и обычный lifecycle:
+нужно явно заменить loopback `LE0X_AGENT_CONTROLLER`. Минимальные non-secret values редактируются
+обычным admin editor:
+
+```text
+# sudoedit /etc/le0xfarm/controller.env
+LE0X_CONTROLLER_LISTEN=0.0.0.0:50051
+
+# sudoedit /etc/le0xfarm/agent.env
+LE0X_AGENT_CONTROLLER=CONTROLLER_HOST:50051
+```
+
+Status/logs и обычный lifecycle:
 
 ```sh
 sudo systemctl status le0x-controller le0x-agent
@@ -84,6 +96,83 @@ sudo journalctl -u le0x-controller -u le0x-agent
 sudo systemctl stop le0x-agent
 sudo systemctl restart le0x-controller
 ```
+
+### Technical MVP operator quick-start
+
+Running Controller предоставляет локальный typed operator API через mode-0600 Unix socket
+`/var/lib/le0xfarm/controller/operator.sock`. Команды ниже выполняются на Controller host от
+service account `le0x`; они не открывают `farm.db` параллельно и не обходят Controller authority.
+Список действий доступен через:
+
+```sh
+sudo -u le0x env LE0X_CONTROLLER_DATA_DIR=/var/lib/le0xfarm/controller \
+  /usr/local/bin/le0x-controller --operator-action help
+```
+
+Для первого secure enrollment временно остановите обычный Controller service, запустите тот же
+Controller с `--pairing --pairing-token-file` и запишите показанный public TLS fingerprint. На
+Agent host передайте одну строку token через stdin (не argv), указав этот fingerprint:
+
+```sh
+# Controller host, temporary foreground window:
+sudo -u le0x env LE0X_CONTROLLER_DATA_DIR=/var/lib/le0xfarm/controller \
+  /usr/local/bin/le0x-controller --listen 0.0.0.0:50051 --pairing \
+  --pairing-token-file /var/lib/le0xfarm/controller/enrollment.token
+
+# Agent host, with TOKEN read/pasted by the operator and not printed:
+read -rsp 'Enrollment token: ' TOKEN; printf '\n'
+printf '%s\n' "$TOKEN" | sudo -u le0x env LE0X_DATA_DIR=/var/lib/le0xfarm/agent \
+  /usr/local/bin/le0x-agent --controller CONTROLLER_HOST:50051 --pair-stdin \
+  --tls-fingerprint 'SHA256:...'
+unset TOKEN
+```
+
+После успешного pairing завершите temporary Controller через SIGTERM/Ctrl-C, удалите одноразовый
+token file и запускайте установленные services. Повторное соединение использует сохранённый mTLS
+trust и token больше не нужен.
+
+Сначала на Agent host получите официальный archive
+`xmrig-6.26.0-linux-static-x64.tar.gz` (upstream release v6.26.0). Импорт принимает только
+встроенный approved XMRig 6.26.0 manifest, проверяет archive SHA-256
+`fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5`, безопасно распаковывает
+его в Agent package store и идемпотентен:
+
+```sh
+sudo -u le0x env LE0X_DATA_DIR=/var/lib/le0xfarm/agent \
+  /usr/local/bin/le0x-agent --package-action import \
+  --package-archive /path/to/xmrig-6.26.0-linux-static-x64.tar.gz
+sudo -u le0x env LE0X_DATA_DIR=/var/lib/le0xfarm/agent \
+  /usr/local/bin/le0x-agent --package-action list
+```
+
+После enrollment и запуска обоих services создайте Controller objects. Каждая create command
+печатает созданный typed ID; подставьте эти значения вместо `<...>`. WalletRef содержит только
+публичный test/payout address, не seed или private key.
+
+```sh
+OP='sudo -u le0x env LE0X_CONTROLLER_DATA_DIR=/var/lib/le0xfarm/controller /usr/local/bin/le0x-controller'
+$OP --operator-action hosts-list
+$OP --operator-action pool-create --op-name test-pool --op-address pool.example:3333
+$OP --operator-action wallet-create --op-name test-wallet --op-coin XMR --op-address PUBLIC_TEST_ADDRESS
+$OP --operator-action profile-create --op-name xmr-cpu --op-adapter xmrig \
+  --op-package-id package_5f5d8ae2b63ce1001aa0a3b8a2a9b29a --op-package-version 6.26.0 \
+  --op-coin XMR --op-algorithm rx/0 --op-pool-id '<PoolID>' --op-wallet-id '<WalletID>' \
+  --op-user-template '${wallet}' --op-worker-placement NONE --op-cpu-threads 2
+$OP --operator-action workload-create --op-name xmr-cpu --op-host-id '<HostID>' \
+  --op-profile-id '<ProfileID>' --op-state STOPPED --op-cpu
+$OP --operator-action workload-set --op-workload-id '<WorkloadID>' --op-state RUNNING
+$OP --operator-action status --op-workload-id '<WorkloadID>'
+$OP --operator-action incidents-active
+$OP --operator-action hold-set --op-host-id '<HostID>' --op-reason maintenance
+$OP --operator-action hold-list
+$OP --operator-action hold-clear --op-host-id '<HostID>'
+$OP --operator-action workload-set --op-workload-id '<WorkloadID>' --op-state STOPPED
+```
+
+Другие inspect/list actions: `host-show`, `pool-list/show`, `wallet-list/show`,
+`profile-list/show`, `workload-list/show`, `hold-show`, `incidents-list`. Operator API является
+локальным Technical MVP control surface: arbitrary SQL, shell execution, secrets и Agent-side
+Desired decisions отсутствуют.
 
 Update повторяет `install` с новыми уже собранными binaries. Installer сначала
 проверяет inputs и сохраняет rollback copies всего replaceable artifact set: role binary,

@@ -5,6 +5,7 @@ package linuxinstall
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -822,6 +823,120 @@ func TestUninstallRemovesInfrastructureAndPreservesData(t *testing.T) {
 		if data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(kept))); err != nil || string(data) != "keep" {
 			t.Fatalf("persistent file lost: %s %q %v", kept, data, err)
 		}
+	}
+}
+
+func TestUninstallIsIdempotentWhenUnitsAreAlreadyAbsent(t *testing.T) {
+	root := t.TempDir()
+	host := &fakeHost{account: Account{UID: 1, GID: 1}}
+	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController, RoleAgent}, ControllerBinary: testBinary(t, "controller"), AgentBinary: testBinary(t, "agent"), Host: host})
+	if err := installer.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := installer.Uninstall(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	host.actions = nil
+	if err := installer.Uninstall(context.Background()); err != nil {
+		t.Fatalf("second uninstall: %v", err)
+	}
+	for _, action := range host.actions {
+		if strings.HasPrefix(action, "systemctl:disable") || strings.HasPrefix(action, "systemctl:reset-failed") {
+			t.Fatalf("absent unit caused state mutation: %v", host.actions)
+		}
+	}
+}
+
+func TestUninstallConvergesLoadedStateWhenUnitFileIsMissing(t *testing.T) {
+	root := t.TempDir()
+	host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{AgentService: {Enabled: true, Active: true}}}
+	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleAgent}, AgentBinary: testBinary(t, "agent"), Host: host})
+	if err := os.MkdirAll(filepath.Join(root, "usr/local/bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr/local/bin/le0x-agent"), []byte("binary"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := installer.Uninstall(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state := host.states[AgentService]; state.Active || state.Enabled {
+		t.Fatalf("loaded state remains: %+v", state)
+	}
+	for _, want := range []string{"systemctl:stop " + AgentService, "systemctl:disable " + AgentService} {
+		if !contains(host.actions, want) {
+			t.Fatalf("missing %q in %v", want, host.actions)
+		}
+	}
+}
+
+func TestUninstallHandlesAllExistingServiceStates(t *testing.T) {
+	for _, initial := range []ServiceState{
+		{Enabled: true, Active: true},
+		{Enabled: true, Active: false},
+		{Enabled: false, Active: true},
+		{Enabled: false, Active: false},
+	} {
+		initial := initial
+		t.Run(fmt.Sprintf("enabled_%t_active_%t", initial.Enabled, initial.Active), func(t *testing.T) {
+			root := t.TempDir()
+			host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{AgentService: initial}}
+			installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleAgent}, AgentBinary: testBinary(t, "agent"), Host: host})
+			if err := installer.Install(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			host.states[AgentService] = initial
+			if err := installer.Uninstall(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if final := host.states[AgentService]; final.Enabled || final.Active {
+				t.Fatalf("final service state=%+v", final)
+			}
+		})
+	}
+}
+
+func TestUninstallSurfacesRealServiceManagerFailure(t *testing.T) {
+	root := t.TempDir()
+	host := &fakeHost{account: Account{UID: 1, GID: 1}}
+	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController}, ControllerBinary: testBinary(t, "controller"), Host: host})
+	if err := installer.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("service manager unavailable")
+	host.fail = func(action string) error {
+		if action == "systemctl:disable --now "+ControllerService {
+			return want
+		}
+		return nil
+	}
+	if err := installer.Uninstall(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("error=%v, want %v", err, want)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "etc/systemd/system", ControllerService)); err != nil {
+		t.Fatalf("unit removed after real systemctl failure: %v", err)
+	}
+}
+
+func TestUninstallDoesNotRemoveUnitWhenResetFailedFails(t *testing.T) {
+	root := t.TempDir()
+	host := &fakeHost{account: Account{UID: 1, GID: 1}}
+	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController}, ControllerBinary: testBinary(t, "controller"), Host: host})
+	if err := installer.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("cannot reset failure state")
+	host.fail = func(action string) error {
+		if action == "systemctl:reset-failed "+ControllerService {
+			return want
+		}
+		return nil
+	}
+	if err := installer.Uninstall(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("error=%v, want %v", err, want)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "etc/systemd/system", ControllerService)); err != nil {
+		t.Fatalf("unit removed after reset-failed failure: %v", err)
 	}
 }
 

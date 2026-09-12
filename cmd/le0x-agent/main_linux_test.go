@@ -1,8 +1,12 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +15,64 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/agentidentity"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
+	"github.com/le0xdon/le0xfarm/internal/packages"
 )
+
+func TestPackageImportOperatorPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LE0X_DATA_DIR", filepath.Join(dir, "agent"))
+	archive := filepath.Join(dir, "package.tar.gz")
+	var buffer bytes.Buffer
+	gz := gzip.NewWriter(&buffer)
+	tw := tar.NewWriter(gz)
+	data := []byte("#!/bin/sh\nexit 0\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "xmrig", Mode: 0755, Size: int64(len(data)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archive, buffer.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(buffer.Bytes())
+	id, _ := identity.ParsePackageID("package_11111111111111111111111111111111")
+	manifest := packages.Manifest{PackageID: id, Name: "fixture", Version: "1", OS: "linux", Architecture: "amd64", ArchiveSHA256: fmt.Sprintf("%x", sum[:]), ExecutableRelativePath: "xmrig", SourceRepository: "https://example.invalid/source", SourceURL: "https://example.invalid/archive"}
+	original := approvedPackageManifest
+	approvedPackageManifest = func() packages.Manifest { return manifest }
+	defer func() { approvedPackageManifest = original }()
+	for _, args := range [][]string{{"--package-action", "import", "--package-archive", archive}, {"--package-action", "verify"}, {"--package-action", "list"}} {
+		var stdout, stderr bytes.Buffer
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("args=%v code=%d stderr=%s", args, code, stderr.String())
+		}
+		if args[1] == "list" {
+			var installed []packages.Installed
+			if err := json.Unmarshal(stdout.Bytes(), &installed); err != nil || len(installed) != 1 || installed[0].Manifest.PackageID != id {
+				t.Fatalf("output=%s err=%v", stdout.String(), err)
+			}
+		} else {
+			var installed packages.Installed
+			if err := json.Unmarshal(stdout.Bytes(), &installed); err != nil || installed.Manifest.PackageID != id {
+				t.Fatalf("output=%s err=%v", stdout.String(), err)
+			}
+		}
+	}
+}
+
+func TestPackageListIsEmptyBeforeImport(t *testing.T) {
+	t.Setenv("LE0X_DATA_DIR", filepath.Join(t.TempDir(), "agent"))
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--package-action", "list"}, strings.NewReader(""), &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "[]" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
 
 func TestPresentationJSON(t *testing.T) {
 	host, err := identity.NewHostID()

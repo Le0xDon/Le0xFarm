@@ -246,6 +246,11 @@ func (store *Store) Get(hostID identity.HostID) (HostObservation, bool) {
 	if item == nil {
 		return HostObservation{}, false
 	}
+	store.refreshFreshness(item)
+	return store.cloneCurrent(item), true
+}
+
+func (store *Store) refreshFreshness(item *entry) {
 	if item.observation.Fresh && (item.freshAt.IsZero() || store.now().Sub(item.freshAt) > store.freshnessTimeout) {
 		item.observation.Fresh = false
 		item.observation.Revision++
@@ -258,11 +263,30 @@ func (store *Store) Get(hostID identity.HostID) (HostObservation, bool) {
 		item.observation.ProcessesFresh = false
 		item.observation.Revision++
 	}
+}
+
+func (store *Store) cloneCurrent(item *entry) HostObservation {
 	result := cloneObservation(item.observation)
 	if !item.freshAt.IsZero() {
 		ageObservedTelemetry(&result, store.now().Sub(item.freshAt))
 	}
-	return result, true
+	return result
+}
+
+// List returns bounded copies of all Hosts known during this Controller
+// lifetime. Observations remain epoch-scoped and are never persisted.
+func (store *Store) List() []HostObservation {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	result := make([]HostObservation, 0, len(store.hosts))
+	for _, item := range store.hosts {
+		store.refreshFreshness(item)
+		result = append(result, store.cloneCurrent(item))
+	}
+	slices.SortFunc(result, func(a, b HostObservation) int {
+		return compare(a.HostID.String(), b.HostID.String())
+	})
+	return result
 }
 
 func ageObservedTelemetry(observation *HostObservation, elapsed time.Duration) {

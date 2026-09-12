@@ -2,6 +2,7 @@ package packages
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -201,6 +202,218 @@ func TestInstallRejectsWrongHashAndConflictingContent(t *testing.T) {
 	if _, err := store.Install(context.Background(), otherPath, other); codeOf(err) != farmerr.CONFIG_CONFLICT {
 		t.Fatalf("conflict error=%v", err)
 	}
+}
+
+func TestInstallExtractsExactVerifiedArchiveAfterSourceSubstitution(t *testing.T) {
+	approvedBody := []byte("#!/bin/sh\nprintf 'approved-6.26.0\\n'\n")
+	replacementBody := []byte("#!/bin/sh\nexit 77\n")
+	tests := []struct {
+		name   string
+		mutate func(string, string, []byte) error
+	}{
+		{
+			name: "symlink replacement",
+			mutate: func(source, replacement string, _ []byte) error {
+				if err := os.Rename(source, source+".verified"); err != nil {
+					return err
+				}
+				return os.Symlink(replacement, source)
+			},
+		},
+		{
+			name: "different regular replacement",
+			mutate: func(source, replacement string, _ []byte) error {
+				return os.Rename(replacement, source)
+			},
+		},
+		{
+			name: "hard link replacement",
+			mutate: func(source, replacement string, _ []byte) error {
+				if err := os.Remove(source); err != nil {
+					return err
+				}
+				return os.Link(replacement, source)
+			},
+		},
+		{
+			name: "delete and recreate",
+			mutate: func(source, _ string, replacement []byte) error {
+				if err := os.Remove(source); err != nil {
+					return err
+				}
+				return os.WriteFile(source, replacement, 0600)
+			},
+		},
+		{
+			name:   "pathname deleted",
+			mutate: func(source, _ string, _ []byte) error { return os.Remove(source) },
+		},
+		{
+			name: "same inode modified after hash",
+			mutate: func(source, _ string, replacement []byte) error {
+				return os.WriteFile(source, replacement, 0600)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source, hash := archive(t, tarEntry{name: "bin", body: approvedBody, mode: 0755})
+			replacement, _ := archive(t, tarEntry{name: "bin", body: replacementBody, mode: 0755})
+			replacementArchive, err := os.ReadFile(replacement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := manifest(t, hash)
+			m.ExecutableRelativePath = "bin"
+			m.VersionArgs = []string{"--version"}
+			m.ExpectedVersion = "approved-6.26.0"
+			store := New(t.TempDir())
+			store.afterArchiveVerified = func() error {
+				return test.mutate(source, replacement, replacementArchive)
+			}
+			installed, err := store.Install(context.Background(), source, m)
+			if err != nil {
+				t.Fatalf("exact verified import failed after namespace mutation: %v", err)
+			}
+			got, err := os.ReadFile(installed.ExecutablePath)
+			if err != nil || !bytes.Equal(got, approvedBody) {
+				t.Fatalf("published executable came from replacement: %q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestInstallUsesOpenedSourceWhenPathChangesBeforeCopy(t *testing.T) {
+	approvedBody := []byte("approved exact object")
+	source, hash := archive(t, tarEntry{name: "bin", body: approvedBody, mode: 0755})
+	replacement, _ := archive(t, tarEntry{name: "bin", body: []byte("replacement"), mode: 0755})
+	m := manifest(t, hash)
+	m.ExecutableRelativePath = "bin"
+	store := New(t.TempDir())
+	store.afterArchiveOpened = func() error {
+		if err := os.Rename(source, source+".opened"); err != nil {
+			return err
+		}
+		return os.Rename(replacement, source)
+	}
+	installed, err := store.Install(context.Background(), source, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(installed.ExecutablePath); err != nil || !bytes.Equal(got, approvedBody) {
+		t.Fatalf("published executable=%q err=%v", got, err)
+	}
+}
+
+func TestInstallFailsClosedWhenOpenedSourceIsModifiedBeforeCopy(t *testing.T) {
+	source, hash := archive(t, tarEntry{name: "bin", body: []byte("approved"), mode: 0755})
+	replacement, _ := archive(t, tarEntry{name: "bin", body: []byte("modified in place"), mode: 0755})
+	replacementArchive, err := os.ReadFile(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := manifest(t, hash)
+	m.ExecutableRelativePath = "bin"
+	store := New(t.TempDir())
+	store.afterArchiveOpened = func() error { return os.WriteFile(source, replacementArchive, 0600) }
+	if _, err := store.Install(context.Background(), source, m); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
+		t.Fatalf("modified opened source error=%v", err)
+	}
+}
+
+func TestInstallRejectsSymlinkAndHardLinkedSource(t *testing.T) {
+	source, hash := archive(t, tarEntry{name: "bin", body: []byte("approved"), mode: 0755})
+	m := manifest(t, hash)
+	m.ExecutableRelativePath = "bin"
+	symlink := filepath.Join(t.TempDir(), "archive-link")
+	if err := os.Symlink(source, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(t.TempDir()).Install(context.Background(), symlink, m); err == nil {
+		t.Fatal("symlink package source was accepted")
+	}
+	hardlink := filepath.Join(t.TempDir(), "archive-hardlink")
+	if err := os.Link(source, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(t.TempDir()).Install(context.Background(), hardlink, m); err == nil {
+		t.Fatal("hard-linked package source was accepted")
+	}
+}
+
+func TestInstallRejectsOversizedSourceBeforeReading(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized.tar.gz")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxArchiveBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest(t, strings.Repeat("0", 64))
+	if _, err := New(t.TempDir()).Install(context.Background(), path, m); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
+		t.Fatalf("oversized archive error=%v", err)
+	}
+}
+
+func TestInstallRejectsMalformedArchiveAndExtractionLimits(t *testing.T) {
+	t.Run("malformed gzip", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "malformed.tar.gz")
+		body := []byte("not a gzip archive")
+		if err := os.WriteFile(path, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(body)
+		m := manifest(t, hex.EncodeToString(sum[:]))
+		if _, err := New(t.TempDir()).Install(context.Background(), path, m); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
+			t.Fatalf("malformed archive error=%v", err)
+		}
+	})
+
+	t.Run("entry count", func(t *testing.T) {
+		entries := make([]tarEntry, maxArchiveEntries+1)
+		for i := range entries {
+			entries[i] = tarEntry{name: fmt.Sprintf("directory-%04d/", i), mode: 0755, kind: tar.TypeDir}
+		}
+		path, hash := archive(t, entries...)
+		m := manifest(t, hash)
+		if _, err := New(t.TempDir()).Install(context.Background(), path, m); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
+			t.Fatalf("entry limit error=%v", err)
+		}
+	})
+
+	t.Run("extracted bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "oversized-extracted.tar.gz")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gzipWriter := gzip.NewWriter(file)
+		tarWriter := tar.NewWriter(gzipWriter)
+		if err := tarWriter.WriteHeader(&tar.Header{Name: "huge", Mode: 0644, Size: maxExtractedBytes + 1, Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		// The importer rejects the declared size after reading the header, so
+		// this deliberately malformed fixture does not need a multi-GB body.
+		if err := gzipWriter.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(body)
+		m := manifest(t, hex.EncodeToString(sum[:]))
+		if _, err := New(t.TempDir()).Install(context.Background(), path, m); codeOf(err) != farmerr.PACKAGE_HASH_MISMATCH {
+			t.Fatalf("extracted byte limit error=%v", err)
+		}
+	})
 }
 
 func TestArchiveSafety(t *testing.T) {

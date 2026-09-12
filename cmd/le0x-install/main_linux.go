@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/le0xdon/le0xfarm/internal/linuxinstall"
@@ -78,6 +79,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "%s complete for %s; persistent data and configuration preserved\n", *action, *roleValue)
+	if *action == "install" && cleanRoot == "/" {
+		if slices.Contains(roles, linuxinstall.RoleController) {
+			fmt.Fprintln(stdout, "Next (fresh Controller only): run le0x-controller --init --init-only as le0x, then configure /etc/le0xfarm/controller.env")
+		}
+		if slices.Contains(roles, linuxinstall.RoleAgent) {
+			fmt.Fprintln(stdout, "Next: configure /etc/le0xfarm/agent.env, import the approved package, and securely enroll the Agent")
+		}
+		fmt.Fprintln(stdout, "See README Technical MVP operator quick-start before enabling services")
+	}
 	return 0
 }
 

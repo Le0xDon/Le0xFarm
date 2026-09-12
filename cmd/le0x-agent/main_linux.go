@@ -34,6 +34,8 @@ type report struct {
 	Warnings  []string        `json:"warnings"`
 }
 
+var approvedPackageManifest = xmrig.Manifest
+
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -46,6 +48,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	pair := flags.String("pair", "", "Controller enrollment token (development only)")
 	pairStdin := flags.Bool("pair-stdin", false, "Read one secure enrollment token from stdin")
 	tlsFingerprint := flags.String("tls-fingerprint", "", "Controller certificate SHA-256 fingerprint")
+	packageAction := flags.String("package-action", "", "Local verified package action: import, verify, or list")
+	packageArchive := flags.String("package-archive", "", "Local approved package archive for --package-action import")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -55,6 +59,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if flags.NArg() != 0 {
 		fmt.Fprintln(stderr, "Unexpected positional arguments")
 		return 2
+	}
+	if *packageAction != "" && (*controller != "" || *insecureDev || *allowRawExecution || *pair != "" || *pairStdin || *tlsFingerprint != "") {
+		return fail(stderr, *asJSON, errors.New("package actions cannot be combined with Controller connection or enrollment options"))
+	}
+	if (*packageAction == "import") != (*packageArchive != "") {
+		return fail(stderr, *asJSON, errors.New("--package-action import requires exactly one --package-archive"))
+	}
+	if *packageAction != "" && *packageAction != "import" && *packageAction != "verify" && *packageAction != "list" {
+		return fail(stderr, *asJSON, errors.New("--package-action must be import, verify, or list"))
 	}
 	if *pair != "" && *controller == "" {
 		return fail(stderr, false, errors.New("--pair requires --controller"))
@@ -96,6 +109,34 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	id, err := agentidentity.LoadOrCreate(dir)
 	if err != nil {
 		return fail(stderr, *asJSON, err)
+	}
+	if *packageAction != "" {
+		store := packages.New(dir)
+		manifest := approvedPackageManifest()
+		var installed packages.Installed
+		if *packageAction == "import" {
+			installed, err = store.Install(context.Background(), *packageArchive, manifest)
+		} else {
+			installed, err = store.Lookup(manifest.PackageID, manifest.Version)
+		}
+		if *packageAction == "list" {
+			if code, _ := farmerr.CodeOf(err); code == farmerr.PACKAGE_NOT_INSTALLED {
+				err = json.NewEncoder(stdout).Encode([]packages.Installed{})
+			} else if err == nil {
+				err = json.NewEncoder(stdout).Encode([]packages.Installed{installed})
+			}
+			if err != nil {
+				return fail(stderr, *asJSON, err)
+			}
+			return 0
+		}
+		if err != nil {
+			return fail(stderr, *asJSON, err)
+		}
+		if err := json.NewEncoder(stdout).Encode(installed); err != nil {
+			return fail(stderr, *asJSON, err)
+		}
+		return 0
 	}
 	inventorySource := inventory.Local()
 	facts, warnings := inventorySource.Discover(id.HostID)

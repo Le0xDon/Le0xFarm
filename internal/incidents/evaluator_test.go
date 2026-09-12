@@ -89,6 +89,23 @@ func TestMonitoringLossDoesNotAuthorizeResolution(t *testing.T) {
 	}
 }
 
+func TestKnownDisconnectedHostCreatesOfflineWithoutDesiredWorkload(t *testing.T) {
+	host := mustHost(7)
+	evaluation := Evaluate(Input{
+		HostID:      host,
+		HasObserved: true,
+		Observed: controllerstate.HostObservation{
+			HostID:          host,
+			ConnectionEpoch: 3,
+			Connected:       false,
+		},
+	})
+	requireIncident(t, evaluation.Conditions, farmmodel.IncidentAgentOffline)
+	if evaluation.ResolvableTypes[farmmodel.IncidentAgentOffline] {
+		t.Fatal("disconnected authority could resolve its own offline incident")
+	}
+}
+
 func TestMaintenanceSuppressesIntentionalStopButNotOffline(t *testing.T) {
 	input := healthyInput(t)
 	input.Hold = &farmmodel.MaintenanceHold{HostID: input.HostID, Active: true}

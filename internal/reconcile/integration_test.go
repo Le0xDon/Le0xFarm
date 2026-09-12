@@ -21,8 +21,10 @@ import (
 	"github.com/le0xdon/le0xfarm/internal/controllerstate"
 	"github.com/le0xdon/le0xfarm/internal/controllertrust"
 	"github.com/le0xdon/le0xfarm/internal/farmconfig"
+	"github.com/le0xdon/le0xfarm/internal/farmerr"
 	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
+	"github.com/le0xdon/le0xfarm/internal/incidents"
 	"github.com/le0xdon/le0xfarm/internal/inventory"
 	"github.com/le0xdon/le0xfarm/internal/minerruntime"
 	"github.com/le0xdon/le0xfarm/internal/model"
@@ -34,6 +36,108 @@ import (
 const integrationAdapterID = "integration-sleep"
 
 var integrationPackageID = mustIntegrationPackageID("package_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+func TestRealTransportDisconnectPersistsAndResolvesAgentOffline(t *testing.T) {
+	controllerID, _ := identity.ParseControllerID("controller_99999999999999999999999999999999")
+	farmID, _ := identity.ParseFarmID("farm_99999999999999999999999999999999")
+	agentID := testAgent(9)
+	hostID := testHost(9)
+	trust, err := controllertrust.Open(t.TempDir(), controllerID, farmID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := trust.Pair(agentID, hostID); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := t.TempDir()
+	if err := agenttrust.Save(agentDir, agenttrust.Binding{ControllerID: controllerID, FarmID: farmID}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := controllerdb.Open(context.Background(), filepath.Join(t.TempDir(), "controller"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	catalog, err := packagecatalog.Builtin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := farmconfig.New(db, catalog, farmconfig.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetMaintenanceHold(context.Background(), hostID, 0, true, "disconnect test"); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := service.IncidentAuthority(context.Background(), hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holdCondition := incidents.NewCondition(farmmodel.IncidentMaintenanceHold, farmmodel.IncidentSeverityInfo, hostID, nil, nil, nil, farmerr.MAINTENANCE_HOLD)
+	if err := service.ReconcileIncidents(context.Background(), hostID, authority, []farmmodel.IncidentCondition{holdCondition}, nil); err != nil {
+		t.Fatal(err)
+	}
+	listener := bufconn.Listen(1024 * 1024)
+	server, err := controllernet.New(controllernet.Config{InsecureDev: true, ControllerID: controllerID, FarmID: farmID, Trust: trust, Maintenance: service, ShutdownGracePeriod: 20 * time.Millisecond, Output: log.New(io.Discard, "", 0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := controllerstate.New()
+	coordinator := NewCoordinator(service, observed, &countingCommander{server: server}, log.New(io.Discard, "", 0))
+	server.SetSessionHandler(coordinator)
+	controllerCtx, stopController := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Serve(controllerCtx, listener) }()
+
+	runtime := supervisor.New(supervisor.Config{StopGrace: 50 * time.Millisecond})
+	facts, _ := inventory.Local().Discover(hostID)
+	minerRuntime := minerruntime.New(runtime, minerruntime.NewRegistry(), agentDir, nil, facts, minerruntime.Config{PollInterval: 10 * time.Millisecond})
+	defer minerRuntime.Shutdown(context.Background())
+	startAgent := func() (context.CancelFunc, <-chan error) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- agentnet.Run(ctx, agentnet.Config{Target: "buf", InsecureDev: true, TrustDir: agentDir, AgentID: agentID, HostID: hostID, Inventory: inventory.Local(), Supervisor: runtime, MinerRuntime: minerRuntime, HeartbeatInterval: 20 * time.Millisecond, ReconnectInitial: time.Millisecond, ReconnectMax: 5 * time.Millisecond, Dialer: func(context.Context, string) (net.Conn, error) { return listener.Dial() }, Output: log.New(io.Discard, "", 0)})
+		}()
+		return cancel, done
+	}
+
+	stopAgent, agentDone := startAgent()
+	waitSessionReady(t, server, hostID)
+	firstSession, _ := server.Session(hostID)
+	if current, ok := observed.Get(hostID); !ok || !current.Ready || !current.Fresh || !current.InventoryFresh || !current.ProcessesFresh {
+		t.Fatalf("Controller observation is not fully fresh: %+v exists=%t", current, ok)
+	}
+	waitPersistedIncidentState(t, service, farmmodel.IncidentMaintenanceHold, farmmodel.IncidentActive)
+	waitIncidentIdle(t, coordinator, hostID)
+	if active, err := service.ListActiveIncidents(context.Background()); err != nil || hasIncidentType(active, farmmodel.IncidentAgentOffline) {
+		t.Fatalf("unexpected initial offline incident: %+v err=%v", active, err)
+	}
+	stopAgent()
+	if err := <-agentDone; err != nil {
+		t.Fatal(err)
+	}
+	waitPersistedIncidentState(t, service, farmmodel.IncidentAgentOffline, farmmodel.IncidentActive)
+	waitPersistedIncidentState(t, service, farmmodel.IncidentMaintenanceHold, farmmodel.IncidentActive)
+	waitIncidentIdle(t, coordinator, hostID)
+
+	stopAgent, agentDone = startAgent()
+	waitSessionReadyAfter(t, server, hostID, firstSession.ConnectionEpoch)
+	waitObservedReadyAfter(t, observed, hostID, firstSession.ConnectionEpoch)
+	coordinator.queueIncidentEvaluation(hostID)
+	waitIncidentIdle(t, coordinator, hostID)
+	waitPersistedIncidentState(t, service, farmmodel.IncidentAgentOffline, farmmodel.IncidentResolved)
+	waitPersistedIncidentState(t, service, farmmodel.IncidentMaintenanceHold, farmmodel.IncidentActive)
+	stopAgent()
+	if err := <-agentDone; err != nil {
+		t.Fatal(err)
+	}
+	stopController()
+	coordinator.Shutdown()
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestControllerBackupRestoreRequiresFreshActualBeforeReconcile(t *testing.T) {
 	ctx := context.Background()
@@ -1048,6 +1152,69 @@ func waitSessionReady(t *testing.T, server *controllernet.Server, host identity.
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("Agent session did not become READY")
+}
+
+func waitSessionReadyAfter(t *testing.T, server *controllernet.Server, host identity.HostID, epoch controllerstate.ConnectionEpoch) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if session, ok := server.Session(host); ok && session.Ready && session.ConnectionEpoch > epoch {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Agent session did not reconnect with a fresh READY epoch")
+}
+
+func waitObservedReadyAfter(t *testing.T, observed *controllerstate.Store, host identity.HostID, epoch controllerstate.ConnectionEpoch) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if current, ok := observed.Get(host); ok && current.Ready && current.Fresh && current.InventoryFresh && current.ProcessesFresh && current.ConnectionEpoch > epoch {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("Controller observation did not reconnect with a fresh complete epoch")
+}
+
+func waitPersistedIncidentState(t *testing.T, service *farmconfig.Service, kind farmmodel.IncidentType, state farmmodel.IncidentState) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		values, err := service.ListIncidents(context.Background(), farmmodel.IncidentQuery{State: state})
+		if err == nil && hasIncidentType(values, kind) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	active, _ := service.ListIncidents(context.Background(), farmmodel.IncidentQuery{State: farmmodel.IncidentActive})
+	resolved, _ := service.ListIncidents(context.Background(), farmmodel.IncidentQuery{State: farmmodel.IncidentResolved})
+	t.Fatalf("incident %s did not reach %s; active=%+v resolved=%+v", kind, state, active, resolved)
+}
+
+func waitIncidentIdle(t *testing.T, coordinator *Coordinator, host identity.HostID) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		coordinator.incidentMu.Lock()
+		idle := !coordinator.incidentRunning[host] && !coordinator.incidentPending[host]
+		coordinator.incidentMu.Unlock()
+		if idle {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("incident worker did not become idle")
+}
+
+func hasIncidentType(values []farmmodel.Incident, kind farmmodel.IncidentType) bool {
+	for _, value := range values {
+		if value.Type == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func waitExecutionState(t *testing.T, runtime *supervisor.Supervisor, executionID identity.ExecutionID, state model.ExecutionStatus) {

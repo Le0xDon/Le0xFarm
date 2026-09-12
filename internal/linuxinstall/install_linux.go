@@ -552,7 +552,36 @@ func (installer *Installer) installRole(transaction *installTransaction, role Ro
 func (installer *Installer) Uninstall(ctx context.Context) error {
 	for _, role := range installer.roles {
 		service := serviceName(role)
-		if err := installer.config.Host.Systemctl(ctx, "disable", "--now", service); err != nil {
+		unitPath := installer.path("etc/systemd/system/" + service)
+		if _, err := os.Lstat(unitPath); err == nil {
+			if err := installer.config.Host.Systemctl(ctx, "disable", "--now", service); err != nil {
+				return err
+			}
+			// reset-failed must run while systemd can still identify the unit.
+			// After removal and daemon-reload, a correctly absent unit is not an
+			// error and must not make an otherwise successful uninstall fail.
+			if err := installer.config.Host.Systemctl(ctx, "reset-failed", service); err != nil {
+				return err
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			// A removed unit file can still have loaded systemd state until the
+			// next daemon-reload. Establish and converge that state without
+			// treating the positively absent pathname as an uninstall failure.
+			state, stateErr := installer.config.Host.ServiceState(ctx, service)
+			if stateErr != nil {
+				return stateErr
+			}
+			if state.Active {
+				if err := installer.config.Host.Systemctl(ctx, "stop", service); err != nil {
+					return err
+				}
+			}
+			if state.Enabled {
+				if err := installer.config.Host.Systemctl(ctx, "disable", service); err != nil {
+					return err
+				}
+			}
+		} else {
 			return err
 		}
 		if err := installer.removeInfrastructure("etc/systemd/system/" + service); err != nil {
@@ -564,11 +593,6 @@ func (installer *Installer) Uninstall(ctx context.Context) error {
 	}
 	if err := installer.config.Host.Systemctl(ctx, "daemon-reload"); err != nil {
 		return err
-	}
-	for _, role := range installer.roles {
-		if err := installer.config.Host.Systemctl(ctx, "reset-failed", serviceName(role)); err != nil {
-			return err
-		}
 	}
 	return nil
 }

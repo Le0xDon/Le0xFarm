@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controlleradmin"
 	"github.com/le0xdon/le0xfarm/internal/controllerbackup"
 	"github.com/le0xdon/le0xfarm/internal/controllerdb"
 	"github.com/le0xdon/le0xfarm/internal/controlleridentity"
@@ -52,6 +53,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("le0x-controller", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	operator := registerOperatorFlags(flags)
 	listen := flags.String("listen", "127.0.0.1:50051", "TCP listen address")
 	insecureDev := flags.Bool("insecure-dev", false, "Allow plaintext gRPC for development/test only")
 	initIdentity := flags.Bool("init", false, "Initialize a new Controller/Farm identity")
@@ -94,11 +96,19 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return 2
 	}
 	setTTL := false
+	operatorOptionSet := false
 	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "pairing-ttl" {
 			setTTL = true
 		}
+		if strings.HasPrefix(f.Name, "op-") {
+			operatorOptionSet = true
+		}
 	})
+	if operatorOptionSet && *operator.action == "" {
+		fmt.Fprintln(stderr, "--op-* options require --operator-action")
+		return 2
+	}
 	if setTTL && !*pairing {
 		fmt.Fprintln(stderr, "--pairing-ttl requires --pairing")
 		return 2
@@ -173,6 +183,13 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if err != nil {
 		printError(stderr, err)
 		return 1
+	}
+	if *operator.action != "" {
+		if *initIdentity || *initOnly || *initPKI || *pairing || *backupAction != "" || *runtimeAction != "" || *runtimeTarget != "" {
+			fmt.Fprintln(stderr, "operator actions cannot be combined with Controller lifecycle, backup, pairing, or development runtime actions")
+			return 2
+		}
+		return runOperator(dataDir, operator, stdout, stderr)
 	}
 	var pairingWindow *controllernet.PairingWindow
 	var token string
@@ -284,6 +301,12 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	coordinator := reconcile.NewCoordinator(farmService, observed, server, log.New(stdout, "", 0))
 	server.SetSessionHandler(coordinator)
+	operatorListener, err := controlleradmin.Listen(dataDir)
+	if err != nil {
+		printError(stderr, err)
+		return 1
+	}
+	defer operatorListener.Close()
 	controllerID, farmID := server.IDs()
 	if *pairing {
 		if err := writeEnrollmentCredential(*pairingTokenFile, token); err != nil {
@@ -308,6 +331,14 @@ func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 	var background sync.WaitGroup
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		if err := controlleradmin.Serve(ctx, operatorListener, &controlleradmin.Service{Backend: farmService, Controller: coordinator, Observed: observed}); err != nil && ctx.Err() == nil {
+			log.New(stdout, "", 0).Printf("OPERATOR: service stopped: %v", err)
+			cancel()
+		}
+	}()
 	if pki != nil {
 		backupManager, err := controllerbackup.New(controllerbackup.Config{DataDir: dataDir, ControllerID: controllerIdentity.ControllerID, FarmID: controllerIdentity.FarmID, TrustFingerprint: pki.CAFingerprint(), Lease: lease})
 		if err != nil {

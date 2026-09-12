@@ -50,6 +50,25 @@ func TestControllerCLIInitializationFlag(t *testing.T) {
 	}
 }
 
+func TestOperatorHelpDoesNotOpenControllerState(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "not-created")
+	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--operator-action", "help"}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "workload-set") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("help created Controller state: %v", err)
+	}
+}
+
+func TestOperatorOptionsRequireAction(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--op-name", "ignored"}, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "require --operator-action") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
 func TestControllerInitOnlyCreatesIdentityAndPKIWithoutServing(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "controller")
 	t.Setenv("LE0X_CONTROLLER_DATA_DIR", dir)

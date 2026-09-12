@@ -52,10 +52,19 @@ func Evaluate(input Input) Evaluation {
 	for _, facts := range input.Workloads {
 		runningDesired = runningDesired || facts.Workload.RunState == farmmodel.DesiredRunning
 	}
-	if !input.HasObserved || !input.Observed.Connected || input.Observed.HostID != input.HostID || input.Observed.ConnectionEpoch == 0 {
+	if !input.HasObserved {
+		// A configured RUNNING workload with no monitoring authority is offline;
+		// a never-observed Host with no work is not yet evidence of a disconnect.
 		if !runningDesired {
 			return finish(result)
 		}
+		add(farmmodel.IncidentAgentOffline, farmmodel.IncidentSeverityError, nil, nil, nil, farmerr.SERVICE_NOT_READY)
+		return finish(result)
+	}
+	if !input.Observed.Connected || input.Observed.HostID != input.HostID || input.Observed.ConnectionEpoch == 0 {
+		// A previously known Host becoming disconnected is itself actionable
+		// monitoring loss, even when it currently has no RUNNING Desired work.
+		// Reconnect without a complete bootstrap still cannot resolve it.
 		add(farmmodel.IncidentAgentOffline, farmmodel.IncidentSeverityError, nil, nil, nil, farmerr.SERVICE_NOT_READY)
 		return finish(result)
 	}
