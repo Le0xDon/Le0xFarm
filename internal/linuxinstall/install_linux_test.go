@@ -14,10 +14,11 @@ import (
 )
 
 type fakeHost struct {
-	account Account
-	actions []string
-	fail    func(string) error
-	states  map[string]ServiceState
+	account         Account
+	actions         []string
+	fail            func(string) error
+	states          map[string]ServiceState
+	unloadOnDisable bool
 }
 
 func (host *fakeHost) EnsureServiceAccount(context.Context) (Account, error) {
@@ -63,6 +64,15 @@ func (host *fakeHost) Systemctl(_ context.Context, args ...string) error {
 	if host.states == nil {
 		host.states = make(map[string]ServiceState)
 	}
+	if len(args) == 1 && args[0] == "daemon-reload" {
+		for service, state := range host.states {
+			if !state.Active && !state.Enabled {
+				state.Loaded = false
+			}
+			host.states[service] = state
+		}
+		return nil
+	}
 	var service string
 	if len(args) >= 2 {
 		service = args[len(args)-1]
@@ -76,10 +86,15 @@ func (host *fakeHost) Systemctl(_ context.Context, args ...string) error {
 		if len(args) == 3 && args[1] == "--now" {
 			state.Active = false
 		}
+		if host.unloadOnDisable && !state.Active {
+			state.Loaded = false
+		}
 	case "start":
 		state.Active = true
 	case "stop":
 		state.Active = false
+	case "reset-failed":
+		state.Failed = false
 	}
 	host.states[service] = state
 	return nil
@@ -815,8 +830,8 @@ func TestUninstallRemovesInfrastructureAndPreservesData(t *testing.T) {
 				t.Fatalf("persistent file lost: %s %q %v", kept, data, err)
 			}
 		}
-		if !contains(host.actions, "systemctl:disable --now "+serviceName(role)) {
-			t.Fatalf("service not disabled: %v", host.actions)
+		if state := host.states[serviceName(role)]; state.Active || state.Enabled || state.Loaded || state.Failed {
+			t.Fatalf("service state remains after uninstall: %+v", state)
 		}
 	}
 	for _, kept := range preserved {
@@ -849,7 +864,7 @@ func TestUninstallIsIdempotentWhenUnitsAreAlreadyAbsent(t *testing.T) {
 
 func TestUninstallConvergesLoadedStateWhenUnitFileIsMissing(t *testing.T) {
 	root := t.TempDir()
-	host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{AgentService: {Enabled: true, Active: true}}}
+	host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{AgentService: {Enabled: true, Active: true, Loaded: true}}}
 	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleAgent}, AgentBinary: testBinary(t, "agent"), Host: host})
 	if err := os.MkdirAll(filepath.Join(root, "usr/local/bin"), 0700); err != nil {
 		t.Fatal(err)
@@ -872,13 +887,16 @@ func TestUninstallConvergesLoadedStateWhenUnitFileIsMissing(t *testing.T) {
 
 func TestUninstallHandlesAllExistingServiceStates(t *testing.T) {
 	for _, initial := range []ServiceState{
-		{Enabled: true, Active: true},
-		{Enabled: true, Active: false},
-		{Enabled: false, Active: true},
-		{Enabled: false, Active: false},
+		{Enabled: true, Active: true, Loaded: true},
+		{Enabled: true, Active: false, Loaded: true},
+		{Enabled: false, Active: true, Loaded: true},
+		{Enabled: false, Active: false, Loaded: true},
+		{Enabled: false, Active: false, Loaded: true, Failed: true},
+		{Enabled: true, Active: false, Loaded: true, Failed: true},
+		{Enabled: false, Active: false, Loaded: false},
 	} {
 		initial := initial
-		t.Run(fmt.Sprintf("enabled_%t_active_%t", initial.Enabled, initial.Active), func(t *testing.T) {
+		t.Run(fmt.Sprintf("enabled_%t_active_%t_loaded_%t_failed_%t", initial.Enabled, initial.Active, initial.Loaded, initial.Failed), func(t *testing.T) {
 			root := t.TempDir()
 			host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{AgentService: initial}}
 			installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleAgent}, AgentBinary: testBinary(t, "agent"), Host: host})
@@ -889,7 +907,7 @@ func TestUninstallHandlesAllExistingServiceStates(t *testing.T) {
 			if err := installer.Uninstall(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			if final := host.states[AgentService]; final.Enabled || final.Active {
+			if final := host.states[AgentService]; final.Enabled || final.Active || final.Loaded || final.Failed {
 				t.Fatalf("final service state=%+v", final)
 			}
 		})
@@ -897,34 +915,41 @@ func TestUninstallHandlesAllExistingServiceStates(t *testing.T) {
 }
 
 func TestUninstallSurfacesRealServiceManagerFailure(t *testing.T) {
-	root := t.TempDir()
-	host := &fakeHost{account: Account{UID: 1, GID: 1}}
-	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController}, ControllerBinary: testBinary(t, "controller"), Host: host})
-	if err := installer.Install(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	want := errors.New("service manager unavailable")
-	host.fail = func(action string) error {
-		if action == "systemctl:disable --now "+ControllerService {
-			return want
-		}
-		return nil
-	}
-	if err := installer.Uninstall(context.Background()); !errors.Is(err, want) {
-		t.Fatalf("error=%v, want %v", err, want)
-	}
-	if _, err := os.Lstat(filepath.Join(root, "etc/systemd/system", ControllerService)); err != nil {
-		t.Fatalf("unit removed after real systemctl failure: %v", err)
+	for _, action := range []string{"systemctl:stop " + ControllerService, "systemctl:disable " + ControllerService} {
+		action := action
+		t.Run(action, func(t *testing.T) {
+			root := t.TempDir()
+			host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{ControllerService: {Enabled: true, Active: true, Loaded: true}}}
+			installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController}, ControllerBinary: testBinary(t, "controller"), Host: host})
+			if err := installer.Install(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			host.states[ControllerService] = ServiceState{Enabled: true, Active: true, Loaded: true}
+			want := errors.New("service manager unavailable")
+			host.fail = func(got string) error {
+				if got == action {
+					return want
+				}
+				return nil
+			}
+			if err := installer.Uninstall(context.Background()); !errors.Is(err, want) {
+				t.Fatalf("error=%v, want %v", err, want)
+			}
+			if _, err := os.Lstat(filepath.Join(root, "etc/systemd/system", ControllerService)); err != nil {
+				t.Fatalf("unit removed after real systemctl failure: %v", err)
+			}
+		})
 	}
 }
 
 func TestUninstallDoesNotRemoveUnitWhenResetFailedFails(t *testing.T) {
 	root := t.TempDir()
-	host := &fakeHost{account: Account{UID: 1, GID: 1}}
+	host := &fakeHost{account: Account{UID: 1, GID: 1}, states: map[string]ServiceState{ControllerService: {Loaded: true, Failed: true}}}
 	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController}, ControllerBinary: testBinary(t, "controller"), Host: host})
 	if err := installer.Install(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	host.states[ControllerService] = ServiceState{Loaded: true, Failed: true}
 	want := errors.New("cannot reset failure state")
 	host.fail = func(action string) error {
 		if action == "systemctl:reset-failed "+ControllerService {
@@ -937,6 +962,84 @@ func TestUninstallDoesNotRemoveUnitWhenResetFailedFails(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "etc/systemd/system", ControllerService)); err != nil {
 		t.Fatalf("unit removed after reset-failed failure: %v", err)
+	}
+}
+
+func TestUninstallRealAcceptanceUnloadAfterDisableDoesNotResetAbsentUnit(t *testing.T) {
+	root := t.TempDir()
+	host := &fakeHost{
+		account:         Account{UID: 1, GID: 1},
+		states:          map[string]ServiceState{AgentService: {Enabled: true, Loaded: true}},
+		unloadOnDisable: true,
+	}
+	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleAgent}, AgentBinary: testBinary(t, "agent"), Host: host})
+	if err := installer.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	host.states[AgentService] = ServiceState{Enabled: true, Loaded: true}
+	host.fail = func(action string) error {
+		if action == "systemctl:reset-failed "+AgentService && !host.states[AgentService].Loaded {
+			return errors.New("Unit le0x-agent.service not loaded")
+		}
+		return nil
+	}
+	if err := installer.Uninstall(context.Background()); err != nil {
+		t.Fatalf("uninstall after disable unloaded the unit: %v actions=%v", err, host.actions)
+	}
+	if contains(host.actions, "systemctl:reset-failed "+AgentService) {
+		t.Fatalf("normal unloaded unit was needlessly reset: %v", host.actions)
+	}
+	for _, relative := range []string{"usr/local/bin/le0x-agent", "etc/systemd/system/" + AgentService} {
+		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(relative))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("infrastructure remains after acceptance-shaped uninstall: %s", relative)
+		}
+	}
+}
+
+func TestUninstallDaemonReloadFailureIsFatal(t *testing.T) {
+	root := t.TempDir()
+	host := &fakeHost{account: Account{UID: 1, GID: 1}}
+	installer := testInstaller(t, Config{Root: root, Roles: []Role{RoleController}, ControllerBinary: testBinary(t, "controller"), Host: host})
+	if err := installer.Install(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("daemon reload failed")
+	host.fail = func(action string) error {
+		if action == "systemctl:daemon-reload" {
+			return want
+		}
+		return nil
+	}
+	if err := installer.Uninstall(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("error=%v, want %v", err, want)
+	}
+}
+
+func TestParseServiceState(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		text string
+		want ServiceState
+	}{
+		{"enabled-active", "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n", ServiceState{Enabled: true, Active: true, Loaded: true}},
+		{"failed-loaded", "ActiveState=failed\nUnitFileState=disabled\nLoadState=loaded\n", ServiceState{Loaded: true, Failed: true}},
+		{"unloaded", "UnitFileState=\nLoadState=not-found\nActiveState=inactive\n", ServiceState{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseServiceState(AgentService, []byte(test.text))
+			if err != nil || got != test.want {
+				t.Fatalf("state=%+v err=%v want=%+v", got, err, test.want)
+			}
+		})
+	}
+	for _, invalid := range []string{
+		"LoadState=loaded\nActiveState=activating\nUnitFileState=enabled\n",
+		"LoadState=loaded\nActiveState=inactive\n",
+		"LoadState=loaded\nLoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n",
+	} {
+		if _, err := parseServiceState(AgentService, []byte(invalid)); err == nil {
+			t.Fatalf("invalid state accepted: %q", invalid)
+		}
 	}
 }
 

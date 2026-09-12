@@ -53,6 +53,8 @@ type Host interface {
 type ServiceState struct {
 	Enabled bool
 	Active  bool
+	Loaded  bool
+	Failed  bool
 }
 
 type Config struct {
@@ -550,38 +552,14 @@ func (installer *Installer) installRole(transaction *installTransaction, role Ro
 }
 
 func (installer *Installer) Uninstall(ctx context.Context) error {
+	services := make([]string, 0, len(installer.roles))
 	for _, role := range installer.roles {
 		service := serviceName(role)
 		unitPath := installer.path("etc/systemd/system/" + service)
-		if _, err := os.Lstat(unitPath); err == nil {
-			if err := installer.config.Host.Systemctl(ctx, "disable", "--now", service); err != nil {
-				return err
-			}
-			// reset-failed must run while systemd can still identify the unit.
-			// After removal and daemon-reload, a correctly absent unit is not an
-			// error and must not make an otherwise successful uninstall fail.
-			if err := installer.config.Host.Systemctl(ctx, "reset-failed", service); err != nil {
-				return err
-			}
-		} else if errors.Is(err, os.ErrNotExist) {
-			// A removed unit file can still have loaded systemd state until the
-			// next daemon-reload. Establish and converge that state without
-			// treating the positively absent pathname as an uninstall failure.
-			state, stateErr := installer.config.Host.ServiceState(ctx, service)
-			if stateErr != nil {
-				return stateErr
-			}
-			if state.Active {
-				if err := installer.config.Host.Systemctl(ctx, "stop", service); err != nil {
-					return err
-				}
-			}
-			if state.Enabled {
-				if err := installer.config.Host.Systemctl(ctx, "disable", service); err != nil {
-					return err
-				}
-			}
-		} else {
+		if _, err := os.Lstat(unitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := installer.convergeServiceBeforeRemoval(ctx, service); err != nil {
 			return err
 		}
 		if err := installer.removeInfrastructure("etc/systemd/system/" + service); err != nil {
@@ -590,9 +568,69 @@ func (installer *Installer) Uninstall(ctx context.Context) error {
 		if err := installer.removeInfrastructure("usr/local/bin/le0x-" + string(role)); err != nil {
 			return err
 		}
+		services = append(services, service)
 	}
 	if err := installer.config.Host.Systemctl(ctx, "daemon-reload"); err != nil {
 		return err
+	}
+	for _, service := range services {
+		state, err := installer.config.Host.ServiceState(ctx, service)
+		if err != nil {
+			return err
+		}
+		if state.Active || state.Enabled || state.Loaded || state.Failed {
+			return fmt.Errorf("service %s remains present after uninstall: enabled=%t active=%t loaded=%t failed=%t", service, state.Enabled, state.Active, state.Loaded, state.Failed)
+		}
+	}
+	return nil
+}
+
+func (installer *Installer) convergeServiceBeforeRemoval(ctx context.Context, service string) error {
+	state, err := installer.config.Host.ServiceState(ctx, service)
+	if err != nil {
+		return err
+	}
+	if state.Failed && !state.Loaded {
+		return fmt.Errorf("service %s reports failed state without a loaded unit", service)
+	}
+	if state.Active {
+		if err := installer.config.Host.Systemctl(ctx, "stop", service); err != nil {
+			return err
+		}
+		if state, err = installer.config.Host.ServiceState(ctx, service); err != nil {
+			return err
+		}
+		if state.Active {
+			return fmt.Errorf("service %s remains active after stop", service)
+		}
+	}
+	// A failed unit must be reset while it is still loaded. A normal
+	// inactive unit does not require reset-failed; systemd may legitimately
+	// unload it during disable, as observed on Ubuntu 22.04 and 26.04.
+	if state.Failed {
+		if !state.Loaded {
+			return fmt.Errorf("service %s became unloaded before failed state was cleared", service)
+		}
+		if err := installer.config.Host.Systemctl(ctx, "reset-failed", service); err != nil {
+			return err
+		}
+		if state, err = installer.config.Host.ServiceState(ctx, service); err != nil {
+			return err
+		}
+		if state.Failed {
+			return fmt.Errorf("service %s remains failed after reset", service)
+		}
+	}
+	if state.Enabled {
+		if err := installer.config.Host.Systemctl(ctx, "disable", service); err != nil {
+			return err
+		}
+		if state, err = installer.config.Host.ServiceState(ctx, service); err != nil {
+			return err
+		}
+	}
+	if state.Active || state.Enabled {
+		return fmt.Errorf("service %s did not converge inactive and disabled before removal", service)
 	}
 	return nil
 }
@@ -1055,31 +1093,58 @@ func (LocalHost) ServiceState(ctx context.Context, service string) (ServiceState
 	if service != ControllerService && service != AgentService {
 		return ServiceState{}, errors.New("refusing service-state query for an unsupported unit")
 	}
-	enabled, err := querySystemctlState(ctx, "is-enabled", service, map[string]bool{
-		"enabled": true, "enabled-runtime": true, "disabled": false, "not-found": false,
-	})
+	command := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", "--property=LoadState", "--property=ActiveState", "--property=UnitFileState", "--no-pager", service)
+	command.Env = append(os.Environ(), "LC_ALL=C")
+	output, err := command.Output()
 	if err != nil {
-		return ServiceState{}, err
+		return ServiceState{}, fmt.Errorf("cannot establish service state for %s: %w", service, err)
 	}
-	active, err := querySystemctlState(ctx, "is-active", service, map[string]bool{
-		"active": true, "inactive": false, "failed": false, "unknown": false,
-	})
-	if err != nil {
-		return ServiceState{}, err
-	}
-	return ServiceState{Enabled: enabled, Active: active}, nil
+	return parseServiceState(service, output)
 }
 
-func querySystemctlState(ctx context.Context, action, service string, accepted map[string]bool) (bool, error) {
-	command := exec.CommandContext(ctx, "/usr/bin/systemctl", action, service)
-	command.Env = append(os.Environ(), "LC_ALL=C")
-	output, runErr := command.Output()
-	state := strings.TrimSpace(string(output))
-	value, ok := accepted[state]
-	if !ok {
-		return false, fmt.Errorf("cannot establish prior %s state for %s: %w", action, service, runErr)
+func parseServiceState(service string, output []byte) (ServiceState, error) {
+	if len(output) > 4096 {
+		return ServiceState{}, fmt.Errorf("service state response for %s is too large", service)
 	}
-	return value, nil
+	properties := make(map[string]string, 3)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || (key != "LoadState" && key != "ActiveState" && key != "UnitFileState") {
+			return ServiceState{}, fmt.Errorf("service state response for %s is invalid", service)
+		}
+		if _, duplicate := properties[key]; duplicate {
+			return ServiceState{}, fmt.Errorf("service state response for %s contains duplicate %s", service, key)
+		}
+		properties[key] = value
+	}
+	if len(properties) != 3 {
+		return ServiceState{}, fmt.Errorf("service state response for %s is incomplete", service)
+	}
+	state := ServiceState{}
+	switch properties["LoadState"] {
+	case "loaded", "masked":
+		state.Loaded = true
+	case "not-found":
+	default:
+		return ServiceState{}, fmt.Errorf("service %s has unsupported load state %q", service, properties["LoadState"])
+	}
+	switch properties["ActiveState"] {
+	case "active":
+		state.Active = true
+	case "inactive":
+	case "failed":
+		state.Failed = true
+	default:
+		return ServiceState{}, fmt.Errorf("service %s has transitional or unsupported active state %q", service, properties["ActiveState"])
+	}
+	switch properties["UnitFileState"] {
+	case "enabled", "enabled-runtime":
+		state.Enabled = true
+	case "", "disabled", "static", "indirect", "generated", "transient", "linked", "linked-runtime", "masked", "masked-runtime":
+	default:
+		return ServiceState{}, fmt.Errorf("service %s has unsupported unit-file state %q", service, properties["UnitFileState"])
+	}
+	return state, nil
 }
 
 func (LocalHost) Systemctl(ctx context.Context, args ...string) error {
@@ -1141,6 +1206,15 @@ func (host *StagingHost) Systemctl(_ context.Context, args ...string) error {
 	if host.States == nil {
 		host.States = make(map[string]ServiceState)
 	}
+	if len(args) == 1 && args[0] == "daemon-reload" {
+		for service, state := range host.States {
+			if !state.Active && !state.Enabled {
+				state.Loaded = false
+			}
+			host.States[service] = state
+		}
+		return nil
+	}
 	var service string
 	if len(args) >= 2 {
 		service = args[len(args)-1]
@@ -1158,6 +1232,8 @@ func (host *StagingHost) Systemctl(_ context.Context, args ...string) error {
 		state.Active = true
 	case "stop":
 		state.Active = false
+	case "reset-failed":
+		state.Failed = false
 	}
 	host.States[service] = state
 	return nil

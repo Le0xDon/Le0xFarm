@@ -5,11 +5,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/le0xdon/le0xfarm/internal/controllerstate"
+	"github.com/le0xdon/le0xfarm/internal/farmerr"
+	"github.com/le0xdon/le0xfarm/internal/farmmodel"
 	"github.com/le0xdon/le0xfarm/internal/identity"
 	"github.com/le0xdon/le0xfarm/internal/model"
+	"github.com/le0xdon/le0xfarm/internal/reconcile"
 )
 
 func TestObserveConservativeClassificationManagedExclusionAndPIDReuse(t *testing.T) {
@@ -82,6 +87,131 @@ func TestAgentRestartDoesNotAdoptSurvivingUnprovenProcess(t *testing.T) {
 	}
 }
 
+func TestObservePermissionDeniedExecutableUsesExactRegisteredComm(t *testing.T) {
+	for _, permission := range []error{syscall.EACCES, syscall.EPERM} {
+		permission := permission
+		t.Run(permission.Error(), func(t *testing.T) {
+			root := t.TempDir()
+			makeProcess(t, root, 401, "xmrig", 1001, false, "")
+			source := sourceWithExeError(root, permission)
+			got, err := source.Observe(model.Inventory{}, []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].PID != 401 || !got[0].CPURelevant || !got[0].CPU || got[0].ResourceScope != model.ProcessResourcesExact {
+				t.Fatalf("permission-denied candidate=%+v", got)
+			}
+			if len(got[0].Evidence) != 1 || got[0].Evidence[0].Kind != "REGISTERED_COMM_IDENTITY_UNREADABLE" {
+				t.Fatalf("candidate evidence=%+v", got[0].Evidence)
+			}
+		})
+	}
+}
+
+func TestObserveUnreadableExecutableDoesNotFuzzilyClassifyUnrelatedComm(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 402, "not-xmrig", 1002, false, "")
+	source := sourceWithExeError(root, syscall.EACCES)
+	got, err := source.Observe(model.Inventory{}, []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("unrelated unreadable process classified as miner: %+v", got)
+	}
+}
+
+func TestObserveUnreadableGPUCandidateUsesConservativeUnknownScope(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 406, "gpu-miner", 1006, false, "")
+	source := sourceWithExeError(root, syscall.EPERM)
+	got, err := source.Observe(model.Inventory{}, []model.ProcessSignature{{Executable: "gpu-miner", Provider: "test-gpu", GPURelevant: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].GPURelevant || got[0].ResourceScope != model.ProcessResourcesUnknown || len(got[0].DeviceIDs) != 0 {
+		t.Fatalf("unreadable GPU candidate was not conservatively broad: %+v", got)
+	}
+}
+
+func TestObserveExecutableENOENTIsHarmlessProcessExitRace(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 403, "xmrig", 1003, false, "")
+	source := sourceWithExeError(root, syscall.ENOENT)
+	got, err := source.Observe(model.Inventory{}, []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}, nil)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("exited process observation=%+v err=%v", got, err)
+	}
+}
+
+func TestObserveUnexpectedExecutableErrorFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 407, "xmrig", 1007, false, "")
+	source := sourceWithExeError(root, syscall.EIO)
+	if got, err := source.Observe(model.Inventory{}, []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}, nil); err == nil || len(got) != 0 {
+		t.Fatalf("unexpected procfs error did not fail closed: observations=%+v err=%v", got, err)
+	}
+}
+
+func TestObserveUnreadableExecutablePreservesManagedExclusionAndPIDReuse(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 404, "xmrig", 1004, false, "")
+	source := sourceWithExeError(root, syscall.EACCES)
+	signatures := []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}
+	got, err := source.Observe(model.Inventory{}, signatures, []ManagedInstance{{PID: 404, ProcessInstance: "linux-proc-start-ticks:1004"}})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("exact managed process classified as unmanaged: %+v err=%v", got, err)
+	}
+	got, err = source.Observe(model.Inventory{}, signatures, []ManagedInstance{{PID: 404, ProcessInstance: "linux-proc-start-ticks:999"}})
+	if err != nil || len(got) != 1 || got[0].ProcessInstance != "linux-proc-start-ticks:1004" {
+		t.Fatalf("PID-reused candidate was excluded: %+v err=%v", got, err)
+	}
+}
+
+func TestUnreadableRegisteredCandidateBlocksThenFreshAbsenceAllowsStart(t *testing.T) {
+	root := t.TempDir()
+	makeProcess(t, root, 405, "xmrig", 1005, false, "")
+	source := sourceWithExeError(root, syscall.EACCES)
+	signatures := []model.ProcessSignature{{Executable: "xmrig", Provider: "xmrig", CPURelevant: true}}
+	processes, err := source.Observe(model.Inventory{}, signatures, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _ := identity.NewHostID()
+	workloadID, _ := identity.NewWorkloadID()
+	executionID, _ := identity.NewExecutionID()
+	claim := farmmodel.ResourceClaim{CPU: true}
+	workload := farmmodel.DesiredWorkload{WorkloadID: workloadID, DesiredGeneration: 1, DesiredWorkloadContent: farmmodel.DesiredWorkloadContent{HostID: host, RunState: farmmodel.DesiredRunning, Resources: claim}}
+	snapshot := farmmodel.ResolvedExecutionSnapshot{WorkloadID: workloadID, DesiredGeneration: 1, ExecutionID: executionID, HostID: host, Resources: claim}
+	observed := controllerstate.HostObservation{HostID: host, Connected: true, Ready: true, Fresh: true, InventoryFresh: true, ProcessesFresh: true, UnmanagedProcesses: processes}
+	input := reconcile.PlanInput{Workload: workload, Current: &snapshot, Snapshots: []farmmodel.ResolvedExecutionSnapshot{snapshot}, Observed: observed}
+	blocked := reconcile.Plan(input)
+	if blocked.Code != farmerr.UNMANAGED_PROCESS_CONFLICT || blocked.Conflict == "" || len(blocked.Actions) != 0 {
+		t.Fatalf("unreadable candidate did not block START: %+v", blocked)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "proc", "405")); err != nil {
+		t.Fatal(err)
+	}
+	processes, err = source.Observe(model.Inventory{}, signatures, nil)
+	if err != nil || len(processes) != 0 {
+		t.Fatalf("fresh absence=%+v err=%v", processes, err)
+	}
+	input.Observed.UnmanagedProcesses = processes
+	allowed := reconcile.Plan(input)
+	if len(allowed.Actions) != 1 || allowed.Actions[0].Key.Action != reconcile.ActionStart {
+		t.Fatalf("fresh absence did not allow START: %+v", allowed)
+	}
+}
+
+func sourceWithExeError(root string, cause error) Source {
+	return Source{Root: root, readlink: func(path string) (string, error) {
+		if filepath.Base(path) == "exe" {
+			return "", &os.PathError{Op: "readlink", Path: path, Err: cause}
+		}
+		return os.Readlink(path)
+	}}
+}
+
 func makeProcess(t *testing.T, root string, pid int, executable string, startTicks uint64, gpu bool, pci string) {
 	t.Helper()
 	procDir := filepath.Join(root, "proc", fmt.Sprint(pid))
@@ -97,6 +227,9 @@ func makeProcess(t *testing.T, root string, pid int, executable string, startTic
 	}
 	fields = append(fields, fmt.Sprint(startTicks))
 	if err := os.WriteFile(filepath.Join(procDir, "stat"), []byte(fmt.Sprintf("%d (%s) %s", pid, executable, strings.Join(fields, " "))), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, "comm"), []byte(executable+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if !gpu {

@@ -19,6 +19,10 @@ import (
 type Source struct {
 	Root string
 	Now  func() time.Time
+	// readlink and readFile are narrow deterministic test seams for procfs
+	// permission and process-exit races. Production uses the os functions.
+	readlink func(string) (string, error)
+	readFile func(string) ([]byte, error)
 }
 
 func Local() Source { return Source{Root: "/", Now: time.Now} }
@@ -28,8 +32,9 @@ type ManagedInstance struct {
 	ProcessInstance string
 }
 
-// Observe reads no process argv or environment. A process is reported only
-// when its executable basename matches an adapter/provider signature.
+// Observe reads no process argv or environment. A process is reported when
+// its executable basename matches an adapter/provider signature, or when
+// executable resolution is permission-denied and its comm matches exactly.
 func (source Source) Observe(inventory model.Inventory, signatures []model.ProcessSignature, managed []ManagedInstance) ([]model.UnmanagedProcessObservation, error) {
 	if source.Root == "" {
 		source.Root = "/"
@@ -63,24 +68,52 @@ func (source Source) Observe(inventory model.Inventory, signatures []model.Proce
 			continue
 		}
 		pid := int(pid64)
-		executablePath, err := os.Readlink(source.path("proc", entry.Name(), "exe"))
+		stat, err := source.readFileAt(source.path("proc", entry.Name(), "stat"))
 		if err != nil {
-			continue
-		}
-		executable := filepath.Base(strings.TrimSuffix(executablePath, " (deleted)"))
-		matches := byExecutable[executable]
-		if len(matches) == 0 {
-			continue
-		}
-		stat, err := os.ReadFile(source.path("proc", entry.Name(), "stat"))
-		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("read process %d stat: %w", pid, err)
 		}
 		instance, err := parseProcessInstance(string(stat))
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse process %d stat: %w", pid, err)
 		}
 		if _, owned := managedSet[instanceKey(pid, instance)]; owned {
+			continue
+		}
+
+		executablePath, err := source.readLink(source.path("proc", entry.Name(), "exe"))
+		executable := ""
+		identityUnreadable := false
+		switch {
+		case err == nil:
+			executable = filepath.Base(strings.TrimSuffix(executablePath, " (deleted)"))
+		case errors.Is(err, os.ErrNotExist):
+			// The process exited after procfs enumeration.
+			continue
+		case errors.Is(err, os.ErrPermission):
+			// Default Ubuntu process protection can deny cross-UID exe
+			// resolution while leaving the non-sensitive comm and stat facts
+			// readable. An exact registered comm match is a conservative
+			// candidate; unreadable identity never means a free resource.
+			comm, commErr := source.readFileAt(source.path("proc", entry.Name(), "comm"))
+			if errors.Is(commErr, os.ErrNotExist) {
+				continue
+			}
+			if commErr != nil {
+				return nil, fmt.Errorf("read process %d comm after executable access denial: %w", pid, commErr)
+			}
+			executable = strings.TrimSuffix(string(comm), "\n")
+			if executable == "" || strings.ContainsAny(executable, "\r\n") {
+				return nil, fmt.Errorf("process %d comm is invalid", pid)
+			}
+			identityUnreadable = true
+		default:
+			return nil, fmt.Errorf("resolve process %d executable: %w", pid, err)
+		}
+		matches := byExecutable[executable]
+		if len(matches) == 0 {
 			continue
 		}
 		item := model.UnmanagedProcessObservation{PID: pid, Executable: executable, ProcessInstance: instance, ObservedAt: observedAt}
@@ -90,7 +123,11 @@ func (source Source) Observe(inventory model.Inventory, signatures []model.Proce
 			item.GPURelevant = item.GPURelevant || match.GPURelevant
 			if _, exists := providers[match.Provider]; !exists {
 				providers[match.Provider] = struct{}{}
-				item.Evidence = append(item.Evidence, model.ProcessEvidence{Kind: "KNOWN_ADAPTER_EXECUTABLE", Provider: match.Provider, Detail: "executable basename matches a registered adapter"})
+				kind, detail := "KNOWN_ADAPTER_EXECUTABLE", "executable basename matches a registered adapter"
+				if identityUnreadable {
+					kind, detail = "REGISTERED_COMM_IDENTITY_UNREADABLE", "process comm exactly matches a registered adapter; executable identity is permission-denied"
+				}
+				item.Evidence = append(item.Evidence, model.ProcessEvidence{Kind: kind, Provider: match.Provider, Detail: detail})
 			}
 		}
 		item.DeviceIDs = source.gpuDevices(pid, inventory)
@@ -124,7 +161,7 @@ func (source Source) gpuDevices(pid int, inventory model.Inventory) []identity.D
 	}
 	seen := make(map[identity.DeviceID]struct{})
 	for _, entry := range entries {
-		target, err := os.Readlink(source.path("proc", strconv.Itoa(pid), "fd", entry.Name()))
+		target, err := source.readLink(source.path("proc", strconv.Itoa(pid), "fd", entry.Name()))
 		if err != nil || !strings.HasPrefix(target, "/dev/dri/") {
 			continue
 		}
@@ -132,7 +169,7 @@ func (source Source) gpuDevices(pid int, inventory model.Inventory) []identity.D
 		if !strings.HasPrefix(deviceName, "renderD") && !strings.HasPrefix(deviceName, "card") {
 			continue
 		}
-		deviceTarget, err := os.Readlink(source.path("sys", "class", "drm", deviceName, "device"))
+		deviceTarget, err := source.readLink(source.path("sys", "class", "drm", deviceName, "device"))
 		if err != nil {
 			continue
 		}
@@ -169,6 +206,20 @@ func parseProcessInstance(stat string) (string, error) {
 func (source Source) path(parts ...string) string {
 	all := append([]string{source.Root}, parts...)
 	return filepath.Join(all...)
+}
+
+func (source Source) readLink(path string) (string, error) {
+	if source.readlink != nil {
+		return source.readlink(path)
+	}
+	return os.Readlink(path)
+}
+
+func (source Source) readFileAt(path string) ([]byte, error) {
+	if source.readFile != nil {
+		return source.readFile(path)
+	}
+	return os.ReadFile(path)
 }
 
 func instanceKey(pid int, instance string) string { return strconv.Itoa(pid) + "\x00" + instance }
